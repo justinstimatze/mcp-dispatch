@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 
 # subprocess only runs the opt-in, local-config notify_command (no shell).
 import subprocess  # nosec B404
@@ -154,7 +155,8 @@ os.umask(0o007 if GROUP_MODE else 0o077)
 
 # Agent ids and targets become path segments under DISPATCH_DIR, so they must
 # never contain separators or traversal sequences. Constrain to a safe charset.
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# \Z (not $) anchors the absolute end — $ would also match before a trailing newline.
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
 
 
 def _validate_id(value: str, kind: str = "agent id") -> str:
@@ -171,18 +173,33 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
+    except ProcessLookupError:
+        return False  # ESRCH — no such process
+    except PermissionError:
+        return True  # EPERM — process exists but is owned by another user (group_mode)
     except OSError:
         return False
 
 
 def _enforce_dir_mode(path: Path) -> None:
     """chmod a dir to DIR_MODE. In shared mode the relay may be owned by another
-    participant (already set up correctly), so tolerate not being the owner."""
+    participant (already set up correctly), so tolerate not being the owner — but
+    only if it is actually usable and group-shared, else fail loud."""
     try:
         os.chmod(path, DIR_MODE)
     except PermissionError:
         if not GROUP_MODE:
             raise
+        # We don't own it; that's fine only if it's genuinely set up for sharing.
+        st = path.stat()
+        usable = os.access(path, os.R_OK | os.W_OK | os.X_OK)
+        shared = bool(st.st_mode & stat.S_ISGID) and (st.st_mode & 0o070) == 0o070
+        if not (usable and shared):
+            raise RuntimeError(
+                f"group_mode relay {path} is owned by another user and not "
+                f"correctly shared (need setgid + group rwx, and you must be in "
+                f"its group). Current mode {oct(stat.S_IMODE(st.st_mode))}."
+            ) from None
 
 
 def _setup_dirs() -> None:
@@ -420,6 +437,10 @@ def _send(
     must_read: bool = False,
 ) -> dict:
     """Write a message to the target's inbox. Fan-out for 'all'."""
+    # ttl: None → default; 0 → explicitly never expire; >0 → seconds. Reject <0.
+    if ttl is not None and ttl < 0:
+        raise ValueError(f"ttl must be >= 0 (got {ttl}); use 0 or omit for no expiry.")
+    effective_ttl = DEFAULT_TTL if ttl is None else ttl
     msg = {
         "id": f"msg-{uuid.uuid4().hex[:8]}",
         "from": from_id,
@@ -430,7 +451,7 @@ def _send(
         "payload": payload,
         "thread_id": thread_id,
         "reply_to": reply_to,
-        "ttl": ttl if ttl else (DEFAULT_TTL if DEFAULT_TTL > 0 else None),
+        "ttl": effective_ttl if effective_ttl and effective_ttl > 0 else None,
         "must_read": must_read,
         "state": "pending",
     }
@@ -510,7 +531,9 @@ def _channel_subscribers(channel: str) -> list[str]:
             continue
         if channel in data.get("channels", []) and _pid_alive(data.get("pid", -1)):
             aid = data.get("agent_id")
-            if aid:
+            # The agent_id becomes a path segment in _deliver_one. A presence
+            # file is group-writable in group_mode, so don't trust it blindly.
+            if aid and _ID_RE.match(str(aid)):
                 subs.append(aid)
     return subs
 
@@ -596,9 +619,11 @@ def _notify(msg: dict) -> None:
     summary = f"dispatch: {pri} message from {sender}"
     body = (msg.get("content", "") or "").replace("\n", " ")[:200]
     try:
-        # argv list (no shell); command is local trusted config.
+        # argv list (no shell); command is local trusted config. "--" stops the
+        # message-derived summary/body from being parsed as options (e.g. a body
+        # starting with "-"). Most notifiers (notify-send) honor the separator.
         subprocess.run(  # nosec B603
-            [*shlex.split(NOTIFY_COMMAND), summary, body],
+            [*shlex.split(NOTIFY_COMMAND), "--", summary, body],
             timeout=5,
             check=False,
             stdout=subprocess.DEVNULL,
