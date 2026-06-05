@@ -201,6 +201,9 @@ def _setup_dirs() -> None:
         (DISPATCH_DIR / aid).mkdir(exist_ok=True)
 
 
+_last_tmp_sweep = 0.0
+
+
 def _sweep_stale_tmp(max_age_s: int = 60) -> None:
     """Unlink orphaned *.tmp files left by writers that crashed mid-rename."""
     cutoff = time.time() - max_age_s
@@ -210,6 +213,16 @@ def _sweep_stale_tmp(max_age_s: int = 60) -> None:
                 tmp.unlink()
         except OSError:
             pass
+
+
+def _maybe_sweep_stale_tmp() -> None:
+    """Run the .tmp sweep at most once a minute, off the back of inbox reads, so a
+    peer that crashes mid-write during a session is cleaned up before next start."""
+    global _last_tmp_sweep
+    now = time.time()
+    if now - _last_tmp_sweep > 60:
+        _last_tmp_sweep = now
+        _sweep_stale_tmp()
 
 
 # Held for the process lifetime so the flock on the presence file stays
@@ -314,11 +327,10 @@ def _claim_id() -> str:
 
 def _release_id(agent_id: str) -> None:
     global _PRESENCE_HANDLE
-    pf = DISPATCH_DIR / ".presence" / f"{agent_id}.json"
-    try:
-        pf.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # Just drop the lock; don't unlink. A lingering presence file with no lock is
+    # already "dead" to who()/channels, the next claimer of this id reclaims it
+    # (truncate + rewrite), and _reap_dead_presence GCs it at startup. Unlinking
+    # here would race a process concurrently reclaiming the same id.
     if _PRESENCE_HANDLE is not None:
         try:
             _PRESENCE_HANDLE.close()  # releases the flock
@@ -400,6 +412,29 @@ def _reap_dead_presence() -> int:
     return removed
 
 
+def _reap_empty_inboxes() -> int:
+    """Remove completely-empty inbox dirs (recreated on demand by senders).
+
+    A dead dynamic-mode agent (<project>-<pid>) never returns, so its empty inbox
+    is pure clutter; a *live* peer's empty inbox is harmless to drop because the
+    next sender re-creates it. Skipped in roster mode, where inboxes are
+    pre-created on purpose.
+    """
+    if AGENT_IDS:
+        return 0
+    removed = 0
+    for d in DISPATCH_DIR.iterdir():
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        try:
+            if not any(d.iterdir()):  # truly empty — no messages, no .tmp
+                d.rmdir()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Message I/O
 # ---------------------------------------------------------------------------
@@ -453,6 +488,7 @@ def _is_expired(msg: dict) -> bool:
 
 def _cleanup_expired(agent_id: str) -> int:
     """Remove expired messages from an agent's inbox. Returns count removed."""
+    _maybe_sweep_stale_tmp()
     inbox = DISPATCH_DIR / agent_id
     removed = 0
     for f in inbox.glob("*.json"):
@@ -792,6 +828,7 @@ def _start_watcher(agent_id: str) -> None:
 _setup_dirs()
 _sweep_stale_tmp()
 _reap_dead_presence()  # GC presence files whose owner is gone (e.g. after reboot)
+_reap_empty_inboxes()  # GC empty inbox dirs left by exited dynamic-mode agents
 AGENT_ID = _claim_id()
 print(f"[dispatch] I am {AGENT_ID} (PID {os.getpid()})", file=sys.stderr)
 
