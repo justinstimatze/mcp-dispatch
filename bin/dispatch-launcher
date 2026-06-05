@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# mcp-dispatch launcher — derive a stable-yet-unique agent id from the current
+# project directory name plus the PID, then exec the server.
+#
+# Wire it into your MCP client config as the dispatch server command, e.g. in
+# ~/.claude.json or a project .mcp.json:
+#
+#   "dispatch": { "command": "/abs/path/to/mcp-dispatch/bin/dispatch-launcher" }
+#
+# A session started in ~/Documents/gemot then becomes agent "gemot-<pid>".
+# An explicit MCP_DISPATCH_AGENT_ID in the environment always wins.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -z "${MCP_DISPATCH_AGENT_ID:-}" ]]; then
+  # Lowercase, keep only [a-z0-9-], drop leading hyphens (id must start [a-z0-9]).
+  base="$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | sed 's/^-*//')"
+  [[ -z "$base" ]] && base="agent"
+  base="${base:0:50}"  # leave room for "-<pid>" under the 64-char id limit
+  export MCP_DISPATCH_AGENT_ID="${base}-$$"
+fi
+
+exec uv run --directory "$REPO_DIR" python server.py
