@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Read-only snapshot of the dispatch relay.
+
+Shows which agent sessions are live (presence file + alive pid), their channel
+subscriptions, and how many unread messages sit in each inbox — plus any
+orphaned inboxes (messages whose owner is gone). Touches nothing.
+
+    bin/dispatch-status            # default relay dir
+    MCP_DISPATCH_DIR=... bin/dispatch-status
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+
+def _relay_dir() -> Path:
+    raw = (
+        os.environ.get("MCP_DISPATCH_DIR")
+        or os.environ.get("DISPATCH_DIR")
+        or "~/.config/mcp-dispatch/messages"
+    )
+    return Path(os.path.expanduser(raw))
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pending(inbox: Path) -> int:
+    if not inbox.is_dir():
+        return 0
+    n = 0
+    for f in inbox.glob("*.json"):
+        try:
+            if json.loads(f.read_text()).get("state", "pending") == "pending":
+                n += 1
+        except (json.JSONDecodeError, OSError):
+            pass
+    return n
+
+
+def main() -> int:
+    relay = _relay_dir()
+    if not relay.is_dir():
+        print(f"No relay yet at {relay}")
+        print("→ no dispatch-enabled session has started. Open a Claude Code window.")
+        return 0
+
+    presence = relay / ".presence"
+    live: dict[str, dict] = {}
+    for pf in sorted(presence.glob("*.json")):
+        try:
+            data = json.loads(pf.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _pid_alive(data.get("pid", -1)):
+            live[data.get("agent_id", pf.stem)] = data
+
+    print(f"relay: {relay}")
+    print(f"live agents: {len(live)}")
+    for aid, data in live.items():
+        chans = data.get("channels") or []
+        chan_s = "  " + " ".join(f"#{c}" for c in chans) if chans else ""
+        print(f"  {aid}  (pid {data.get('pid')})  unread:{_pending(relay / aid)}{chan_s}")
+
+    # Orphaned inboxes: a dir with messages but no live owner.
+    live_ids = set(live)
+    orphans = []
+    for d in sorted(relay.iterdir()):
+        if d.is_dir() and not d.name.startswith(".") and d.name not in live_ids:
+            count = _pending(d)
+            if count:
+                orphans.append((d.name, count))
+    if orphans:
+        print("orphaned inboxes (owner gone, messages remain):")
+        for name, count in orphans:
+            print(f"  {name}  unread:{count}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
