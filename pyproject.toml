@@ -9,3 +9,25 @@ dependencies = [
 
 [project.optional-dependencies]
 watch = ["watchdog>=4.0"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.10", "bandit>=1.7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, isort, pyupgrade, bugbear, flake8-comprehensions
+select = ["E", "F", "I", "UP", "B", "C4"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+
+[tool.bandit]
+# B110: try/except/pass — used intentionally for best-effort fs cleanup.
+skips = ["B110"]
