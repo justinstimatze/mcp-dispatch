@@ -177,6 +177,20 @@ def _sweep_stale_tmp(max_age_s: int = 60) -> None:
 # Held for the process lifetime so the flock on the presence file stays
 # acquired. Closing or GC'ing this handle would release the lock.
 _PRESENCE_HANDLE = None
+# Live in-memory copy of this agent's presence record (incl. channel subs),
+# written through the locked handle on every change.
+_PRESENCE_DATA: dict = {}
+
+
+def _write_presence() -> None:
+    """Persist _PRESENCE_DATA through the held, locked handle."""
+    if _PRESENCE_HANDLE is None:
+        return
+    _PRESENCE_HANDLE.seek(0)
+    _PRESENCE_HANDLE.truncate()
+    _PRESENCE_HANDLE.write(json.dumps(_PRESENCE_DATA))
+    _PRESENCE_HANDLE.flush()
+    os.fsync(_PRESENCE_HANDLE.fileno())
 
 
 def _try_lock_presence(pf: Path, agent_id: str) -> bool:
@@ -186,27 +200,21 @@ def _try_lock_presence(pf: Path, agent_id: str) -> bool:
     process holds the identity. The lock — not a pid heuristic — is the source
     of truth, so a crashed process's lock is released by the kernel for free.
     """
-    global _PRESENCE_HANDLE
+    global _PRESENCE_HANDLE, _PRESENCE_DATA
     fh = open(pf, "a+")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         fh.close()
         return False
-    fh.seek(0)
-    fh.truncate()
-    fh.write(
-        json.dumps(
-            {
-                "agent_id": agent_id,
-                "pid": os.getpid(),
-                "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-        )
-    )
-    fh.flush()
-    os.fsync(fh.fileno())
     _PRESENCE_HANDLE = fh
+    _PRESENCE_DATA = {
+        "agent_id": agent_id,
+        "pid": os.getpid(),
+        "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "channels": [],
+    }
+    _write_presence()
     return True
 
 
@@ -411,7 +419,7 @@ def _send(
     def _validate_target(target: str) -> None:
         if not DYNAMIC_MODE:
             if target not in AGENT_IDS:
-                valid = ", ".join(AGENT_IDS) + ", all"
+                valid = ", ".join(AGENT_IDS) + ", #channel, all"
                 raise ValueError(f"Unknown agent '{target}'. Valid targets: {valid}")
         else:
             # In dynamic mode any name is accepted, but it becomes a path
@@ -419,16 +427,29 @@ def _send(
             _validate_id(target, "target")
         (DISPATCH_DIR / target).mkdir(exist_ok=True)
 
+    def _deliver_one(target: str) -> None:
+        (DISPATCH_DIR / target).mkdir(exist_ok=True)
+        _atomic_write(DISPATCH_DIR / target / _filename(), dict(msg))
+
     if to == "all":
-        # Broadcast: fan-out to all known agents (or all with inboxes in dynamic mode)
-        targets = [aid for aid in _discover_agents() if aid != from_id]
-        for target in targets:
-            _atomic_write(DISPATCH_DIR / target / _filename(), dict(msg))
+        # Broadcast: every known agent except the sender.
+        delivered = [aid for aid in _discover_agents() if aid != from_id]
+        for target in delivered:
+            _deliver_one(target)
+    elif to.startswith("#"):
+        # Channel: only current subscribers, except the sender.
+        channel = _validate_id(to[1:], "channel")
+        delivered = [aid for aid in _channel_subscribers(channel) if aid != from_id]
+        for target in delivered:
+            _deliver_one(target)
     else:
         _validate_target(to)
-        _atomic_write(DISPATCH_DIR / to / _filename(), msg)
+        _deliver_one(to)
+        delivered = [to]
 
-    return msg
+    result: dict = dict(msg)
+    result["delivered_to"] = delivered
+    return result
 
 
 def _discover_agents() -> list[str]:
@@ -439,6 +460,39 @@ def _discover_agents() -> list[str]:
     return [
         d.name for d in sorted(DISPATCH_DIR.iterdir()) if d.is_dir() and not d.name.startswith(".")
     ]
+
+
+# ---------------------------------------------------------------------------
+# Channels (presence-derived, ephemeral)
+# ---------------------------------------------------------------------------
+
+
+def _channel_subscribers(channel: str) -> list[str]:
+    """Live agents currently subscribed to a channel, by presence record."""
+    subs: list[str] = []
+    for pf in sorted((DISPATCH_DIR / ".presence").glob("*.json")):
+        try:
+            data = json.loads(pf.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if channel in data.get("channels", []) and _pid_alive(data.get("pid", -1)):
+            aid = data.get("agent_id")
+            if aid:
+                subs.append(aid)
+    return subs
+
+
+def _set_subscription(channel: str, subscribed: bool) -> list[str]:
+    """Add/remove a channel from this agent's presence record. Returns the new set."""
+    _validate_id(channel, "channel")
+    channels = set(_PRESENCE_DATA.get("channels", []))
+    if subscribed:
+        channels.add(channel)
+    else:
+        channels.discard(channel)
+    _PRESENCE_DATA["channels"] = sorted(channels)
+    _write_presence()
+    return _PRESENCE_DATA["channels"]
 
 
 # ---------------------------------------------------------------------------
@@ -546,14 +600,22 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 _start_watcher(AGENT_ID)
 
-# Build instructions from template
+# Build instructions from template. The default below is the load-bearing
+# "when to reach for this" contract — override it via the `instructions` config
+# key for environment-specific guidance (e.g. escalation to a deliberation tool).
 _default_instructions = (
-    "This is the MCP Dispatch server. You are agent '{agent_id}'. "
-    "Use dispatch() to send messages to other agents, "
-    "peek() to read incoming messages and check delivery receipts for sent messages, "
-    "ack() to acknowledge processed messages, "
-    "who() to see who's online. "
-    "Messages from others are also included in every tool response (piggyback delivery). "
+    "You are agent '{agent_id}' on MCP Dispatch, a messaging rail shared with "
+    "other agent sessions running concurrently on this host. "
+    "WHEN to use it: when your work would ripple into another session's work — a "
+    "shared-interface change, a decision that affects a dependent project, or a "
+    "learning a sibling session needs — dispatch a short FYI to the relevant agent "
+    "or channel. Most exchanges are 1-3 messages. "
+    "Tools: dispatch(message, target) sends to an agent id, a '#channel', or 'all'; "
+    "peek() reads new messages and shows receipts for what you sent; "
+    "ack(ids) clears messages you're done with; who() lists who's online; "
+    "subscribe('#name')/unsubscribe('#name') manage channel membership. "
+    "Incoming messages also ride along on every tool response (piggyback delivery) — "
+    "address them before resuming your current task. "
     "Available targets: {agent_list}."
 )
 _instructions_template = CONFIG["instructions"] or _default_instructions
@@ -574,14 +636,15 @@ mcp = FastMCP("dispatch", instructions=_instructions)
 @mcp.tool(
     name="dispatch",
     description=(
-        "Send a message to another agent or all agents. "
+        "Send a message to a target: one agent (its id), a channel ('#name', "
+        "delivered to current subscribers), or 'all'. "
         "Use priority='urgent' for time-sensitive messages. "
         "Optional: thread_id groups messages into conversations, "
         "reply_to references a specific message, "
         "payload carries structured data (dict), "
         "ttl sets expiry in seconds, "
         "must_read=true prevents auto-expiry. "
-        "Returns confirmation plus any pending messages for you."
+        "Returns confirmation (incl. delivered_to) plus any pending messages for you."
     ),
 )
 def dispatch_tool(
@@ -612,6 +675,7 @@ def dispatch_tool(
             "id": sent["id"],
             "from": AGENT_ID,
             "to": target,
+            "delivered_to": sent.get("delivered_to", []),
             "priority": priority,
             "thread_id": sent.get("thread_id"),
         }
@@ -723,6 +787,35 @@ def who_tool() -> dict:
         "agents": agents,
         "count": len(agents),
     }
+
+
+@mcp.tool(
+    name="subscribe",
+    description=(
+        "Subscribe to a channel so dispatch(target='#name') reaches you. "
+        "Pass the channel name with or without the leading '#'. "
+        "Subscriptions are ephemeral — they vanish when this session exits."
+    ),
+)
+def subscribe_tool(channel: str) -> dict:
+    """Join a channel."""
+    name = channel[1:] if channel.startswith("#") else channel
+    channels = _set_subscription(name, True)
+    return _with_pending({"agent_id": AGENT_ID, "subscribed": name, "channels": channels})
+
+
+@mcp.tool(
+    name="unsubscribe",
+    description=(
+        "Leave a channel you previously subscribed to. "
+        "Pass the channel name with or without the leading '#'."
+    ),
+)
+def unsubscribe_tool(channel: str) -> dict:
+    """Leave a channel."""
+    name = channel[1:] if channel.startswith("#") else channel
+    channels = _set_subscription(name, False)
+    return _with_pending({"agent_id": AGENT_ID, "unsubscribed": name, "channels": channels})
 
 
 if __name__ == "__main__":
