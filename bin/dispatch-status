@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only snapshot of the dispatch relay.
 
-Shows which agent sessions are live (presence file + alive pid), their channel
+Shows which agent sessions are live (hold their presence lock), their channel
 subscriptions, and how many unread messages sit in each inbox — plus any
 orphaned inboxes (messages whose owner is gone). Touches nothing.
 
@@ -11,6 +11,7 @@ orphaned inboxes (messages whose owner is gone). Touches nothing.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -45,16 +46,21 @@ def _relay_dir() -> Path:
     return Path(os.path.expanduser(raw))
 
 
-def _pid_alive(pid: int) -> bool:
+def _presence_is_live(pf: Path) -> bool:
+    """A live owner holds the exclusive flock on this presence file (uid-agnostic,
+    pid-reuse-immune). If we can take the lock, nobody's home."""
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False  # ESRCH — no such process
-    except PermissionError:
-        return True  # EPERM — exists, owned by another user (group_mode)
+        fh = open(pf)
     except OSError:
         return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
 
 
 def _pending(inbox: Path) -> int:
@@ -84,7 +90,7 @@ def main() -> int:
             data = json.loads(pf.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if _pid_alive(data.get("pid", -1)):
+        if _presence_is_live(pf):
             live[data.get("agent_id", pf.stem)] = data
 
     print(f"relay: {relay}")

@@ -1,32 +1,41 @@
 """Channel subscription + fan-out tests.
 
-Subscriptions live in the per-agent presence record, so a "subscriber" in these
-tests is an agent whose presence file lists the channel. Because each loaded
-server instance owns exactly one presence handle, we drive multi-agent
-scenarios by writing sibling presence records directly and keeping their pids
-alive (this process).
+A "subscriber" is an agent whose presence record lists the channel AND whose
+owner is live. Liveness is the presence flock, so we simulate sibling agents by
+writing a presence file and actually holding an exclusive flock on it (a record
+with no held lock reads as dead, exactly like a crashed peer).
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
-import os
+
+import pytest
 
 
-def _add_subscriber(server, agent_id, channels):
-    """Create a live sibling presence record subscribed to channels."""
-    (server.DISPATCH_DIR / agent_id).mkdir(exist_ok=True)
-    pf = server.DISPATCH_DIR / ".presence" / f"{agent_id}.json"
-    pf.write_text(
-        json.dumps(
-            {
-                "agent_id": agent_id,
-                "pid": os.getpid(),  # alive: this test process
-                "started": "2026-06-05T00:00:00Z",
-                "channels": list(channels),
-            }
-        )
-    )
+@pytest.fixture
+def add_live():
+    """Factory: create a sibling presence record and hold its flock (live owner).
+
+    Held handles are closed at teardown so the locks release.
+    """
+    held = []
+
+    def _add(server, agent_id, channels):
+        (server.DISPATCH_DIR / agent_id).mkdir(exist_ok=True)
+        pf = server.DISPATCH_DIR / ".presence" / f"{agent_id}.json"
+        pf.write_text(json.dumps({"agent_id": agent_id, "channels": list(channels)}))
+        fh = open(pf, "a+")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held.append(fh)
+
+    yield _add
+    for fh in held:
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 
 def test_subscribe_updates_presence(server):
@@ -47,20 +56,20 @@ def test_unsubscribe_removes(server):
     assert server._set_subscription("gemot", False) == []
 
 
-def test_channel_send_reaches_only_subscribers(server):
+def test_channel_send_reaches_only_subscribers(server, add_live):
     # alpha (the loaded server) sends; beta subscribes, carol does not.
-    _add_subscriber(server, "beta", ["gemot"])
-    _add_subscriber(server, "carol", [])
+    add_live(server, "beta", ["gemot"])
+    add_live(server, "carol", [])
     sent = server._send("alpha", "#gemot", "channel hello")
     assert sent["delivered_to"] == ["beta"]
     assert any(m["content"] == "channel hello" for m in server._read_inbox("beta"))
     assert server._read_inbox("carol") == []
 
 
-def test_channel_send_excludes_sender(server):
+def test_channel_send_excludes_sender(server, add_live):
     # alpha is itself subscribed; it must not receive its own channel message.
     server._set_subscription("gemot", True)
-    _add_subscriber(server, "beta", ["gemot"])
+    add_live(server, "beta", ["gemot"])
     sent = server._send(server.AGENT_ID, "#gemot", "to the channel")
     assert server.AGENT_ID not in sent["delivered_to"]
     assert "beta" in sent["delivered_to"]
@@ -72,19 +81,16 @@ def test_channel_send_with_no_subscribers_delivers_nothing(server):
 
 
 def test_dead_subscriber_is_skipped(server):
-    # A presence record with a dead pid must not receive channel messages.
+    # A presence record whose owner holds no flock (crashed/exited) is dead and
+    # must not receive channel messages — regardless of the pid field.
     pf = server.DISPATCH_DIR / ".presence" / "ghost.json"
     (server.DISPATCH_DIR / "ghost").mkdir(exist_ok=True)
-    pf.write_text(
-        json.dumps({"agent_id": "ghost", "pid": 2**31 - 1, "started": "x", "channels": ["gemot"]})
-    )
+    pf.write_text(json.dumps({"agent_id": "ghost", "channels": ["gemot"]}))
     sent = server._send("alpha", "#gemot", "anyone there?")
     assert "ghost" not in sent["delivered_to"]
 
 
 def test_channel_name_validated(server):
-    import pytest
-
     with pytest.raises(ValueError):
         server._send("alpha", "#../evil", "traversal via channel")
 

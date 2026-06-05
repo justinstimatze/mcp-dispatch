@@ -60,15 +60,28 @@ def test_must_read_overrides_ttl(server, monkeypatch):
 
 
 def test_broadcast_fans_out_excluding_sender(server_factory):
+    import fcntl
+    import json
+
     srv = server_factory("alpha")
-    # Create inboxes for beta and gamma by sending direct first.
-    srv._send("alpha", "beta", "seed")
-    srv._send("alpha", "gamma", "seed")
-    srv._send("alpha", "all", "broadcast")
-    assert any(m["content"] == "broadcast" for m in srv._read_inbox("beta"))
-    assert any(m["content"] == "broadcast" for m in srv._read_inbox("gamma"))
-    # Sender does not receive its own broadcast.
-    assert all(m["content"] != "broadcast" for m in srv._read_inbox("alpha"))
+    # Broadcast reaches live agents (presence + held flock), not bare inbox dirs.
+    held = []
+    for aid in ("beta", "gamma"):
+        (srv.DISPATCH_DIR / aid).mkdir(exist_ok=True)
+        pf = srv.DISPATCH_DIR / ".presence" / f"{aid}.json"
+        pf.write_text(json.dumps({"agent_id": aid, "channels": []}))
+        fh = open(pf, "a+")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        held.append(fh)
+    try:
+        srv._send("alpha", "all", "broadcast")
+        assert any(m["content"] == "broadcast" for m in srv._read_inbox("beta"))
+        assert any(m["content"] == "broadcast" for m in srv._read_inbox("gamma"))
+        # Sender does not receive its own broadcast.
+        assert all(m["content"] != "broadcast" for m in srv._read_inbox("alpha"))
+    finally:
+        for fh in held:
+            fh.close()
 
 
 def test_piggyback_attaches_pending(server_factory):
