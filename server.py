@@ -169,18 +169,6 @@ def _validate_id(value: str, kind: str = "agent id") -> str:
     return value
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False  # ESRCH — no such process
-    except PermissionError:
-        return True  # EPERM — process exists but is owned by another user (group_mode)
-    except OSError:
-        return False
-
-
 def _enforce_dir_mode(path: Path) -> None:
     """chmod a dir to DIR_MODE. In shared mode the relay may be owned by another
     participant (already set up correctly), so tolerate not being the owner — but
@@ -233,12 +221,19 @@ _PRESENCE_DATA: dict = {}
 
 
 def _write_presence() -> None:
-    """Persist _PRESENCE_DATA through the held, locked handle."""
+    """Persist _PRESENCE_DATA through the held, locked handle.
+
+    The handle keeps the flock that gates identity, so we can't atomically
+    replace the file (rename would orphan the lock on a new inode). Serialize
+    before truncating to keep the truncate→write empty-file window as small as
+    possible for concurrent readers.
+    """
     if _PRESENCE_HANDLE is None:
         return
+    payload = json.dumps(_PRESENCE_DATA)
     _PRESENCE_HANDLE.seek(0)
     _PRESENCE_HANDLE.truncate()
-    _PRESENCE_HANDLE.write(json.dumps(_PRESENCE_DATA))
+    _PRESENCE_HANDLE.write(payload)
     _PRESENCE_HANDLE.flush()
     os.fsync(_PRESENCE_HANDLE.fileno())
 
@@ -332,17 +327,91 @@ def _release_id(agent_id: str) -> None:
         _PRESENCE_HANDLE = None
 
 
+def _presence_is_live(pf: Path) -> bool:
+    """True iff a live process holds the exclusive flock on this presence file.
+
+    The lock — not the pid field — is the source of truth: it's uid-agnostic
+    (works across accounts in group_mode, unlike os.kill) and immune to pid
+    reuse, because the kernel drops it when the owner dies, crashes, or the host
+    reboots. We probe with a non-blocking exclusive lock: if we can take it,
+    nobody's home; if it blocks, a live process holds it.
+    """
+    try:
+        fh = open(pf)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+def _live_presence_files() -> list[Path]:
+    """Presence files whose owner is currently live."""
+    return [
+        pf for pf in sorted((DISPATCH_DIR / ".presence").glob("*.json")) if _presence_is_live(pf)
+    ]
+
+
+def _live_agents() -> list[str]:
+    """Agent ids with a live presence record (validated to be path-safe)."""
+    out: list[str] = []
+    for pf in _live_presence_files():
+        try:
+            aid = json.loads(pf.read_text()).get("agent_id") or pf.stem
+        except (OSError, json.JSONDecodeError):
+            aid = pf.stem
+        if _ID_RE.match(str(aid)):
+            out.append(str(aid))
+    return out
+
+
+def _reap_dead_presence() -> int:
+    """Unlink presence files with no live owner. Returns count removed.
+
+    Holds the lock across the unlink so a process reclaiming the same id can't
+    recreate-and-lock the file underneath us mid-delete. Run at startup; who()
+    and channel reads merely *filter* by liveness rather than delete, which
+    avoids racing a concurrent claimant.
+    """
+    removed = 0
+    for pf in sorted((DISPATCH_DIR / ".presence").glob("*.json")):
+        try:
+            fh = open(pf)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # live owner — leave it
+            try:
+                pf.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Message I/O
 # ---------------------------------------------------------------------------
 
 
 def _atomic_write(path: Path, data: dict) -> None:
-    """Write JSON atomically: write tmp, fsync, then rename.
+    """Write JSON durably and atomically: write tmp, fsync file, rename, fsync dir.
 
-    POSIX rename only guarantees the directory entry swaps atomically; fsync
-    before the rename ensures the file's bytes are durable first, so a crash
-    can't leave a renamed-but-empty file.
+    fsync on the file makes its bytes durable before the rename (no renamed-but-
+    empty file on crash); fsync on the parent directory makes the rename itself
+    durable (otherwise a crash can lose the new directory entry, dropping the
+    message entirely).
     """
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as f:
@@ -350,6 +419,14 @@ def _atomic_write(path: Path, data: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def _parse_timestamp(ts: str) -> float:
@@ -456,8 +533,9 @@ def _send(
         "state": "pending",
     }
 
-    # Enforce size limit
-    msg_bytes = len(json.dumps(msg).encode("utf-8"))
+    # Enforce size limit against the bytes actually written (indent=2, matching
+    # _atomic_write) plus headroom for the read_at/state fields added on read.
+    msg_bytes = len(json.dumps(msg, indent=2).encode("utf-8")) + 64
     if msg_bytes > MAX_MESSAGE_BYTES:
         raise ValueError(
             f"Message too large ({msg_bytes} bytes). Maximum: {MAX_MESSAGE_BYTES} bytes."
@@ -486,8 +564,11 @@ def _send(
         _atomic_write(DISPATCH_DIR / target / _filename(), dict(msg))
 
     if to == "all":
-        # Broadcast: every known agent except the sender.
-        delivered = [aid for aid in _discover_agents() if aid != from_id]
+        # Broadcast: live agents in dynamic mode (a dead <project>-<pid> id never
+        # returns, so writing to its inbox is pure waste). In roster mode keep the
+        # full roster — an offline roster agent keeps its id and collects mail.
+        pool = AGENT_IDS if AGENT_IDS else _live_agents()
+        delivered = [aid for aid in pool if aid != from_id]
         for target in delivered:
             _deliver_one(target)
     elif to.startswith("#"):
@@ -524,12 +605,12 @@ def _discover_agents() -> list[str]:
 def _channel_subscribers(channel: str) -> list[str]:
     """Live agents currently subscribed to a channel, by presence record."""
     subs: list[str] = []
-    for pf in sorted((DISPATCH_DIR / ".presence").glob("*.json")):
+    for pf in _live_presence_files():
         try:
             data = json.loads(pf.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if channel in data.get("channels", []) and _pid_alive(data.get("pid", -1)):
+        if channel in data.get("channels", []):
             aid = data.get("agent_id")
             # The agent_id becomes a path segment in _deliver_one. A presence
             # file is group-writable in group_mode, so don't trust it blindly.
@@ -710,6 +791,7 @@ def _start_watcher(agent_id: str) -> None:
 
 _setup_dirs()
 _sweep_stale_tmp()
+_reap_dead_presence()  # GC presence files whose owner is gone (e.g. after reboot)
 AGENT_ID = _claim_id()
 print(f"[dispatch] I am {AGENT_ID} (PID {os.getpid()})", file=sys.stderr)
 
@@ -894,17 +976,15 @@ def ack_tool(
     description="List all currently connected agents and their status.",
 )
 def who_tool() -> dict:
-    """List connected agents via presence files."""
-    presence_dir = DISPATCH_DIR / ".presence"
+    """List connected agents. Liveness is the presence flock, not a pid check.
+
+    This only *filters* by liveness; it never unlinks (that would race a process
+    reclaiming the same id). Dead presence files are reaped at startup instead.
+    """
     agents: list[dict] = []
-    for pf in sorted(presence_dir.glob("*.json")):
+    for pf in _live_presence_files():
         try:
-            data = json.loads(pf.read_text())
-            pid = data.get("pid", -1)
-            if _pid_alive(pid):
-                agents.append(data)
-            else:
-                pf.unlink()  # Clean stale
+            agents.append(json.loads(pf.read_text()))
         except (json.JSONDecodeError, OSError):
             pass
 

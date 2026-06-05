@@ -1,34 +1,27 @@
 """Regression tests for the adversarial-review fixes.
 
-Covers: the cross-account _pid_alive EPERM bug, the \\Z id anchor, ttl=0 /
-negative-ttl semantics, untrusted presence agent_id in channel fan-out, and
-group_mode's refusal to run against a relay that isn't actually shared.
+Covers: the \\Z id anchor, ttl=0 / negative-ttl semantics, untrusted presence
+agent_id in channel fan-out, and group_mode's refusal to run against a relay
+that isn't actually shared. (Liveness moved to flock — see test_liveness.py.)
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 
 import pytest
 
-# --- _pid_alive cross-account (EPERM means alive) --------------------------
 
-
-def test_pid_alive_eperm_is_alive(server, monkeypatch):
-    def fake_kill(_pid, _sig):
-        raise PermissionError()  # EPERM: exists but owned by another user
-
-    monkeypatch.setattr(server.os, "kill", fake_kill)
-    assert server._pid_alive(424242) is True
-
-
-def test_pid_alive_esrch_is_dead(server, monkeypatch):
-    def fake_kill(_pid, _sig):
-        raise ProcessLookupError()  # ESRCH: truly gone
-
-    monkeypatch.setattr(server.os, "kill", fake_kill)
-    assert server._pid_alive(424242) is False
+def _hold_presence(server, agent_id, channels):
+    """Create a presence file AND hold its flock, simulating a live owner."""
+    (server.DISPATCH_DIR / agent_id).mkdir(exist_ok=True)
+    pf = server.DISPATCH_DIR / ".presence" / f"{agent_id}.json"
+    pf.write_text(json.dumps({"agent_id": agent_id, "channels": list(channels)}))
+    fh = open(pf, "a+")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fh  # caller keeps it open to hold the lock
 
 
 # --- id anchor: \Z, not $ (no trailing-newline bypass) ---------------------
@@ -63,9 +56,16 @@ def test_ttl_none_uses_default(server):
 
 
 def test_channel_skips_invalid_presence_agent_id(server):
-    pf = server.DISPATCH_DIR / ".presence" / "evil.json"
-    pf.write_text(json.dumps({"agent_id": "../../tmp/pwn", "pid": os.getpid(), "channels": ["x"]}))
-    assert "../../tmp/pwn" not in server._channel_subscribers("x")
+    # Hold the lock so the record is *live* — the id validation, not liveness,
+    # must be what excludes the traversal payload.
+    fh = _hold_presence(server, "evil", ["x"])
+    try:
+        (server.DISPATCH_DIR / ".presence" / "evil.json").write_text(
+            json.dumps({"agent_id": "../../tmp/pwn", "channels": ["x"]})
+        )
+        assert "../../tmp/pwn" not in server._channel_subscribers("x")
+    finally:
+        fh.close()
 
 
 # --- group_mode refuses an unusable / non-shared relay ---------------------

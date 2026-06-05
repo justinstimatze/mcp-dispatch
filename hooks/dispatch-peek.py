@@ -25,6 +25,7 @@ Wire into ~/.claude/settings.json:
 from __future__ import annotations
 
 import calendar
+import fcntl
 import hashlib
 import json
 import os
@@ -66,16 +67,21 @@ def _dispatch_dir() -> Path:
     return Path(os.path.expanduser(raw))
 
 
-def _pid_alive(pid: int) -> bool:
+def _presence_is_live(pf: Path) -> bool:
+    """A live owner holds the exclusive flock on this presence file (uid-agnostic,
+    pid-reuse-immune). If we can take the lock, nobody's home."""
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False  # ESRCH — no such process
-    except PermissionError:
-        return True  # EPERM — exists, owned by another user (group_mode)
+        fh = open(pf)
     except OSError:
         return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
 
 
 def _resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
@@ -94,7 +100,7 @@ def _resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
         except (json.JSONDecodeError, OSError):
             continue
         aid = data.get("agent_id", "")
-        if aid.startswith(f"{prefix}-") and _pid_alive(data.get("pid", -1)):
+        if aid.startswith(f"{prefix}-") and _presence_is_live(pf):
             matches.append(aid)
     return matches[0] if len(matches) == 1 else None
 
