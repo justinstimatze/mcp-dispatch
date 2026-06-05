@@ -1,0 +1,39 @@
+# Example mcp-dispatch config. Copy to ~/.config/mcp-dispatch/config.toml
+# (or point MCP_DISPATCH_CONFIG at it) and edit to taste.
+
+# Agent roster. Omit (or leave empty) for dynamic mode, where any validated
+# agent id is accepted and inboxes are created on demand. With the launcher
+# (bin/dispatch-launcher) deriving "<project>-<pid>" ids, dynamic mode is the
+# usual choice.
+# agents = ["alice", "bob", "carol"]
+
+# Where messages live. Per-user, created 0700; messages are 0600.
+dispatch_dir = "~/.config/mcp-dispatch/messages"
+
+# Max message size in bytes.
+max_message_bytes = 65536
+
+# Default TTL in seconds. 0 = no expiry. must_read messages ignore it.
+default_ttl = 7200  # 120 minutes
+
+# Affordance contract — the load-bearing "when to reach for this" guidance the
+# model reads at session start. The built-in default is a good generic version;
+# override here for environment-specific escalation paths. Placeholders:
+# {agent_id}, {agent_list}.
+#
+# This example wires the loose escalation seam to a structured-deliberation tool
+# via the generic payload field (no coupling in the dispatch code itself):
+instructions = """
+You are agent '{agent_id}' on MCP Dispatch, a messaging rail shared with other \
+agent sessions running concurrently on this host (siblings in nearby project \
+directories). When your work would ripple into a sibling's work — a shared- \
+interface change, a decision affecting a dependent repo, or a learning a sibling \
+needs — dispatch a short FYI to the relevant agent or '#channel'. Most exchanges \
+are 1-3 messages. If a genuine weighed decision emerges, escalate: open a gemot \
+deliberation and dispatch its join code as a structured payload, e.g. \
+payload={{"type": "gemot.invite", "deliberation_id": "...", "join_code": "..."}}. \
+Tools: dispatch(message, target), peek(), ack(ids), who(), \
+subscribe('#name')/unsubscribe('#name'). Incoming messages also piggyback on \
+every tool response — address them before resuming your current task. \
+Available targets: {agent_list}.
+"""

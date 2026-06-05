@@ -7,12 +7,15 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 ## Features
 
 - **Non-destructive messaging** — Messages persist until explicitly acknowledged. No more lost messages from crashes or compaction.
+- **Channels** — `subscribe('#name')` and `dispatch(target='#name')` fan a message out to current subscribers. Ephemeral — subscriptions vanish when a session exits.
 - **Threading** — Group messages into conversations with `thread_id` and `reply_to`.
 - **Structured payloads** — Attach machine-readable data alongside human-readable messages.
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
+- **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
+- **Local-only & per-user** — `0700`/`0600` perms, validated ids, no network. See [Security](#security).
 
 ## Quick Start
 
@@ -51,7 +54,23 @@ Add to your `~/.claude.json`:
 }
 ```
 
-Each Claude Code window needs a unique `MCP_DISPATCH_AGENT_ID`.
+Each Claude Code window needs a unique `MCP_DISPATCH_AGENT_ID`. To avoid hand-
+assigning one per window, point `command` at the launcher instead, which derives
+a `<project>-<pid>` id from the working directory:
+
+```json
+{
+  "mcpServers": {
+    "dispatch": {
+      "type": "stdio",
+      "command": "/path/to/mcp-dispatch/bin/dispatch-launcher"
+    }
+  }
+}
+```
+
+A session started in `~/Documents/gemot` then becomes agent `gemot-<pid>`. An
+explicit `MCP_DISPATCH_AGENT_ID` always wins.
 
 ### 3. Send messages
 
@@ -67,17 +86,18 @@ Agent bob:   ack(["msg-abc12345"])  →  message removed
 
 | Tool | Description |
 |------|-------------|
-| `dispatch(message, target, ...)` | Send a message to one agent or all |
+| `dispatch(message, target, ...)` | Send to one agent (`id`), a channel (`#name`), or `all` |
 | `peek(thread_id?, include_read?)` | Read messages and delivery receipts for sent messages |
 | `ack(message_ids)` | Acknowledge and delete processed messages |
-| `who()` | List connected agents |
+| `who()` | List connected agents and their channel subscriptions |
+| `subscribe(channel)` / `unsubscribe(channel)` | Join / leave a channel |
 
 ### dispatch
 
 ```python
 dispatch(
     message="Deployed to staging",
-    target="all",           # or a specific agent name
+    target="all",           # an agent id, a "#channel", or "all"
     priority="normal",      # "normal" or "urgent"
     thread_id="deploy-123", # optional: group into conversation
     reply_to="msg-abc",     # optional: reference specific message
@@ -86,6 +106,20 @@ dispatch(
     must_read=True,         # optional: survive TTL, require explicit ack
 )
 ```
+
+The response includes `delivered_to` — the list of agents the message actually
+reached (empty for a channel with no current subscribers).
+
+### channels
+
+```python
+subscribe("#deploys")              # join (with or without the leading '#')
+dispatch("staging is up", "#deploys")   # fan out to current subscribers
+unsubscribe("#deploys")            # leave
+```
+
+Channels are presence-derived and ephemeral: a subscription lives only as long
+as the session, and a channel send reaches whoever is subscribed *right now*.
 
 ### peek
 
@@ -131,9 +165,30 @@ default_ttl = 7200
 | `MCP_DISPATCH_CONFIG` | Config file path (default: `~/.config/mcp-dispatch/config.toml`) |
 | `MCP_DISPATCH_DIR` | Override dispatch directory from config |
 
+A fuller annotated example lives in [`config.example.toml`](config.example.toml),
+including an `instructions` template that wires a loose escalation seam to a
+structured-deliberation tool via the generic `payload` field.
+
 ### Dynamic Mode
 
-When no `agents` roster is configured, any agent name is accepted. Inbox directories are created on demand. This is more flexible but less safe (typos create phantom agents).
+When no `agents` roster is configured, any validated agent name is accepted (see [Security](#security) for the id rules). Inbox directories are created on demand. This is more flexible but less safe (typos create phantom agents). It pairs naturally with the launcher's `<project>-<pid>` ids.
+
+### Stop hook (optional)
+
+Sessions that only *consume* messages never call a dispatch tool, so piggyback
+delivery never fires for them. `hooks/dispatch-peek.py` is a Stop hook that reads
+the inbox directly from the filesystem and surfaces unread messages back into the
+conversation, rate-limited to every 5th turn. Wire it into `~/.claude/settings.json`:
+
+```json
+{ "hooks": { "Stop": [ { "hooks": [
+  { "type": "command", "command": "/path/to/mcp-dispatch/hooks/dispatch-peek.py" }
+] } ] } }
+```
+
+It resolves your agent id from `$MCP_DISPATCH_AGENT_ID`, falling back to the single
+live `<project>-<pid>` agent for the session's directory. It is read-only —
+acknowledge messages with `ack()`.
 
 ## How It Works
 
@@ -142,6 +197,9 @@ When no `agents` roster is configured, any agent name is accepted. Inbox directo
 - Presence is held via an exclusive `flock` on a file in `{dispatch_dir}/.presence/`,
   so a crashed process's identity is freed by the kernel and two live processes
   can never claim the same agent id
+- Channel subscriptions are stored in the presence record; a `#channel` send
+  fans out to every live subscriber, so channels need no separate state and are
+  cleaned up automatically when sessions exit
 - Messages have states: `pending` → `read` → acknowledged (deleted)
 - Piggyback delivery: pending messages are attached to every tool response
 - TTL cleanup runs lazily on read operations
