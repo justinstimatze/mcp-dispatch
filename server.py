@@ -25,15 +25,16 @@ Tools:
 from __future__ import annotations
 
 import atexit
+import fcntl
 import json
 import os
+import re
 import signal
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -45,12 +46,17 @@ except ImportError:
 
 # Optional: filesystem watcher for real-time stderr alerts
 try:
+    from watchdog.events import FileCreatedEvent, FileSystemEventHandler
     from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
+
+# Inter-agent message files may contain coordination details that other local
+# users have no business reading. Default to owner-only (0600 files / 0700
+# dirs) regardless of the inherited umask. Runs before any file is created.
+os.umask(0o077)
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +67,7 @@ _DEFAULT_CONFIG = {
     "agents": [],  # empty = dynamic registration (any name accepted)
     "dispatch_dir": "~/.config/mcp-dispatch/messages",
     "max_message_bytes": 65536,
-    "default_ttl": 0,  # 0 = no default expiry
+    "default_ttl": 7200,  # seconds; 120-min ambient default (0 = no expiry; must_read overrides)
     "instructions": "",  # empty = use built-in template
 }
 
@@ -96,7 +102,7 @@ def _load_config() -> dict:
         except Exception as e:
             print(f"[dispatch] Config error ({config_path}): {e}", file=sys.stderr)
     else:
-        print(f"[dispatch] No config file found, using defaults", file=sys.stderr)
+        print("[dispatch] No config file found, using defaults", file=sys.stderr)
 
     # Env var overrides
     if os.environ.get("MCP_DISPATCH_DIR"):
@@ -105,7 +111,7 @@ def _load_config() -> dict:
         config["dispatch_dir"] = os.environ["DISPATCH_DIR"]  # legacy fallback
 
     # Expand ~ in dispatch_dir
-    config["dispatch_dir"] = os.path.expanduser(config["dispatch_dir"])
+    config["dispatch_dir"] = os.path.expanduser(str(config["dispatch_dir"]))
 
     return config
 
@@ -123,6 +129,21 @@ DYNAMIC_MODE = len(AGENT_IDS) == 0  # no roster = accept any agent name
 # ---------------------------------------------------------------------------
 
 
+# Agent ids and targets become path segments under DISPATCH_DIR, so they must
+# never contain separators or traversal sequences. Constrain to a safe charset.
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _validate_id(value: str, kind: str = "agent id") -> str:
+    """Ensure an id is a single safe path segment. Raises ValueError otherwise."""
+    if not isinstance(value, str) or not _ID_RE.match(value):
+        raise ValueError(
+            f"Invalid {kind} {value!r}: must match {_ID_RE.pattern} "
+            "(lowercase alphanumeric, '_' or '-', 1-64 chars, no path separators)."
+        )
+    return value
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -133,9 +154,60 @@ def _pid_alive(pid: int) -> bool:
 
 def _setup_dirs() -> None:
     DISPATCH_DIR.mkdir(parents=True, exist_ok=True)
-    (DISPATCH_DIR / ".presence").mkdir(exist_ok=True)
+    presence = DISPATCH_DIR / ".presence"
+    presence.mkdir(exist_ok=True)
+    # Explicit chmod in case the dirs predate this server's umask.
+    os.chmod(DISPATCH_DIR, 0o700)
+    os.chmod(presence, 0o700)
     for aid in AGENT_IDS:
         (DISPATCH_DIR / aid).mkdir(exist_ok=True)
+
+
+def _sweep_stale_tmp(max_age_s: int = 60) -> None:
+    """Unlink orphaned *.tmp files left by writers that crashed mid-rename."""
+    cutoff = time.time() - max_age_s
+    for tmp in DISPATCH_DIR.glob("*/*.tmp"):
+        try:
+            if tmp.stat().st_mtime < cutoff:
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+# Held for the process lifetime so the flock on the presence file stays
+# acquired. Closing or GC'ing this handle would release the lock.
+_PRESENCE_HANDLE = None
+
+
+def _try_lock_presence(pf: Path, agent_id: str) -> bool:
+    """Atomically claim a presence file via an exclusive, non-blocking flock.
+
+    Returns True and records the handle on success; False if another live
+    process holds the identity. The lock — not a pid heuristic — is the source
+    of truth, so a crashed process's lock is released by the kernel for free.
+    """
+    global _PRESENCE_HANDLE
+    fh = open(pf, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    fh.seek(0)
+    fh.truncate()
+    fh.write(
+        json.dumps(
+            {
+                "agent_id": agent_id,
+                "pid": os.getpid(),
+                "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        )
+    )
+    fh.flush()
+    os.fsync(fh.fileno())
+    _PRESENCE_HANDLE = fh
+    return True
 
 
 def _claim_id() -> str:
@@ -154,6 +226,7 @@ def _claim_id() -> str:
     )
 
     if explicit:
+        _validate_id(explicit)
         if AGENT_IDS and explicit not in AGENT_IDS:
             raise ValueError(
                 f"Agent ID '{explicit}' is not in the configured roster. "
@@ -162,28 +235,11 @@ def _claim_id() -> str:
         # In dynamic mode, create inbox dir on demand
         (DISPATCH_DIR / explicit).mkdir(exist_ok=True)
 
-        # Check if slot is held by a different live process
-        pf = presence_dir / f"{explicit}.json"
-        if pf.exists():
-            try:
-                data = json.loads(pf.read_text())
-                other_pid = data.get("pid", -1)
-                if other_pid != os.getpid() and _pid_alive(other_pid):
-                    print(
-                        f"[dispatch] WARNING: {explicit} claimed by PID {other_pid}, taking over",
-                        file=sys.stderr,
-                    )
-            except (json.JSONDecodeError, KeyError, OSError):
-                pass
-        pf.write_text(
-            json.dumps(
-                {
-                    "agent_id": explicit,
-                    "pid": os.getpid(),
-                    "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
+        if not _try_lock_presence(presence_dir / f"{explicit}.json", explicit):
+            raise RuntimeError(
+                f"Agent ID '{explicit}' is already held by a live process. "
+                "Stop that instance or choose a different MCP_DISPATCH_AGENT_ID."
             )
-        )
         return explicit
 
     if DYNAMIC_MODE:
@@ -192,27 +248,10 @@ def _claim_id() -> str:
             "set MCP_DISPATCH_AGENT_ID in your environment."
         )
 
-    # Auto-claim: first available slot from roster
+    # Auto-claim: first slot whose presence lock we can acquire.
     for aid in AGENT_IDS:
-        pf = presence_dir / f"{aid}.json"
-        if pf.exists():
-            try:
-                data = json.loads(pf.read_text())
-                if _pid_alive(data.get("pid", -1)):
-                    continue
-            except (json.JSONDecodeError, KeyError, OSError):
-                pass
-
-        pf.write_text(
-            json.dumps(
-                {
-                    "agent_id": aid,
-                    "pid": os.getpid(),
-                    "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                }
-            )
-        )
-        return aid
+        if _try_lock_presence(presence_dir / f"{aid}.json", aid):
+            return aid
 
     raise RuntimeError(
         f"All {len(AGENT_IDS)} agent slots are claimed by live processes. "
@@ -221,11 +260,18 @@ def _claim_id() -> str:
 
 
 def _release_id(agent_id: str) -> None:
+    global _PRESENCE_HANDLE
     pf = DISPATCH_DIR / ".presence" / f"{agent_id}.json"
     try:
         pf.unlink(missing_ok=True)
     except OSError:
         pass
+    if _PRESENCE_HANDLE is not None:
+        try:
+            _PRESENCE_HANDLE.close()  # releases the flock
+        except OSError:
+            pass
+        _PRESENCE_HANDLE = None
 
 
 # ---------------------------------------------------------------------------
@@ -234,16 +280,24 @@ def _release_id(agent_id: str) -> None:
 
 
 def _atomic_write(path: Path, data: dict) -> None:
-    """Write JSON atomically via tmp + rename."""
+    """Write JSON atomically: write tmp, fsync, then rename.
+
+    POSIX rename only guarantees the directory entry swaps atomically; fsync
+    before the rename ensures the file's bytes are durable first, so a crash
+    can't leave a renamed-but-empty file.
+    """
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.rename(path)
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def _parse_timestamp(ts: str) -> float:
     """Parse ISO 8601 timestamp to epoch seconds."""
     try:
-        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
         return dt.timestamp()
     except (ValueError, TypeError):
         return 0.0
@@ -277,7 +331,9 @@ def _cleanup_expired(agent_id: str) -> int:
     return removed
 
 
-def _read_inbox(agent_id: str, *, state_filter: str | None = None, thread_id: str | None = None) -> list[dict]:
+def _read_inbox(
+    agent_id: str, *, state_filter: str | None = None, thread_id: str | None = None
+) -> list[dict]:
     """Read messages from inbox with optional filtering. Non-destructive."""
     inbox = DISPATCH_DIR / agent_id
     messages: list[dict] = []
@@ -342,27 +398,35 @@ def _send(
     msg_bytes = len(json.dumps(msg).encode("utf-8"))
     if msg_bytes > MAX_MESSAGE_BYTES:
         raise ValueError(
-            f"Message too large ({msg_bytes} bytes). "
-            f"Maximum: {MAX_MESSAGE_BYTES} bytes."
+            f"Message too large ({msg_bytes} bytes). Maximum: {MAX_MESSAGE_BYTES} bytes."
         )
 
     ts = str(int(time.time() * 1000))
 
+    def _filename() -> str:
+        # uuid suffix prevents two same-millisecond sends from the same sender
+        # from colliding on one filename (which would silently drop a message).
+        return f"{ts}-{from_id}-{uuid.uuid4().hex[:8]}.json"
+
     def _validate_target(target: str) -> None:
-        if not DYNAMIC_MODE and target not in AGENT_IDS:
-            valid = ", ".join(AGENT_IDS) + ", all"
-            raise ValueError(f"Unknown agent '{target}'. Valid targets: {valid}")
-        # In dynamic mode, create inbox on demand
+        if not DYNAMIC_MODE:
+            if target not in AGENT_IDS:
+                valid = ", ".join(AGENT_IDS) + ", all"
+                raise ValueError(f"Unknown agent '{target}'. Valid targets: {valid}")
+        else:
+            # In dynamic mode any name is accepted, but it becomes a path
+            # segment, so it must still be a safe single segment.
+            _validate_id(target, "target")
         (DISPATCH_DIR / target).mkdir(exist_ok=True)
 
     if to == "all":
         # Broadcast: fan-out to all known agents (or all with inboxes in dynamic mode)
         targets = [aid for aid in _discover_agents() if aid != from_id]
         for target in targets:
-            _atomic_write(DISPATCH_DIR / target / f"{ts}-{from_id}.json", dict(msg))
+            _atomic_write(DISPATCH_DIR / target / _filename(), dict(msg))
     else:
         _validate_target(to)
-        _atomic_write(DISPATCH_DIR / to / f"{ts}-{from_id}.json", msg)
+        _atomic_write(DISPATCH_DIR / to / _filename(), msg)
 
     return msg
 
@@ -373,9 +437,7 @@ def _discover_agents() -> list[str]:
         return list(AGENT_IDS)
     # Dynamic mode: find all directories that aren't .presence
     return [
-        d.name
-        for d in sorted(DISPATCH_DIR.iterdir())
-        if d.is_dir() and not d.name.startswith(".")
+        d.name for d in sorted(DISPATCH_DIR.iterdir()) if d.is_dir() and not d.name.startswith(".")
     ]
 
 
@@ -397,14 +459,16 @@ def _get_sent_receipts(agent_id: str) -> list[dict]:
             try:
                 msg = json.loads(f.read_text())
                 if msg.get("from") == agent_id:
-                    receipts.append({
-                        "id": msg["id"],
-                        "to": agent,
-                        "state": msg.get("state", "pending"),
-                        "read_at": msg.get("read_at"),
-                        "sent_at": msg.get("timestamp"),
-                        "preview": msg.get("content", "")[:60],
-                    })
+                    receipts.append(
+                        {
+                            "id": msg["id"],
+                            "to": agent,
+                            "state": msg.get("state", "pending"),
+                            "read_at": msg.get("read_at"),
+                            "sent_at": msg.get("timestamp"),
+                            "preview": msg.get("content", "")[:60],
+                        }
+                    )
             except (json.JSONDecodeError, OSError):
                 continue
     return receipts
@@ -466,11 +530,19 @@ def _start_watcher(agent_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 _setup_dirs()
+_sweep_stale_tmp()
 AGENT_ID = _claim_id()
 print(f"[dispatch] I am {AGENT_ID} (PID {os.getpid()})", file=sys.stderr)
 
 atexit.register(lambda: _release_id(AGENT_ID))
-signal.signal(signal.SIGTERM, lambda *_: (_release_id(AGENT_ID), sys.exit(0)))
+
+
+def _on_sigterm(*_: object) -> None:
+    _release_id(AGENT_ID)
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _on_sigterm)
 
 _start_watcher(AGENT_ID)
 
@@ -516,15 +588,18 @@ def dispatch_tool(
     message: str,
     target: str = "all",
     priority: str = "normal",
-    thread_id: Optional[str] = None,
-    reply_to: Optional[str] = None,
-    payload: Optional[dict] = None,
-    ttl: Optional[int] = None,
+    thread_id: str | None = None,
+    reply_to: str | None = None,
+    payload: dict | None = None,
+    ttl: int | None = None,
     must_read: bool = False,
 ) -> dict:
     """Send a message to other agents."""
     sent = _send(
-        AGENT_ID, target, message, priority,
+        AGENT_ID,
+        target,
+        message,
+        priority,
         thread_id=thread_id,
         reply_to=reply_to,
         payload=payload,
@@ -555,7 +630,7 @@ def dispatch_tool(
     ),
 )
 def peek_tool(
-    thread_id: Optional[str] = None,
+    thread_id: str | None = None,
     include_read: bool = False,
 ) -> dict:
     """Non-destructive read of inbox messages plus sent message receipts."""

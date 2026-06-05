@@ -115,8 +115,8 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # Maximum message size in bytes (default: 65536)
 max_message_bytes = 65536
 
-# Default TTL in seconds (0 = no expiry)
-default_ttl = 0
+# Default TTL in seconds (0 = no expiry; must_read overrides). Default: 7200 (120 min).
+default_ttl = 7200
 
 # Custom MCP instructions template (optional)
 # Placeholders: {agent_id}, {agent_list}
@@ -138,12 +138,27 @@ When no `agents` roster is configured, any agent name is accepted. Inbox directo
 ## How It Works
 
 - Each agent gets an inbox directory (`{dispatch_dir}/{agent_name}/`)
-- Messages are JSON files written atomically (tmp + rename)
-- Presence is tracked via PID files in `{dispatch_dir}/.presence/`
+- Messages are JSON files written atomically (tmp + fsync + rename)
+- Presence is held via an exclusive `flock` on a file in `{dispatch_dir}/.presence/`,
+  so a crashed process's identity is freed by the kernel and two live processes
+  can never claim the same agent id
 - Messages have states: `pending` → `read` → acknowledged (deleted)
 - Piggyback delivery: pending messages are attached to every tool response
 - TTL cleanup runs lazily on read operations
 - Optional watchdog prints stderr alerts for the human operator
+
+## Security
+
+This is local-host-only IPC; the threat model is other local users on a shared machine.
+
+- The dispatch directory and `.presence` are created `0700`; the server sets
+  `umask 0o077` so message files are `0600` (owner-only). Other users on the box
+  cannot read your inter-agent messages.
+- Agent ids and targets must match `^[a-z0-9][a-z0-9_-]{0,63}$`. They become path
+  segments, so anything with separators or traversal sequences (`../…`) is rejected
+  rather than allowed to escape the dispatch directory.
+- No network listener, no daemon, no encryption at rest (out of scope for the
+  local-only threat model).
 
 ## Message Format
 
