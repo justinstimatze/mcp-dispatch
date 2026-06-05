@@ -29,8 +29,13 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
+
+# subprocess only runs the opt-in, local-config notify_command (no shell).
+import subprocess  # nosec B404
 import sys
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -68,6 +73,14 @@ _DEFAULT_CONFIG = {
     # accounts in a common group: the relay dir must be group-owned + setgid, and
     # files/dirs become group-readable/writable (0660 / 2770) instead of 0600/0700.
     "group_mode": False,
+    # Optional command run when a message arrives, so a PARKED session (model
+    # idle, taking no turns) still surfaces incoming mail. The server process is
+    # alive the whole session, so a background poll can fire this even while the
+    # model sleeps. Empty = off. No Python deps — it just shells out, e.g.
+    # "notify-send" on GNOME. The summary and body are appended as two args.
+    "notify_command": "",
+    # Which messages notify: "important" (urgent or must_read), "all", or "none".
+    "notify_on": "important",
 }
 
 
@@ -121,6 +134,9 @@ DISPATCH_DIR = Path(CONFIG["dispatch_dir"])
 MAX_MESSAGE_BYTES = int(CONFIG["max_message_bytes"])
 DEFAULT_TTL = int(CONFIG["default_ttl"])
 DYNAMIC_MODE = len(AGENT_IDS) == 0  # no roster = accept any agent name
+NOTIFY_COMMAND = str(CONFIG["notify_command"]).strip()
+NOTIFY_ON = str(CONFIG["notify_on"]).strip().lower()
+NOTIFY_POLL_SECONDS = 4
 GROUP_MODE = bool(CONFIG["group_mode"])
 # Directory mode: setgid + group-rwx when sharing, else owner-only. The setgid
 # bit makes inboxes created by any participant inherit the relay's group.
@@ -560,6 +576,73 @@ def _with_pending(result: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Human-facing notifications (work even while the model is parked/idle)
+# ---------------------------------------------------------------------------
+
+
+def _should_notify(msg: dict) -> bool:
+    if NOTIFY_ON == "none":
+        return False
+    if NOTIFY_ON == "all":
+        return True
+    # "important": urgent priority or must_read.
+    return msg.get("priority") == "urgent" or bool(msg.get("must_read"))
+
+
+def _notify(msg: dict) -> None:
+    """Run NOTIFY_COMMAND with (summary, body). Best-effort; never raises."""
+    sender = msg.get("from", "?")
+    pri = msg.get("priority", "normal")
+    summary = f"dispatch: {pri} message from {sender}"
+    body = (msg.get("content", "") or "").replace("\n", " ")[:200]
+    try:
+        # argv list (no shell); command is local trusted config.
+        subprocess.run(  # nosec B603
+            [*shlex.split(NOTIFY_COMMAND), summary, body],
+            timeout=5,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+
+def _start_notifier(agent_id: str) -> None:
+    """Fire NOTIFY_COMMAND when new messages arrive — even with the model idle.
+
+    The MCP server process outlives any single turn, so a background poll of the
+    inbox is the one delivery path that reaches a parked session. Opt-in: empty
+    NOTIFY_COMMAND disables it. Stdlib only (threading + subprocess), no deps.
+    """
+    if not NOTIFY_COMMAND:
+        return
+    inbox = DISPATCH_DIR / agent_id
+
+    def _loop() -> None:
+        try:
+            seen = {p.name for p in inbox.glob("*.json")}
+        except OSError:
+            seen = set()
+        while True:
+            time.sleep(NOTIFY_POLL_SECONDS)
+            try:
+                current = {p.name for p in inbox.glob("*.json")}
+            except OSError:
+                continue
+            for name in sorted(current - seen):
+                try:
+                    msg = json.loads((inbox / name).read_text())
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if _should_notify(msg):
+                    _notify(msg)
+            seen = current
+
+    threading.Thread(target=_loop, name="dispatch-notifier", daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
 # Filesystem watcher (stderr alerts for the human operator)
 # ---------------------------------------------------------------------------
 
@@ -616,6 +699,7 @@ def _on_sigterm(*_: object) -> None:
 signal.signal(signal.SIGTERM, _on_sigterm)
 
 _start_watcher(AGENT_ID)
+_start_notifier(AGENT_ID)
 
 # Build instructions from template. The default below is the load-bearing
 # "when to reach for this" contract — override it via the `instructions` config

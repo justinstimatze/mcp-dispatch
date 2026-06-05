@@ -190,6 +190,18 @@ It resolves your agent id from `$MCP_DISPATCH_AGENT_ID`, falling back to the sin
 live `<project>-<pid>` agent for the session's directory. It is read-only —
 acknowledge messages with `ack()`.
 
+### Parked sessions (notifications)
+
+Piggyback and the Stop hook both need the session to be *taking turns*. A parked
+session — model idle while you work elsewhere — takes none, and a dormant model
+can't wake itself. But the server process stays alive, so it can alert **you**.
+Set `notify_command` (e.g. `notify-send` on GNOME) and the server shells out to
+it when a message arrives, even with the model idle — no Python dependency, no
+polling of the model. `notify_on` controls which messages alert (`important` =
+urgent or must_read, `all`, or `none`). Meanwhile `must_read` guarantees the
+message itself waits until that session next takes a turn and acks it. See
+`config.example.toml`.
+
 ## How It Works
 
 - Each agent gets an inbox directory (`{dispatch_dir}/{agent_name}/`)

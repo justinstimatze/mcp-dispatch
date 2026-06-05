@@ -28,6 +28,21 @@ max_message_bytes = 65536
 # Default TTL in seconds. 0 = no expiry. must_read messages ignore it.
 default_ttl = 7200  # 120 minutes
 
+# Parked-session alerts. A session that's idle (model taking no turns) gets
+# nothing from piggyback or the Stop hook — but the server process is still
+# alive, so it can shell out to a notifier when a message arrives. No Python
+# deps; it just runs this command with (summary, body) appended as two args.
+# On GNOME, notify-send is already present:
+#   notify_command = "notify-send -a dispatch"
+# notify_on: "important" (urgent or must_read), "all", or "none".
+# notify_command = "notify-send -a dispatch"
+# notify_on = "important"
+#
+# Cross-account note: notify-send needs the target user's desktop session bus.
+# If a second account has no graphical session, point notify_command at a small
+# wrapper that sets DBUS_SESSION_BUS_ADDRESS / DISPLAY, or one that pushes
+# elsewhere (e.g. ntfy, or appending to a log you tail).
+
 # Affordance contract — the load-bearing "when to reach for this" guidance the
 # model reads at session start. The built-in default is a good generic version;
 # override here for environment-specific escalation paths. Placeholders:
