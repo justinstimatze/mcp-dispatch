@@ -50,7 +50,9 @@ def _configured_dir() -> str | None:
             data = tomllib.load(f)
     except Exception:
         return None
-    val = data.get("dispatch_dir")
+    sub = data.get("dispatch")
+    section = sub if isinstance(sub, dict) else {}
+    val = data.get("dispatch_dir") or section.get("dispatch_dir")
     return str(val) if val else None
 
 
@@ -68,6 +70,10 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
+    except ProcessLookupError:
+        return False  # ESRCH — no such process
+    except PermissionError:
+        return True  # EPERM — exists, owned by another user (group_mode)
     except OSError:
         return False
 
