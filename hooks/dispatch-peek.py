@@ -36,10 +36,31 @@ from pathlib import Path
 EVERY_N = 5  # surface on every 5th Stop event
 
 
+def _configured_dir() -> str | None:
+    """Read dispatch_dir from the config file, if present (stdlib tomllib)."""
+    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
+        "~/.config/mcp-dispatch/config.toml"
+    )
+    if not os.path.exists(cfg):
+        return None
+    try:
+        import tomllib
+
+        with open(cfg, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    val = data.get("dispatch_dir")
+    return str(val) if val else None
+
+
 def _dispatch_dir() -> Path:
-    raw = os.environ.get("MCP_DISPATCH_DIR") or os.environ.get("DISPATCH_DIR")
-    if not raw:
-        raw = "~/.config/mcp-dispatch/messages"
+    raw = (
+        os.environ.get("MCP_DISPATCH_DIR")
+        or os.environ.get("DISPATCH_DIR")
+        or _configured_dir()
+        or "~/.config/mcp-dispatch/messages"
+    )
     return Path(os.path.expanduser(raw))
 
 

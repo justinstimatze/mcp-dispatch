@@ -16,10 +16,30 @@ import os
 from pathlib import Path
 
 
+def _configured_dir() -> str | None:
+    """Read dispatch_dir from the config file, if present (stdlib tomllib)."""
+    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
+        "~/.config/mcp-dispatch/config.toml"
+    )
+    if not os.path.exists(cfg):
+        return None
+    try:
+        import tomllib
+
+        with open(cfg, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    section = data.get("dispatch", data) if isinstance(data, dict) else {}
+    val = data.get("dispatch_dir") or (section or {}).get("dispatch_dir")
+    return str(val) if val else None
+
+
 def _relay_dir() -> Path:
     raw = (
         os.environ.get("MCP_DISPATCH_DIR")
         or os.environ.get("DISPATCH_DIR")
+        or _configured_dir()
         or "~/.config/mcp-dispatch/messages"
     )
     return Path(os.path.expanduser(raw))
