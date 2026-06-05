@@ -218,6 +218,16 @@ This is local-host-only IPC; the threat model is other local users on a shared m
 - No network listener, no daemon, no encryption at rest (out of scope for the
   local-only threat model).
 
+### Sharing a relay across accounts
+
+By default each user has a separate, owner-only relay. To let several
+mutually-trusting accounts (e.g. multiple accounts belonging to one person)
+share a single relay, set `group_mode = true` and point `dispatch_dir` at a
+shared, group-owned, setgid directory whose group every participant belongs to.
+In that mode the relay and messages are group-readable/writable (`2770` / `0660`)
+— so anyone in the group can read the group's traffic. Only enable it when the
+accounts trust each other; the default stays owner-only. See `config.example.toml`.
+
 ## Message Format
 
 ```json
