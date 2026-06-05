@@ -10,6 +10,18 @@
 # Where messages live. Per-user, created 0700; messages are 0600.
 dispatch_dir = "~/.config/mcp-dispatch/messages"
 
+# Share one relay across mutually-trusting accounts in a common OS group
+# (e.g. several accounts belonging to one person). When true, the relay dir and
+# message files become group-rw (2770 / 0660) instead of owner-only, and the
+# server tolerates a relay it doesn't own. Requirements:
+#   - point dispatch_dir at a shared path outside any single home dir
+#   - that dir must be group-owned by the shared group and setgid:
+#       mkdir -p <dir> && chgrp <group> <dir> && chmod 2770 <dir>
+#   - every participating account must be a member of <group>
+# Leave false (the default) for the normal single-user case.
+# group_mode = true
+# dispatch_dir = "/var/tmp/mcp-dispatch"
+
 # Max message size in bytes.
 max_message_bytes = 65536
 

@@ -39,8 +39,12 @@ def load_server(dispatch_dir, agent_id="alpha", *, config_path=None, extra_env=N
     os.environ["MCP_DISPATCH_DIR"] = str(dispatch_dir)
     if agent_id is not None:
         os.environ["MCP_DISPATCH_AGENT_ID"] = agent_id
-    if config_path is not None:
-        os.environ["MCP_DISPATCH_CONFIG"] = str(config_path)
+    # Always pin the config path so tests never pick up the user's real
+    # ~/.config/mcp-dispatch/config.toml. A test that wants config supplies one;
+    # otherwise point at a guaranteed-absent file → built-in defaults.
+    os.environ["MCP_DISPATCH_CONFIG"] = str(
+        config_path if config_path is not None else dispatch_dir.parent / "no-such-config.toml"
+    )
     if extra_env:
         os.environ.update(extra_env)
 

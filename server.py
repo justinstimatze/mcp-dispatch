@@ -53,11 +53,6 @@ try:
 except ImportError:
     HAS_WATCHDOG = False
 
-# Inter-agent message files may contain coordination details that other local
-# users have no business reading. Default to owner-only (0600 files / 0700
-# dirs) regardless of the inherited umask. Runs before any file is created.
-os.umask(0o077)
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -69,6 +64,10 @@ _DEFAULT_CONFIG = {
     "max_message_bytes": 65536,
     "default_ttl": 7200,  # seconds; 120-min ambient default (0 = no expiry; must_read overrides)
     "instructions": "",  # empty = use built-in template
+    # Owner-only by default. Set true to share one relay across mutually-trusting
+    # accounts in a common group: the relay dir must be group-owned + setgid, and
+    # files/dirs become group-readable/writable (0660 / 2770) instead of 0600/0700.
+    "group_mode": False,
 }
 
 
@@ -122,6 +121,14 @@ DISPATCH_DIR = Path(CONFIG["dispatch_dir"])
 MAX_MESSAGE_BYTES = int(CONFIG["max_message_bytes"])
 DEFAULT_TTL = int(CONFIG["default_ttl"])
 DYNAMIC_MODE = len(AGENT_IDS) == 0  # no roster = accept any agent name
+GROUP_MODE = bool(CONFIG["group_mode"])
+# Directory mode: setgid + group-rwx when sharing, else owner-only. The setgid
+# bit makes inboxes created by any participant inherit the relay's group.
+DIR_MODE = 0o2770 if GROUP_MODE else 0o700
+
+# Set the umask before any file is created so message files land group-readable
+# (0660) in shared mode or owner-only (0600) otherwise, whatever the inherited umask.
+os.umask(0o007 if GROUP_MODE else 0o077)
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +159,23 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _enforce_dir_mode(path: Path) -> None:
+    """chmod a dir to DIR_MODE. In shared mode the relay may be owned by another
+    participant (already set up correctly), so tolerate not being the owner."""
+    try:
+        os.chmod(path, DIR_MODE)
+    except PermissionError:
+        if not GROUP_MODE:
+            raise
+
+
 def _setup_dirs() -> None:
     DISPATCH_DIR.mkdir(parents=True, exist_ok=True)
     presence = DISPATCH_DIR / ".presence"
     presence.mkdir(exist_ok=True)
     # Explicit chmod in case the dirs predate this server's umask.
-    os.chmod(DISPATCH_DIR, 0o700)
-    os.chmod(presence, 0o700)
+    _enforce_dir_mode(DISPATCH_DIR)
+    _enforce_dir_mode(presence)
     for aid in AGENT_IDS:
         (DISPATCH_DIR / aid).mkdir(exist_ok=True)
 
