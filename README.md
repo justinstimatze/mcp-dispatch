@@ -13,6 +13,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
+- **Live tail** — `bin/dispatch-tail` streams every message across the relay to a terminal, IRC-style, so you can watch sessions talk in real time.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
 - **Local-only & per-user** — `0700`/`0600` perms, validated ids, no network. See [Security](#security).
@@ -201,6 +202,27 @@ polling of the model. `notify_on` controls which messages alert (`important` =
 urgent or must_read, `all`, or `none`). Meanwhile `must_read` guarantees the
 message itself waits until that session next takes a turn and acks it. See
 `config.example.toml`.
+
+### Watching the relay
+
+To watch messages flow by like an IRC channel, run the live tail in a spare
+terminal:
+
+```bash
+bin/dispatch-tail              # follow new traffic from now on
+bin/dispatch-tail --replay     # print what's already queued, then follow
+bin/dispatch-tail --interval 0.5   # poll faster (default 1.0s)
+```
+
+Each message prints once as a one-liner — `time  from → to  content` — with
+flags for `must_read` (🔒), urgent (‼) and high (!) priority, the thread id, and
+any structured `payload` type. A broadcast shows as a single line (its `to`
+reads `all` or `#channel`), not one per recipient. It's read-only — it never
+acks or deletes — and finds the relay from your config like the server does
+(override with `MCP_DISPATCH_DIR`).
+
+For a point-in-time snapshot instead of a stream — who's live, their channel
+subscriptions, and unread counts — run `bin/dispatch-status`.
 
 ## How It Works
 

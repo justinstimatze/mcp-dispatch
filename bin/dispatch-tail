@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Live tail of the dispatch relay — watch messages scroll by like IRC.
+
+Polls the relay directory and prints each new message once as a one-liner.
+A broadcast writes one file per recipient but shares a message id, so it shows
+as a single line (its `to` field reads `all` or `#channel`). Read-only: it never
+acks, deletes, or otherwise touches the relay.
+
+    bin/dispatch-tail                 # follow new traffic from now on
+    bin/dispatch-tail --replay        # dump what's already queued, then follow
+    bin/dispatch-tail --interval 0.5  # poll faster (default 1.0s)
+    bin/dispatch-tail --no-color
+    MCP_DISPATCH_DIR=... bin/dispatch-tail
+
+Stop with Ctrl-C.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def _configured_dir() -> str | None:
+    """Read dispatch_dir from the config file, if present (stdlib tomllib)."""
+    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
+        "~/.config/mcp-dispatch/config.toml"
+    )
+    if not os.path.exists(cfg):
+        return None
+    try:
+        import tomllib
+
+        with open(cfg, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return None
+    section = data.get("dispatch", data) if isinstance(data, dict) else {}
+    val = data.get("dispatch_dir") or (section or {}).get("dispatch_dir")
+    return str(val) if val else None
+
+
+def _relay_dir() -> Path:
+    raw = (
+        os.environ.get("MCP_DISPATCH_DIR")
+        or os.environ.get("DISPATCH_DIR")
+        or _configured_dir()
+        or "~/.config/mcp-dispatch/messages"
+    )
+    return Path(os.path.expanduser(raw))
+
+
+# ── formatting ──────────────────────────────────────────────────────────────
+
+_COLORS = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "from": "\033[36m",  # cyan
+    "to": "\033[35m",  # magenta
+    "urgent": "\033[1;31m",  # bold red
+    "high": "\033[33m",  # yellow
+    "normal": "",
+    "payload": "\033[32m",  # green
+}
+
+
+def _c(use_color: bool, key: str, text: str) -> str:
+    if not use_color or not _COLORS.get(key):
+        return text
+    return f"{_COLORS[key]}{text}{_COLORS['reset']}"
+
+
+def _hhmmss(ts: str) -> str:
+    # timestamp is ISO8601 "YYYY-MM-DDTHH:MM:SSZ"; just slice the time.
+    if "T" in ts and ts.endswith("Z"):
+        return ts.split("T", 1)[1][:-1]
+    return ts or "--:--:--"
+
+
+def _format(msg: dict, use_color: bool) -> str:
+    pri = msg.get("priority", "normal")
+    frm = msg.get("from", "?")
+    to = msg.get("to", "?")
+    content = (msg.get("content") or "").replace("\n", " ⏎ ")
+    flags = ""
+    if msg.get("must_read"):
+        flags += " 🔒"
+    if pri == "urgent":
+        flags += " ‼"
+    elif pri == "high":
+        flags += " !"
+    thread = msg.get("thread_id")
+    thread_s = _c(use_color, "dim", f" ({thread})") if thread else ""
+    payload = msg.get("payload")
+    payload_s = ""
+    if isinstance(payload, dict) and payload.get("type"):
+        payload_s = " " + _c(use_color, "payload", f"⟨{payload['type']}⟩")
+
+    arrow_color = "urgent" if pri == "urgent" else "to"
+    line = (
+        f"{_c(use_color, 'dim', _hhmmss(msg.get('timestamp', '')))}  "
+        f"{_c(use_color, 'from', frm)} "
+        f"{_c(use_color, arrow_color, '→')} "
+        f"{_c(use_color, 'to', to)}{flags}{thread_s}{payload_s}  "
+        f"{content}"
+    )
+    return line
+
+
+# ── tail loop ───────────────────────────────────────────────────────────────
+
+
+def _scan(relay: Path) -> list[tuple[str, dict]]:
+    """Return (sort_key, msg) for every message file currently on disk.
+
+    sort_key is the filename, which is millisecond-timestamp-prefixed, giving a
+    chronological order across all inboxes.
+    """
+    out: list[tuple[str, dict]] = []
+    for inbox in relay.iterdir():
+        if not inbox.is_dir() or inbox.name.startswith("."):
+            continue
+        for f in inbox.glob("*.json"):
+            try:
+                msg = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            out.append((f.name, msg))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Live tail of the dispatch relay.")
+    ap.add_argument(
+        "--replay",
+        action="store_true",
+        help="print messages already queued before following new ones",
+    )
+    ap.add_argument("--interval", type=float, default=1.0, help="poll seconds (default 1.0)")
+    ap.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    args = ap.parse_args()
+
+    use_color = not args.no_color and sys.stdout.isatty()
+    relay = _relay_dir()
+    if not relay.is_dir():
+        print(f"No relay yet at {relay}")
+        print("→ no dispatch-enabled session has started. Open a Claude Code window.")
+        return 0
+
+    print(_c(use_color, "dim", f"# tailing {relay} — Ctrl-C to stop"), flush=True)
+
+    # First pass establishes the baseline. Without --replay we swallow what's
+    # already there so the feed only shows traffic from now on.
+    seen: set[str] = set()
+    for _key, msg in _scan(relay):
+        mid = msg.get("id", _key)
+        if args.replay:
+            print(_format(msg, use_color), flush=True)
+        seen.add(mid)
+    if args.replay:
+        print(_c(use_color, "dim", "# ── now following ──"), flush=True)
+
+    try:
+        while True:
+            time.sleep(args.interval)
+            current: set[str] = set()
+            for _key, msg in _scan(relay):
+                mid = msg.get("id", _key)
+                current.add(mid)
+                if mid not in seen:
+                    print(_format(msg, use_color), flush=True)
+            # Bound memory: forget ids no longer on disk. Message ids are unique
+            # and the relay is ephemeral, so a departed id never recurs — `seen`
+            # tracks only live messages, never the whole session's history.
+            seen = current
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
