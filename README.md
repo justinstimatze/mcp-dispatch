@@ -14,6 +14,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Live tail** — `bin/dispatch-tail` streams every message across the relay to a terminal, IRC-style, so you can watch sessions talk in real time.
+- **Wake on arrival** — `bin/dispatch-wait` blocks until a message matching the notify policy lands, then exits to wake a parked model — an event-driven replacement for polling with `/loop`.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
 - **Local-only & per-user** — `0700`/`0600` perms, validated ids, no network. See [Security](#security).
@@ -198,10 +199,36 @@ session — model idle while you work elsewhere — takes none, and a dormant mo
 can't wake itself. But the server process stays alive, so it can alert **you**.
 Set `notify_command` (e.g. `notify-send` on GNOME) and the server shells out to
 it when a message arrives, even with the model idle — no Python dependency, no
-polling of the model. `notify_on` controls which messages alert (`important` =
-urgent or must_read, `all`, or `none`). Meanwhile `must_read` guarantees the
-message itself waits until that session next takes a turn and acks it. See
+polling of the model. `notify_on` controls which messages alert: `direct`
+(addressed to this agent), `important` (urgent priority), `all`, or `none`;
+`must_read` always pierces except under `none`. Meanwhile `must_read` guarantees
+the message itself waits until that session next takes a turn and acks it. See
 `config.example.toml`.
+
+### Waking a parked session (`dispatch-wait`)
+
+A desktop notification alerts *you*, but the model still won't act until its
+next turn. To wake the **model** on arrival without burning turns on a timer,
+launch `bin/dispatch-wait` as a background task. It blocks until a message that
+matches `notify_on` lands in this agent's inbox, prints a summary, and exits —
+and Claude Code re-invokes the model when a backgrounded task exits. Handle the
+message, then launch `dispatch-wait` again to re-arm.
+
+```bash
+dispatch-wait                  # block until a notify_on-qualifying message lands
+dispatch-wait --notify-on direct   # wake only on messages addressed to me
+dispatch-wait --interval 1     # poll seconds (default 2.0)
+dispatch-wait --max-lifetime 600   # clean timeout exit (default 1800s; 0 = none)
+```
+
+This replaces `/loop` for staying responsive while idle: `/loop` fires a whole
+model turn every interval whether or not anything arrived; `dispatch-wait`
+spends **zero** model tokens while blocking and wakes only on a real qualifying
+arrival. It reads the same `notify_on` policy the desktop notifier uses (one
+source of truth, `notify_policy.py`), so the two paths never disagree. It is
+level-triggered — a message already unread at launch exits it immediately, so
+re-arming after handling one leaves no window to miss the next. Resolves
+identity from `$MCP_DISPATCH_AGENT_ID` (set it, for a dozen sessions especially).
 
 ### Watching the relay
 

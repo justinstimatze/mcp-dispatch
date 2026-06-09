@@ -27,6 +27,19 @@ def test_important_only_notifies_urgent_or_must_read(server_factory, tmp_path):
     assert not srv._should_notify({})
 
 
+def test_direct_notifies_dms_to_this_agent_only(server_factory, tmp_path):
+    # Confirms _should_notify threads AGENT_ID into the shared predicate.
+    srv = server_factory(
+        "alpha",
+        config_path=_cfg(tmp_path, 'notify_command = "notify-send"\nnotify_on = "direct"\n'),
+    )
+    assert srv._should_notify({"to": "alpha", "priority": "normal"})  # DM to me
+    assert not srv._should_notify({"to": "all", "priority": "normal"})  # broadcast
+    assert not srv._should_notify({"to": "#eng", "priority": "normal"})  # channel
+    assert not srv._should_notify({"to": "beta", "priority": "urgent"})  # someone else's DM
+    assert srv._should_notify({"to": "#eng", "must_read": True})  # must_read pierces
+
+
 def test_all_notifies_everything(server_factory, tmp_path):
     srv = server_factory(
         "alpha", config_path=_cfg(tmp_path, 'notify_command = "notify-send"\nnotify_on = "all"\n')

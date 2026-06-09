@@ -44,6 +44,8 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from notify_policy import should_notify
+
 # tomllib is stdlib in 3.11+
 try:
     import tomllib
@@ -80,7 +82,11 @@ _DEFAULT_CONFIG = {
     # model sleeps. Empty = off. No Python deps — it just shells out, e.g.
     # "notify-send" on GNOME. The summary and body are appended as two args.
     "notify_command": "",
-    # Which messages notify: "important" (urgent or must_read), "all", or "none".
+    # Which messages notify. must_read always pierces (except "none"):
+    #   "none"      — never
+    #   "direct"    — messages addressed to this agent (to == my id)
+    #   "important" — urgent priority (this default also fires on must_read)
+    #   "all"       — everything
     "notify_on": "important",
 }
 
@@ -721,12 +727,9 @@ def _with_pending(result: dict) -> dict:
 
 
 def _should_notify(msg: dict) -> bool:
-    if NOTIFY_ON == "none":
-        return False
-    if NOTIFY_ON == "all":
-        return True
-    # "important": urgent priority or must_read.
-    return msg.get("priority") == "urgent" or bool(msg.get("must_read"))
+    # Delegates to the shared predicate (notify_policy.py) so the OS-notification
+    # poll here and the bin/dispatch-wait model-wake long-poll apply identical rules.
+    return should_notify(msg, NOTIFY_ON, AGENT_ID)
 
 
 def _notify(msg: dict) -> None:
