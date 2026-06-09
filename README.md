@@ -151,8 +151,10 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # Maximum message size in bytes (default: 65536)
 max_message_bytes = 65536
 
-# Default TTL in seconds (0 = no expiry; must_read overrides). Default: 7200 (120 min).
-default_ttl = 7200
+# Default TTL in seconds (0 = no expiry; must_read overrides). Default: 604800 (7 days)
+# — long enough that messages survive a parked/idle session instead of expiring
+# unread. Set a short ttl= explicitly on time-sensitive sends.
+default_ttl = 604800
 
 # Custom MCP instructions template (optional)
 # Placeholders: {agent_id}, {agent_list}
