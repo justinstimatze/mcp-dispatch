@@ -34,9 +34,20 @@ default_ttl = 7200  # 120 minutes
 # deps; it just runs this command with (summary, body) appended as two args.
 # On GNOME, notify-send is already present:
 #   notify_command = "notify-send -a dispatch"
-# notify_on: "important" (urgent or must_read), "all", or "none".
 # notify_command = "notify-send -a dispatch"
+#
+# notify_on selects which messages count. must_read always pierces (except "none"):
+#   "none"      — never
+#   "direct"    — addressed to this agent (to == my id) — DMs, not channel/broadcast
+#   "important" — urgent priority (this default also fires on must_read)
+#   "all"       — everything
 # notify_on = "important"
+#
+# The SAME notify_on also drives bin/dispatch-wait, the model-wake long-poll that
+# replaces /loop for parked sessions: launch it in the background and the harness
+# re-invokes the model when a qualifying message lands (zero tokens while idle).
+# For "wake me only on messages addressed to me", set:
+#   notify_on = "direct"
 #
 # Cross-account note: notify-send needs the target user's desktop session bus.
 # If a second account has no graphical session, point notify_command at a small
