@@ -26,7 +26,9 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 max_message_bytes = 65536
 
 # Default TTL in seconds. 0 = no expiry. must_read messages ignore it.
-default_ttl = 7200  # 120 minutes
+# A week, so messages survive long-idle/parked sessions instead of expiring
+# unread. Time-sensitive sends should set a short ttl= explicitly.
+default_ttl = 604800  # 7 days
 
 # Parked-session alerts. A session that's idle (model taking no turns) gets
 # nothing from piggyback or the Stop hook — but the server process is still

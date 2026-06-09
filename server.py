@@ -70,7 +70,7 @@ _DEFAULT_CONFIG = {
     "agents": [],  # empty = dynamic registration (any name accepted)
     "dispatch_dir": "~/.config/mcp-dispatch/messages",
     "max_message_bytes": 65536,
-    "default_ttl": 7200,  # seconds; 120-min ambient default (0 = no expiry; must_read overrides)
+    "default_ttl": 604800,  # seconds; 1-week ambient default (0 = no expiry; must_read overrides)
     "instructions": "",  # empty = use built-in template
     # Owner-only by default. Set true to share one relay across mutually-trusting
     # accounts in a common group: the relay dir must be group-owned + setgid, and

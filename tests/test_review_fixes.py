@@ -48,8 +48,8 @@ def test_ttl_negative_rejected(server):
 
 
 def test_ttl_none_uses_default(server):
-    m = server._send("alpha", "beta", "x")  # built-in default_ttl = 7200
-    assert m["ttl"] == 7200
+    m = server._send("alpha", "beta", "x")  # omitted ttl falls back to the configured default
+    assert m["ttl"] == server.DEFAULT_TTL
 
 
 # --- channel fan-out ignores untrusted presence agent_id -------------------
