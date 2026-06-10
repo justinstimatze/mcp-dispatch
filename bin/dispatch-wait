@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,17 @@ def _dispatch_dir() -> Path:
         or "~/.config/mcp-dispatch/messages"
     )
     return Path(os.path.expanduser(raw))
+
+
+def _state_dir() -> Path:
+    """Per-user scratch dir for arm lockfiles. Overridable for tests."""
+    raw = os.environ.get("MCP_DISPATCH_STATE_DIR") or "~/.cache/mcp-dispatch"
+    return Path(os.path.expanduser(raw))
+
+
+def _arm_lock_path(agent_id: str) -> Path:
+    key = hashlib.md5(agent_id.encode(), usedforsecurity=False).hexdigest()[:8]
+    return _state_dir() / f"wait-{key}.lock"
 
 
 def _notify_on(cli_value: str | None) -> str:
@@ -203,6 +215,37 @@ def main() -> int:
             "(set $MCP_DISPATCH_AGENT_ID) — not waiting."
         )
         return 0
+
+    # Single-instance lock: hold it for our lifetime so (a) two waiters never arm
+    # the same agent and (b) hooks/dispatch-arm.py can detect liveness by probing
+    # this same flock. Released automatically by the kernel when we exit. Degrade
+    # to running unlocked if the scratch dir is unwritable.
+    lock_fh = None
+    try:
+        lock_path = _arm_lock_path(agent_id)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(lock_path, "a+")  # noqa: SIM115 — held for process lifetime
+    except OSError:
+        lock_fh = None
+    if lock_fh is not None:
+        locked = False
+        for attempt in range(2):
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                # The arm hook probes this same lock (acquire+release) to test
+                # liveness; that momentary hold could collide with us starting up.
+                # Retry once after a beat so a probe never masquerades as a rival
+                # waiter — only a truly-held lock survives the retry.
+                if attempt == 0:
+                    time.sleep(0.05)
+        if not locked:
+            lock_fh.close()
+            print(f"[mcp-dispatch] a waiter is already armed for {agent_id}; "
+                  "not starting a second.")
+            return 0
 
     notify_on = _notify_on(args.notify_on)
     deadline = None if args.max_lifetime <= 0 else time.monotonic() + args.max_lifetime

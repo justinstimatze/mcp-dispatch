@@ -51,6 +51,12 @@ default_ttl = 604800  # 7 days
 # For "wake me only on messages addressed to me", set:
 #   notify_on = "direct"
 #
+# auto_arm (default true): when hooks/dispatch-arm.py is wired into SessionStart
+# and Stop, the session arms a dispatch-wait at startup and re-arms after every
+# wake with no human in the loop (the hook nudges the model — only the model can
+# launch the wake task). Set false to disable, or export MCP_DISPATCH_NO_AUTO_ARM=1.
+# auto_arm = false
+#
 # Cross-account note: notify-send needs the target user's desktop session bus.
 # If a second account has no graphical session, point notify_command at a small
 # wrapper that sets DBUS_SESSION_BUS_ADDRESS / DISPLAY, or one that pushes

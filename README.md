@@ -216,6 +216,9 @@ matches `notify_on` lands in this agent's inbox, prints a summary, and exits —
 and Claude Code re-invokes the model when a backgrounded task exits. Handle the
 message, then launch `dispatch-wait` again to re-arm.
 
+A waiter holds a per-agent lock for its lifetime, so launching a second
+`dispatch-wait` for the same agent exits immediately rather than double-arming.
+
 ```bash
 dispatch-wait                  # block until a notify_on-qualifying message lands
 dispatch-wait --notify-on direct   # wake only on messages addressed to me
@@ -231,6 +234,33 @@ source of truth, `notify_policy.py`), so the two paths never disagree. It is
 level-triggered — a message already unread at launch exits it immediately, so
 re-arming after handling one leaves no window to miss the next. Resolves
 identity from `$MCP_DISPATCH_AGENT_ID` (set it, for a dozen sessions especially).
+
+#### Arming it hands-free (`hooks/dispatch-arm.py`)
+
+Launching and re-launching `dispatch-wait` by hand is the manual step. Only the
+model can start the wake task (the harness wakes on a *model-launched*
+`run_in_background` task, not on an arbitrary process), but a hook can make the
+model do it. `hooks/dispatch-arm.py`, wired into **SessionStart and Stop**,
+checks whether a waiter holds the arm lock; if none does, it tells the model to
+launch one. On SessionStart it injects the instruction; on Stop it *blocks*
+(capped, so a failing launch can't wedge the session) so the model never parks
+unarmed. Once a waiter is armed the hook is silent. Net: the session arms itself
+at startup and re-arms after every wake, with no human in the loop.
+
+```json
+{ "hooks": {
+  "SessionStart": [ { "hooks": [
+    { "type": "command", "command": "/path/to/mcp-dispatch/hooks/dispatch-arm.py" }
+  ] } ],
+  "Stop": [ { "hooks": [
+    { "type": "command", "command": "/path/to/mcp-dispatch/hooks/dispatch-arm.py" }
+  ] } ]
+} }
+```
+
+Disable per environment with `auto_arm = false` in the config or
+`MCP_DISPATCH_NO_AUTO_ARM=1` in the environment. It no-ops when no relay or agent
+resolves, so wiring it globally is safe.
 
 ### Watching the relay
 
