@@ -223,8 +223,14 @@ A waiter holds a per-agent lock for its lifetime, so launching a second
 dispatch-wait                  # block until a notify_on-qualifying message lands
 dispatch-wait --notify-on direct   # wake only on messages addressed to me
 dispatch-wait --interval 1     # poll seconds (default 2.0)
-dispatch-wait --max-lifetime 600   # clean timeout exit (default 1800s; 0 = none)
+dispatch-wait --max-lifetime 600   # add a wall-clock cap (default 0 = none)
 ```
+
+By default there's no time cap: the waiter exits the instant its agent's presence
+flock drops (the session's server died), so a backgrounded waiter can't outlive
+its session and orphan — independent of whether the harness reaps background
+tasks on close. `--max-lifetime` adds a wall-clock cap on top; standalone use
+with no live server to gate on falls back to a finite cap automatically.
 
 This replaces `/loop` for staying responsive while idle: `/loop` fires a whole
 model turn every interval whether or not anything arrived; `dispatch-wait`

@@ -26,13 +26,21 @@ With notify_on = "direct" an idle session wakes on messages addressed to it
 Level-triggered: if a qualifying message is already unread at launch it exits
 immediately, so re-arming after handling one leaves no window to miss the next.
 
+Lifetime: by default there is no time cap. Instead the waiter exits the moment
+its agent's presence flock drops — the MCP server releases it when the session
+dies — so a backgrounded waiter can't outlive its session and orphan, whether or
+not the harness reaps background tasks on close. Pass --max-lifetime to add a
+wall-clock cap on top; standalone use (no live server to gate on) falls back to a
+finite cap automatically.
+
 Identity resolution (first that works):
   1. $MCP_DISPATCH_AGENT_ID — the recommended setup.
   2. The single live agent whose id starts with "<project>-" (launcher scheme).
      Skipped if zero or several match — too ambiguous.
 
-Exit status is always 0 (clean wake or lifetime timeout); the printed text says
-which. Read-only: never acks, marks, or deletes. Acknowledge via the ack() tool.
+Exit status is always 0 (clean wake, presence drop, or lifetime timeout); the
+printed text says which. Read-only: never acks, marks, or deletes. Acknowledge
+via the ack() tool.
 """
 
 from __future__ import annotations
@@ -51,6 +59,10 @@ from pathlib import Path
 # notify_policy.py lives at the repo root (parent of bin/).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from notify_policy import should_notify  # noqa: E402
+
+# When launched standalone (no live server holding the agent's presence), there's
+# no session to gate our lifetime on, so cap it rather than poll forever.
+STANDALONE_FALLBACK_SECONDS = 1800.0
 
 
 def _configured(key: str) -> str | None:
@@ -196,9 +208,11 @@ def main() -> int:
     ap.add_argument(
         "--max-lifetime",
         type=float,
-        default=1800.0,
-        help="seconds before a clean timeout exit (default 1800); bounds orphans and "
-        "gives idle sessions a cheap heartbeat. 0 = no limit.",
+        default=0.0,
+        help="seconds before a clean timeout exit. Default 0 = no time cap: the "
+        "waiter instead exits the moment its agent's presence drops (the session "
+        "ended), so it can't outlive its session and orphan. With no live presence "
+        "at startup (standalone use), 0 falls back to a finite cap.",
     )
     ap.add_argument("--notify-on", default=None, help="override the configured policy for this run")
     args = ap.parse_args()
@@ -248,17 +262,40 @@ def main() -> int:
             return 0
 
     notify_on = _notify_on(args.notify_on)
-    deadline = None if args.max_lifetime <= 0 else time.monotonic() + args.max_lifetime
+
+    # Orphan guard. Default (no time cap) ties our lifetime to the session: we
+    # exit the instant our agent's presence flock drops, which the MCP server
+    # releases when it dies. That makes an orphaned waiter impossible regardless
+    # of whether the harness reaps background tasks on session close. If no
+    # presence exists at startup (standalone use, no live server), there's nothing
+    # to gate on, so fall back to a finite cap rather than poll forever.
+    presence_pf = dispatch_dir / ".presence" / f"{agent_id}.json"
+    gated = presence_pf.exists()
+    max_lifetime = args.max_lifetime
+    if max_lifetime <= 0 and not gated:
+        try:
+            max_lifetime = float(
+                os.environ.get("MCP_DISPATCH_STANDALONE_FALLBACK", STANDALONE_FALLBACK_SECONDS)
+            )
+        except ValueError:
+            max_lifetime = STANDALONE_FALLBACK_SECONDS
+    deadline = None if max_lifetime <= 0 else time.monotonic() + max_lifetime
 
     while True:
         hits = _qualifying(dispatch_dir, agent_id, notify_on)
         if hits:
             print(_summary(agent_id, notify_on, hits))
             return 0
+        if gated and not _presence_is_live(presence_pf):
+            print(
+                f"[mcp-dispatch] session for {agent_id} ended (presence dropped) — "
+                "waiter exiting."
+            )
+            return 0
         if deadline is not None and time.monotonic() >= deadline:
             print(
                 f"[mcp-dispatch] no qualifying messages for {agent_id} within "
-                f"{int(args.max_lifetime)}s (notify_on={notify_on}). Re-arm if still idle."
+                f"{int(max_lifetime)}s (notify_on={notify_on}). Re-arm if still idle."
             )
             return 0
         time.sleep(args.interval)
