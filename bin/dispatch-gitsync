@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Mirror this host's local dispatch bus to/from a shared git repo.
+
+mcp-dispatch is a local-only file bus. This daemon bridges it to other machines:
+it proxies the local DISPATCH_DIR <-> a git clone (git_transport's per-author
+lanes), so agents reach agents on OTHER hosts with *zero* change to how they call
+dispatch(). All git knowledge lives here, not in the server.
+
+    dispatch-gitsync                     # run the daemon (one per host)
+    dispatch-gitsync --once              # a single sync pass and exit (smoke / cron)
+    dispatch-gitsync --mirror all        # full audited replica (vs default remote-only)
+
+    dispatch-gitsync init <url|slug|path>  # create/clone + seed + write [git] config
+    dispatch-gitsync init --create owner/agent-bus   # gh-create a PRIVATE repo first
+    dispatch-gitsync status                # is it running? repo, lanes, who's reachable
+
+The daemon holds a host-level lock (one daemon per DISPATCH_DIR) and is presence-
+gated: it exits once no agent is live on the host, so it can't orphan. A message
+arriving over git is materialized as a normal inbox .json, so it wakes a parked
+session through the same path a local message does. Setup is one `init` per host;
+wire hooks/dispatch-gitsync-arm.py into SessionStart to start it hands-free.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# git_bridge.py and its deps live at the repo root (parent of bin/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_fs  # noqa: E402
+from git_bridge import GitBridge  # noqa: E402
+
+STARTUP_GRACE_SECONDS = 60.0  # exit if no agent ever appears (standalone safety)
+
+
+# ---------------------------------------------------------------------------
+# Config / path resolution (mirrors bin/dispatch-wait's idiom)
+# ---------------------------------------------------------------------------
+
+
+def _load_config() -> dict:
+    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
+        "~/.config/mcp-dispatch/config.toml"
+    )
+    if not os.path.exists(cfg):
+        return {}
+    try:
+        import tomllib
+
+        with open(cfg, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+def _flat(data: dict, key: str):
+    sub = data.get("dispatch")
+    section = sub if isinstance(sub, dict) else {}
+    val = data.get(key)
+    return section.get(key) if val is None else val
+
+
+def _git_section(data: dict) -> dict:
+    git = data.get("git")
+    return git if isinstance(git, dict) else {}
+
+
+def _dispatch_dir(data: dict) -> Path:
+    raw = (
+        os.environ.get("MCP_DISPATCH_DIR")
+        or os.environ.get("DISPATCH_DIR")
+        or _flat(data, "dispatch_dir")
+        or "~/.config/mcp-dispatch/messages"
+    )
+    return Path(os.path.expanduser(str(raw)))
+
+
+def _config_path() -> Path:
+    return Path(
+        os.environ.get("MCP_DISPATCH_CONFIG")
+        or os.path.expanduser("~/.config/mcp-dispatch/config.toml")
+    )
+
+
+def _state_dir() -> Path:
+    raw = os.environ.get("MCP_DISPATCH_STATE_DIR") or "~/.cache/mcp-dispatch"
+    return Path(os.path.expanduser(raw))
+
+
+def _host_lock_path(dispatch_dir: Path) -> Path:
+    key = hashlib.md5(str(dispatch_dir).encode(), usedforsecurity=False).hexdigest()[:8]
+    return _state_dir() / f"gitsync-{key}.lock"
+
+
+def _acquire_host_lock(dispatch_dir: Path):
+    """Single-instance lock: one daemon per DISPATCH_DIR. Returns the held handle,
+    or None if another daemon already holds it. Released by the kernel on exit."""
+    import fcntl
+
+    try:
+        _state_dir().mkdir(parents=True, exist_ok=True)
+        fh = open(_host_lock_path(dispatch_dir), "a+")  # noqa: SIM115 - held for lifetime
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _host_lock_held(dispatch_dir: Path) -> bool:
+    """Probe the host lock without taking it for keeps (status read)."""
+    import fcntl
+
+    pf = _host_lock_path(dispatch_dir)
+    try:
+        fh = open(pf)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: list[str]) -> int:
+    return subprocess.run(cmd).returncode
+
+
+def _looks_like_url(s: str) -> bool:
+    return "://" in s or (":" in s and "@" in s) or s.endswith(".git")
+
+
+def _has_commits(repo_dir: Path) -> bool:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _seed(repo_dir: Path, remote: str) -> None:
+    """Give an empty repo an initial commit on `main` so lanes have a branch."""
+    readme = repo_dir / "README.md"
+    if not readme.exists():
+        readme.write_text(
+            "# mcp-dispatch git bus\n\n"
+            "Per-author append-only message lanes for cross-host agent dispatch.\n"
+            "Created by `dispatch-gitsync init`.\n"
+        )
+    _run(["git", "-C", str(repo_dir), "checkout", "-q", "-B", "main"])
+    _run(["git", "-C", str(repo_dir), "add", "README.md"])
+    _run(
+        [
+            "git", "-C", str(repo_dir),
+            "-c", "user.name=dispatch-gitsync",
+            "-c", "user.email=gitsync@mcp-dispatch",
+            "commit", "-q", "-m", "seed bus",
+        ]
+    )
+    _run(["git", "-C", str(repo_dir), "push", "-q", remote, "HEAD:main"])
+
+
+def _write_git_config(repo_dir: Path, remote: str) -> None:
+    cfgp = _config_path()
+    cfgp.parent.mkdir(parents=True, exist_ok=True)
+    text = cfgp.read_text() if cfgp.exists() else ""
+    if "[git]" in text:
+        print(
+            f"[gitsync] {cfgp} already has a [git] section — not clobbering it. "
+            f"Ensure: repo_dir = \"{repo_dir}\", remote = \"{remote}\", enabled = true."
+        )
+        return
+    block = (
+        "\n# Added by `dispatch-gitsync init` — cross-host comms over git.\n"
+        "[git]\n"
+        "enabled = true\n"
+        f'repo_dir = "{repo_dir}"\n'
+        f'remote = "{remote}"\n'
+        '# mirror = "remote-only"  # default; "all" = full audited replica\n'
+    )
+    with cfgp.open("a") as f:
+        f.write(block)
+    print(f"[gitsync] wrote [git] block to {cfgp}")
+
+
+def cmd_init(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dispatch-gitsync init",
+        description="Create/clone a git bus repo, seed it, and write the [git] config.",
+    )
+    ap.add_argument("target", nargs="?", help="git URL, owner/name slug, or existing clone path")
+    ap.add_argument("--create", action="store_true", help="gh repo create the slug PRIVATE first")
+    ap.add_argument("--repo-dir", default=None, help="clone dest (default ~/.config/.../bus)")
+    ap.add_argument("--remote", default="origin", help="git remote name (default origin)")
+    args = ap.parse_args(argv)
+
+    repo_dir = Path(os.path.expanduser(args.repo_dir or "~/.config/mcp-dispatch/bus"))
+
+    if (repo_dir / ".git").exists():
+        print(f"[gitsync] reusing existing clone at {repo_dir}")
+    else:
+        target = args.target
+        if args.create:
+            if not target:
+                print("[gitsync] --create needs an owner/name slug, e.g. --create you/agent-bus")
+                return 2
+            print(f"[gitsync] creating PRIVATE repo {target} via gh…")
+            if _run(["gh", "repo", "create", target, "--private"]) != 0:
+                print("[gitsync] gh repo create nonzero (may already exist) — trying clone.")
+        if not target:
+            print("[gitsync] need a target: a git URL, owner/name slug, or an existing clone path.")
+            return 2
+        local = Path(os.path.expanduser(target))
+        if (local / ".git").exists():
+            repo_dir = local
+            print(f"[gitsync] using existing clone {repo_dir}")
+        else:
+            repo_dir.parent.mkdir(parents=True, exist_ok=True)
+            clone = (
+                ["git", "clone", target, str(repo_dir)]
+                if _looks_like_url(target) or local.exists()
+                else ["gh", "repo", "clone", target, str(repo_dir)]
+            )
+            if _run(clone) != 0:
+                print("[gitsync] clone failed.")
+                return 2
+
+    if not _has_commits(repo_dir):
+        print("[gitsync] seeding empty repo with an initial commit…")
+        _seed(repo_dir, args.remote)
+
+    _write_git_config(repo_dir, args.remote)
+    print(f"[gitsync] ready. repo_dir={repo_dir} remote={args.remote}")
+    print("[gitsync] run it with:  dispatch-gitsync   (or enable hooks/dispatch-gitsync-arm.py).")
+    return 0
+
+
+def cmd_status(argv: list[str]) -> int:
+    argparse.ArgumentParser(prog="dispatch-gitsync status").parse_args(argv)
+    data = _load_config()
+    git = _git_section(data)
+    dispatch_dir = _dispatch_dir(data)
+    repo_dir = git.get("repo_dir") or os.environ.get("MCP_DISPATCH_GIT_REPO")
+    repo_dir = Path(os.path.expanduser(str(repo_dir))) if repo_dir else None
+
+    print(f"enabled:          {bool(git.get('enabled'))}")
+    print(f"daemon running:   {_host_lock_held(dispatch_dir)}")
+    print(f"dispatch_dir:     {dispatch_dir}")
+    print(f"repo_dir:         {repo_dir or '(unset)'}")
+    print(f"remote:           {git.get('remote') or '(local-only)'}")
+    print(f"mirror:           {git.get('mirror') or 'remote-only'}")
+    if repo_dir and (repo_dir / "lanes").is_dir():
+        print(f"DM lanes:         {len(list((repo_dir / 'lanes').glob('*.jsonl')))}")
+    if dispatch_dir.is_dir():
+        print(f"live local:       {dispatch_fs.live_agents(dispatch_dir) or '(none)'}")
+        rem = dispatch_dir / ".remote"
+        if rem.is_dir():
+            print(f"remote-known:     {[p.stem for p in sorted(rem.glob('*.json'))] or '(none)'}")
+    return 0
+
+
+def cmd_run(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dispatch-gitsync", description="Mirror the local dispatch bus to/from git."
+    )
+    ap.add_argument("--interval", type=float, default=None, help="seconds between sync passes")
+    ap.add_argument("--once", action="store_true", help="run a single pass and exit")
+    ap.add_argument(
+        "--mirror", choices=["remote-only", "all"], default=None, help="override mirror mode"
+    )
+    ap.add_argument("--repo-dir", default=None, help="override the git clone path")
+    args = ap.parse_args(argv)
+
+    data = _load_config()
+    git = _git_section(data)
+
+    enabled = bool(git.get("enabled")) or bool(os.environ.get("MCP_DISPATCH_GIT_ENABLED"))
+    if not enabled and not (args.once or args.repo_dir):
+        print(
+            "[gitsync] [git].enabled is false — not bridging. Run `dispatch-gitsync "
+            "init <repo>` to set it up, or pass --repo-dir to bridge ad hoc."
+        )
+        return 0
+
+    repo_dir = args.repo_dir or os.environ.get("MCP_DISPATCH_GIT_REPO") or git.get("repo_dir")
+    if not repo_dir:
+        print("[gitsync] no git clone configured — run `dispatch-gitsync init <repo>` first.")
+        return 2
+    repo_dir = Path(os.path.expanduser(str(repo_dir)))
+    if not (repo_dir / ".git").exists():
+        print(
+            f"[gitsync] {repo_dir} is not a git clone (no .git). "
+            "Run `dispatch-gitsync init <repo>` first."
+        )
+        return 2
+
+    dispatch_dir = _dispatch_dir(data)
+    if not dispatch_dir.is_dir():
+        print(f"[gitsync] no relay at {dispatch_dir} — nothing to mirror.")
+        return 0
+
+    remote = os.environ.get("MCP_DISPATCH_GIT_REMOTE") or git.get("remote")
+    mirror = args.mirror or git.get("mirror") or "remote-only"
+    interval = args.interval if args.interval is not None else float(git.get("interval", 2.0))
+    group_mode = bool(_flat(data, "group_mode"))
+
+    bridge = GitBridge(dispatch_dir, repo_dir, remote=remote, mirror=mirror, group_mode=group_mode)
+
+    if args.once:
+        bridge.tick_guarded()
+        return 0
+
+    # One daemon per host. A second invocation (e.g. a racing SessionStart hook)
+    # finds the lock held and exits quietly.
+    lock = _acquire_host_lock(dispatch_dir)
+    if lock is None:
+        print(f"[gitsync] a daemon is already mirroring {dispatch_dir}; not starting a second.")
+        return 0
+
+    print(
+        f"[gitsync] mirroring {dispatch_dir} <-> {repo_dir} "
+        f"(remote={remote or 'local'}, mirror={mirror}, every {interval}s)"
+    )
+
+    # Presence-gated lifetime: exit once the host goes quiet (no live agents), so a
+    # backgrounded daemon can't outlive every session and orphan. A startup grace
+    # tolerates being launched a beat before the first session's presence appears.
+    seen_live = False
+    start = time.monotonic()
+    try:
+        while True:
+            bridge.tick_guarded()
+            live = bool(dispatch_fs.live_agents(dispatch_dir))
+            if live:
+                seen_live = True
+            elif seen_live:
+                print("[gitsync] no live agents on host — exiting (a new session re-arms me).")
+                return 0
+            elif time.monotonic() - start > STARTUP_GRACE_SECONDS:
+                print("[gitsync] no agents appeared within startup grace — exiting.")
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "init":
+        return cmd_init(argv[1:])
+    if argv and argv[0] == "status":
+        return cmd_status(argv[1:])
+    return cmd_run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

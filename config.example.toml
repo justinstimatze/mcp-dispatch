@@ -62,6 +62,36 @@ default_ttl = 604800  # 7 days
 # wrapper that sets DBUS_SESSION_BUS_ADDRESS / DISPLAY, or one that pushes
 # elsewhere (e.g. ntfy, or appending to a log you tail).
 
+# -- Cross-host comms (git transport) -----------------------------------------
+# Bridge this host's local bus to other machines through a shared git repo. Off
+# by default — with it off, dispatch is purely local, exactly as before. Run the
+# bin/dispatch-gitsync daemon once per host; it mirrors the local DISPATCH_DIR
+# <-> a git clone, so agents reach agents on OTHER hosts with zero change to how
+# they call dispatch(). A message from another machine is materialized as a normal
+# inbox file, so it wakes a parked session through the usual path. The git wire
+# format is the cross-language contract (see docs/git-transport.md); the canonical
+# Go impl is `leat`.
+[git]
+# enabled = true
+#
+# A working clone of a (private) git repo shared across your hosts. Make the repo
+# once, clone it on each host, and point repo_dir at the clone:
+#   git clone git@github.com:you/agent-bus.git ~/.config/mcp-dispatch/bus
+# repo_dir = "~/.config/mcp-dispatch/bus"
+#
+# Git remote within that clone to fetch/push. Omit for a local-only bus (tests,
+# single host with multiple DISPATCH_DIRs).
+# remote = "origin"
+#
+# Seconds between sync passes.
+# interval = 2.0
+#
+# What to mirror:
+#   "remote-only" (default) — only bridge a message with no live-local recipient;
+#                             same-host chatter stays local and private.
+#   "all"                   — mirror every DM too: a full audited cross-host replica.
+# mirror = "remote-only"
+
 # Affordance contract — the load-bearing "when to reach for this" guidance the
 # model reads at session start. The built-in default is a good generic version;
 # override here for environment-specific escalation paths. Placeholders:

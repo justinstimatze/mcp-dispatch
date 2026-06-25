@@ -28,7 +28,6 @@ import atexit
 import fcntl
 import json
 import os
-import re
 import shlex
 import signal
 import stat
@@ -39,11 +38,11 @@ import sys
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+import dispatch_fs
 from notify_policy import should_notify
 
 # tomllib is stdlib in 3.11+
@@ -162,17 +161,12 @@ os.umask(0o007 if GROUP_MODE else 0o077)
 # Agent ids and targets become path segments under DISPATCH_DIR, so they must
 # never contain separators or traversal sequences. Constrain to a safe charset.
 # \Z (not $) anchors the absolute end — $ would also match before a trailing newline.
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
-
-
-def _validate_id(value: str, kind: str = "agent id") -> str:
-    """Ensure an id is a single safe path segment. Raises ValueError otherwise."""
-    if not isinstance(value, str) or not _ID_RE.match(value):
-        raise ValueError(
-            f"Invalid {kind} {value!r}: must match {_ID_RE.pattern} "
-            "(lowercase alphanumeric, '_' or '-', 1-64 chars, no path separators)."
-        )
-    return value
+# The id contract and these fs primitives live in dispatch_fs so the git
+# replicator daemon (git_bridge.py) reuses the exact same logic without importing
+# this module (whose load claims an id and starts threads). One source of truth
+# for the on-disk format — drift would silently corrupt cross-host delivery.
+_ID_RE = dispatch_fs.ID_RE
+_validate_id = dispatch_fs.validate_id
 
 
 def _enforce_dir_mode(path: Path) -> None:
@@ -345,47 +339,17 @@ def _release_id(agent_id: str) -> None:
         _PRESENCE_HANDLE = None
 
 
-def _presence_is_live(pf: Path) -> bool:
-    """True iff a live process holds the exclusive flock on this presence file.
-
-    The lock — not the pid field — is the source of truth: it's uid-agnostic
-    (works across accounts in group_mode, unlike os.kill) and immune to pid
-    reuse, because the kernel drops it when the owner dies, crashes, or the host
-    reboots. We probe with a non-blocking exclusive lock: if we can take it,
-    nobody's home; if it blocks, a live process holds it.
-    """
-    try:
-        fh = open(pf)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        return False
-    except OSError:
-        return True
-    finally:
-        fh.close()
+_presence_is_live = dispatch_fs.presence_is_live
 
 
 def _live_presence_files() -> list[Path]:
     """Presence files whose owner is currently live."""
-    return [
-        pf for pf in sorted((DISPATCH_DIR / ".presence").glob("*.json")) if _presence_is_live(pf)
-    ]
+    return dispatch_fs.live_presence_files(DISPATCH_DIR)
 
 
 def _live_agents() -> list[str]:
     """Agent ids with a live presence record (validated to be path-safe)."""
-    out: list[str] = []
-    for pf in _live_presence_files():
-        try:
-            aid = json.loads(pf.read_text()).get("agent_id") or pf.stem
-        except (OSError, json.JSONDecodeError):
-            aid = pf.stem
-        if _ID_RE.match(str(aid)):
-            out.append(str(aid))
-    return out
+    return dispatch_fs.live_agents(DISPATCH_DIR)
 
 
 def _reap_dead_presence() -> int:
@@ -446,37 +410,8 @@ def _reap_empty_inboxes() -> int:
 # ---------------------------------------------------------------------------
 
 
-def _atomic_write(path: Path, data: dict) -> None:
-    """Write JSON durably and atomically: write tmp, fsync file, rename, fsync dir.
-
-    fsync on the file makes its bytes durable before the rename (no renamed-but-
-    empty file on crash); fsync on the parent directory makes the rename itself
-    durable (otherwise a crash can lose the new directory entry, dropping the
-    message entirely).
-    """
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
-
-
-def _parse_timestamp(ts: str) -> float:
-    """Parse ISO 8601 timestamp to epoch seconds."""
-    try:
-        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        return dt.timestamp()
-    except (ValueError, TypeError):
-        return 0.0
+_atomic_write = dispatch_fs.atomic_write
+_parse_timestamp = dispatch_fs.parse_timestamp
 
 
 def _is_expired(msg: dict) -> bool:
@@ -583,12 +518,8 @@ def _send(
             f"Message too large ({msg_bytes} bytes). Maximum: {MAX_MESSAGE_BYTES} bytes."
         )
 
-    ts = str(int(time.time() * 1000))
-
     def _filename() -> str:
-        # uuid suffix prevents two same-millisecond sends from the same sender
-        # from colliding on one filename (which would silently drop a message).
-        return f"{ts}-{from_id}-{uuid.uuid4().hex[:8]}.json"
+        return dispatch_fs.message_filename(from_id)
 
     def _validate_target(target: str) -> None:
         if not DYNAMIC_MODE:
@@ -646,19 +577,7 @@ def _discover_agents() -> list[str]:
 
 def _channel_subscribers(channel: str) -> list[str]:
     """Live agents currently subscribed to a channel, by presence record."""
-    subs: list[str] = []
-    for pf in _live_presence_files():
-        try:
-            data = json.loads(pf.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        if channel in data.get("channels", []):
-            aid = data.get("agent_id")
-            # The agent_id becomes a path segment in _deliver_one. A presence
-            # file is group-writable in group_mode, so don't trust it blindly.
-            if aid and _ID_RE.match(str(aid)):
-                subs.append(aid)
-    return subs
+    return dispatch_fs.channel_subscribers(DISPATCH_DIR, channel)
 
 
 def _set_subscription(channel: str, subscribed: bool) -> list[str]:
@@ -707,6 +626,17 @@ def _get_sent_receipts(agent_id: str) -> list[dict]:
     return receipts
 
 
+def _public_msg(m: dict) -> dict:
+    """Strip internal (_-prefixed) fields for the wire, but surface provenance: a
+    message materialized from the git transport carries an internal `_via` tag —
+    expose it as `via: "remote"` so an agent knows this one crossed machines
+    (durable delivery, so not necessarily instant)."""
+    clean = {k: v for k, v in m.items() if not k.startswith("_")}
+    if m.get("_via") == "git":
+        clean["via"] = "remote"
+    return clean
+
+
 def _with_pending(result: dict) -> dict:
     """Attach NEW (pending) messages to a tool response, marking them read."""
     _cleanup_expired(AGENT_ID)
@@ -715,7 +645,7 @@ def _with_pending(result: dict) -> dict:
         # Strip internal _file before exposing, but keep for _mark_read
         _mark_read(messages)
         # Clean internal fields for response
-        clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+        clean = [_public_msg(m) for m in messages]
         result["_dispatches"] = clean
         result["_dispatch_count"] = len(clean)
     return result
@@ -864,6 +794,9 @@ _default_instructions = (
     "subscribe('#name')/unsubscribe('#name') manage channel membership. "
     "Incoming messages also ride along on every tool response (piggyback delivery) — "
     "address them before resuming your current task. "
+    "If a git transport is configured, the SAME targets also reach agents on OTHER "
+    "hosts transparently (who() shows them under 'remote'; their delivery is durable "
+    "but not instant, and such messages arrive tagged via='remote'). "
     "Available targets: {agent_list}."
 )
 _instructions_template = CONFIG["instructions"] or _default_instructions
@@ -956,8 +889,8 @@ def peek_tool(
     # Mark pending → read
     _mark_read(messages)
 
-    # Clean internal fields
-    clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+    # Clean internal fields (and surface cross-host provenance via _public_msg)
+    clean = [_public_msg(m) for m in messages]
 
     # Delivery receipts for sent messages
     receipts = _get_sent_receipts(AGENT_ID)
@@ -1013,13 +946,21 @@ def ack_tool(
 
 @mcp.tool(
     name="who",
-    description="List all currently connected agents and their status.",
+    description=(
+        "List agents: those live on this host, plus any reachable cross-host via "
+        "the git transport (the 'remote' list — durable delivery, so they may be "
+        "offline right now). dispatch(target=id) reaches either the same way."
+    ),
 )
 def who_tool() -> dict:
     """List connected agents. Liveness is the presence flock, not a pid check.
 
     This only *filters* by liveness; it never unlinks (that would race a process
     reclaiming the same id). Dead presence files are reaped at startup instead.
+
+    Cross-host agents come from DISPATCH_DIR/.remote/, a roster the dispatch-gitsync
+    daemon maintains from git lane activity (no heartbeat); who() stays git-agnostic
+    and just reads it. A live-local agent shadows any remote entry of the same id.
     """
     agents: list[dict] = []
     for pf in _live_presence_files():
@@ -1028,11 +969,28 @@ def who_tool() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
 
-    return {
+    local_ids = {a.get("agent_id") for a in agents}
+    remote: list[dict] = []
+    remote_dir = DISPATCH_DIR / ".remote"
+    if remote_dir.is_dir():
+        for rf in sorted(remote_dir.glob("*.json")):
+            try:
+                data = json.loads(rf.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("agent_id") in local_ids:
+                continue  # a live local session wins over a git roster entry
+            remote.append(data)
+
+    result = {
         "self": AGENT_ID,
         "agents": agents,
         "count": len(agents),
     }
+    if remote:
+        result["remote"] = remote
+        result["remote_count"] = len(remote)
+    return result
 
 
 @mcp.tool(

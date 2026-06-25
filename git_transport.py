@@ -314,12 +314,35 @@ class GitBus:
             f"{type} {env.id} from {self.agent_id}"
             + (f" to {to}" if to else f" in #{chan}"),
         )
-        if push and self.remote:
-            # Pull-rebase-then-push to absorb siblings' fast-forwards. Because
-            # every author owns a distinct file, the rebase never conflicts.
-            self._git("pull", "--rebase", "-q", self.remote, self._branch(), check=False)
-            self._git("push", "-q", self.remote, f"HEAD:{self._branch()}")
+        if push:
+            self.push()
         return env
+
+    def push(self) -> None:
+        """Pull-rebase then push HEAD to the remote, retrying the race.
+
+        Lanes are per-author single-writer so the rebase never *conflicts*, but a
+        sibling's concurrent push can still leave ours non-fast-forward; absorb
+        that by re-pulling and retrying a bounded number of times. (A single-shot
+        push loses this race — the bug leat's CI caught and fixed with the same
+        loop.) No-op when the bus is local-only.
+        """
+        if not self.remote:
+            return
+        branch = self._branch()
+        last_err = ""
+        for _ in range(6):
+            self._git("pull", "--rebase", "-q", self.remote, branch, check=False)
+            proc = subprocess.run(
+                ["git", "push", "-q", self.remote, f"HEAD:{branch}"],
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                return
+            last_err = proc.stderr.strip()
+        raise RuntimeError(f"push to {self.remote}/{branch} failed after retries: {last_err}")
 
     def _branch(self) -> str:
         return self._git("rev-parse", "--abbrev-ref", "HEAD").strip() or "main"
@@ -389,6 +412,30 @@ class GitBus:
         self._cursor.save()
         # Stable order across lanes: by (ts, from, seq). Within a lane seq is
         # authoritative; across lanes we have no global clock (see doc).
+        results.sort(key=lambda e: (e.ts, e.from_, e.seq))
+        return results
+
+    def drain(self, *, fetch: bool = True) -> list[Envelope]:
+        """All new records across every lane past the reader cursor.
+
+        Like ``receive()`` but WITHOUT the ``to == me`` self-filter: the
+        replicator daemon (git_bridge.py) wants every new record so it can route
+        each one by ``to``/``chan`` into the right local inbox itself. Still skips
+        this reader's own lane (we never re-ingest what we authored) and
+        advances+persists the cursor. Guarding against re-ingesting records this
+        host *published on behalf of others* relies on the daemon's msg-id dedup
+        against the recipient inbox, not on lane exclusion here.
+        """
+        if fetch:
+            self.fetch()
+        results: list[Envelope] = []
+        for lane in self._all_lane_files():
+            for env in self._read_new_lines(lane):
+                if env.from_ == self.agent_id:
+                    continue
+                results.append(self._decode(env))
+        self._cursor.save()
+        # Same cross-lane ordering as receive(): no global clock, so (ts, from, seq).
         results.sort(key=lambda e: (e.ts, e.from_, e.seq))
         return results
 

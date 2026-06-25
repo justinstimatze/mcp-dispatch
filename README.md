@@ -304,6 +304,52 @@ subscriptions, and unread counts — run `bin/dispatch-status`.
 - TTL cleanup runs lazily on read operations
 - Optional watchdog prints stderr alerts for the human operator
 
+## Cross-host comms (git transport)
+
+By default dispatch is local-host-only: a message to an agent on another machine
+is written to a local inbox dir nobody reads. To reach agents on **other hosts**,
+run the `dispatch-gitsync` daemon — it bridges this host's relay to a shared git
+repo (per-author append-only JSONL lanes; durable, audited, conflict-free). The
+message tool surface is untouched: agents keep calling `dispatch(target=...)` and
+a message from another machine arrives as a normal inbox file, so it wakes a
+parked session through the same path a local one does. `who()` also lists
+cross-host agents under a `remote` key, and such messages arrive tagged
+`via: "remote"`.
+
+**Setup is one command per host** (`init` create-or-clones the repo, seeds it, and
+writes the `[git]` config — no hand-editing TOML):
+
+```bash
+dispatch-gitsync init --create you/agent-bus   # gh-create a PRIVATE repo, then wire it
+dispatch-gitsync init git@github.com:you/agent-bus.git   # join an existing bus
+```
+
+```bash
+dispatch-gitsync            # run the daemon (one per host; holds a host lock)
+dispatch-gitsync --once     # a single sync pass (smoke / cron)
+dispatch-gitsync status     # running? repo, lane count, who's reachable
+```
+
+The daemon is **presence-gated** — it exits once no agent is live on the host, so
+it can't orphan. For hands-free operation, wire `hooks/dispatch-gitsync-arm.py`
+into `SessionStart` (alongside the dispatch-wait arm hook) and it starts the daemon
+automatically whenever `[git].enabled`:
+
+```json
+{ "type": "command", "command": "/abs/path/to/hooks/dispatch-gitsync-arm.py" }
+```
+
+`mirror = "remote-only"` (default) only bridges messages with no live-local
+recipient — same-host chatter stays local and private; `mirror = "all"` makes a
+full audited cross-host replica.
+
+The git **wire format** (an 11-field JSONL envelope + lane layout) is the
+cross-language contract — see [`docs/git-transport.md`](docs/git-transport.md).
+The canonical Go implementation is [`leat`](https://github.com/justinstimatze/leat).
+Cross-host **channel** membership currently relies on a local subscriber to carry
+a post onto git (shared presence across hosts is a later step); **DMs** bridge
+unconditionally.
+
 ## Security
 
 This is local-host-only IPC; the threat model is other local users on a shared machine.
