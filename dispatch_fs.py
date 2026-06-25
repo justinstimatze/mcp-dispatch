@@ -110,9 +110,7 @@ def presence_is_live(pf: Path) -> bool:
 def live_presence_files(dispatch_dir: Path) -> list[Path]:
     """Presence files whose owner is currently live."""
     return [
-        pf
-        for pf in sorted((dispatch_dir / ".presence").glob("*.json"))
-        if presence_is_live(pf)
+        pf for pf in sorted((dispatch_dir / ".presence").glob("*.json")) if presence_is_live(pf)
     ]
 
 

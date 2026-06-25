@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+
+# plancheck debug artifact
+.plancheck-debug.json

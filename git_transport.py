@@ -201,6 +201,12 @@ class GitBus:
         state = Path(state_dir) if state_dir else (self.repo_dir / ".git" / "mcp-dispatch")
         self._cursor = Cursor.load(state / f"cursor-{self.agent_id}.json")
         self._subs: set[str] = set()
+        # Configure a LOCAL commit identity so commits AND `pull --rebase` succeed
+        # even where no global git identity is set (e.g. CI runners). Without it a
+        # rebase aborts mid-flight, detaching HEAD — which then poisons the push
+        # refspec. Best-effort: a no-op/ignored error if repo_dir isn't a repo yet.
+        self._git("config", "user.name", self.agent_id, check=False)
+        self._git("config", "user.email", f"{self.agent_id}@mcp-dispatch", check=False)
 
     # -- git plumbing -------------------------------------------------------
 
@@ -311,8 +317,7 @@ class GitBus:
             "commit",
             "-q",
             "-m",
-            f"{type} {env.id} from {self.agent_id}"
-            + (f" to {to}" if to else f" in #{chan}"),
+            f"{type} {env.id} from {self.agent_id}" + (f" to {to}" if to else f" in #{chan}"),
         )
         if push:
             self.push()
@@ -345,7 +350,10 @@ class GitBus:
         raise RuntimeError(f"push to {self.remote}/{branch} failed after retries: {last_err}")
 
     def _branch(self) -> str:
-        return self._git("rev-parse", "--abbrev-ref", "HEAD").strip() or "main"
+        b = self._git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        # "HEAD" means a detached state (e.g. a rebase mid-flight); never push to
+        # the literal ref "HEAD" — fall back to the default branch name.
+        return b if b and b != "HEAD" else "main"
 
     # -- fetch --------------------------------------------------------------
 

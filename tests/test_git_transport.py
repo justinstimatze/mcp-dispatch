@@ -45,9 +45,7 @@ def bus_pair(tmp_path: Path):
 
 
 def test_envelope_roundtrip():
-    env = Envelope(
-        type="message", from_="alice", to="bob", body={"content": "hi"}, key=None, seq=3
-    )
+    env = Envelope(type="message", from_="alice", to="bob", body={"content": "hi"}, key=None, seq=3)
     again = Envelope.from_json(env.to_json())
     assert again.from_ == "alice"
     assert again.to == "bob"
@@ -66,7 +64,18 @@ def test_envelope_uses_git_field_names():
 
     keys = set(json.loads(line).keys())
     assert keys == {
-        "type", "from", "to", "chan", "key", "id", "ts", "seq", "ttl", "version", "sig", "body"
+        "type",
+        "from",
+        "to",
+        "chan",
+        "key",
+        "id",
+        "ts",
+        "seq",
+        "ttl",
+        "version",
+        "sig",
+        "body",
     }
 
 

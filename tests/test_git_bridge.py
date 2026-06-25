@@ -245,9 +245,7 @@ def test_broadcast_not_bridged(hosts):
     # A broadcast file (to == "all") is host-local semantics; not bridged in v1.
     msg = _make_msg("alice", "all", "all hands")
     (hosts.dir_a / "bob").mkdir(parents=True)
-    dispatch_fs.atomic_write(
-        hosts.dir_a / "bob" / dispatch_fs.message_filename("alice"), msg
-    )
+    dispatch_fs.atomic_write(hosts.dir_a / "bob" / dispatch_fs.message_filename("alice"), msg)
     hosts.a.tick()
     hosts.b.tick()
     assert _inbox_files(hosts.dir_b, "bob") == []

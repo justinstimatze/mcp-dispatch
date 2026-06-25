@@ -171,10 +171,17 @@ def _seed(repo_dir: Path, remote: str) -> None:
     _run(["git", "-C", str(repo_dir), "add", "README.md"])
     _run(
         [
-            "git", "-C", str(repo_dir),
-            "-c", "user.name=dispatch-gitsync",
-            "-c", "user.email=gitsync@mcp-dispatch",
-            "commit", "-q", "-m", "seed bus",
+            "git",
+            "-C",
+            str(repo_dir),
+            "-c",
+            "user.name=dispatch-gitsync",
+            "-c",
+            "user.email=gitsync@mcp-dispatch",
+            "commit",
+            "-q",
+            "-m",
+            "seed bus",
         ]
     )
     _run(["git", "-C", str(repo_dir), "push", "-q", remote, "HEAD:main"])
@@ -187,7 +194,7 @@ def _write_git_config(repo_dir: Path, remote: str) -> None:
     if "[git]" in text:
         print(
             f"[gitsync] {cfgp} already has a [git] section — not clobbering it. "
-            f"Ensure: repo_dir = \"{repo_dir}\", remote = \"{remote}\", enabled = true."
+            f'Ensure: repo_dir = "{repo_dir}", remote = "{remote}", enabled = true.'
         )
         return
     block = (

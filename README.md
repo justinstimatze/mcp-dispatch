@@ -1,8 +1,8 @@
 # mcp-dispatch
 
-Local inter-agent messaging for AI coding agents via [MCP](https://modelcontextprotocol.io/).
+Local-first inter-agent messaging for AI coding agents via [MCP](https://modelcontextprotocol.io/), with an optional git transport for cross-host comms.
 
-Multiple Claude Code sessions (or any MCP-compatible agents) running on the same machine can send messages to each other through a shared filesystem relay. No server process, no ports, no network — just directories and JSON files with atomic writes.
+Multiple Claude Code sessions (or any MCP-compatible agents) running on the same machine send messages to each other through a shared filesystem relay — no server process, no ports, no network, just directories and JSON files with atomic writes. When you need to reach agents on **other machines**, an opt-in [git transport](#cross-host-comms-git-transport) bridges the same tool surface across hosts; until you enable it, everything stays purely local.
 
 ## Features
 
@@ -17,7 +17,8 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Wake on arrival** — `bin/dispatch-wait` blocks until a message matching the notify policy lands, then exits to wake a parked model — an event-driven replacement for polling with `/loop`.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
-- **Local-only & per-user** — `0700`/`0600` perms, validated ids, no network. See [Security](#security).
+- **Local-first & per-user** — `0700`/`0600` perms, validated ids, no network by default. See [Security](#security).
+- **Optional cross-host** — An opt-in [git transport](#cross-host-comms-git-transport) reaches agents on other machines through a shared git repo, transparently, without changing how agents call `dispatch()`.
 
 ## Quick Start
 
@@ -362,6 +363,11 @@ This is local-host-only IPC; the threat model is other local users on a shared m
   rather than allowed to escape the dispatch directory.
 - No network listener, no daemon, no encryption at rest (out of scope for the
   local-only threat model).
+- The optional [git transport](#cross-host-comms-git-transport) doesn't open a
+  listener either — it pushes/pulls a git remote you control. Its confidentiality
+  is your repo's (use a **private** repo); message bodies are cleartext in the
+  lanes today (a per-line encryption seam exists but ships off). Don't enable it
+  against a remote you wouldn't trust with the message contents.
 
 ### Sharing a relay across accounts
 
