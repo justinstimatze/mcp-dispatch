@@ -237,6 +237,54 @@ need cleartext. Cheap to fix now, expensive to reconcile later.
 `Collect() -> latest envelope per author`. A transport offering those two
 serves both the event-stream and state-snapshot consumers.
 
+### Wire contract (language-independent — this, not any one API, is the seam)
+
+Because a consumer may reimplement the transport in another language (ettle is
+Go and reads/writes lanes directly rather than importing the Python `GitBus`),
+**the on-disk format is the actual interop contract.** Two agents in different
+languages sharing one repo interoperate iff they agree on the bytes below. The
+reference implementation is `git_transport.py`.
+
+**Record** — one JSON object per line (JSONL), UTF-8, `\n`-terminated, no
+embedded newlines. The Python reference emits compact JSON
+(`separators=(",", ":")`), but **key order is not significant** — any
+conformant JSON parser reads by key, so a Go struct with json tags interops
+fine; byte-identical serialization is *not* required, only field
+names/types/semantics:
+
+| field | type | required | semantics |
+|-------|------|----------|-----------|
+| `type` | string | yes | record discriminator (`message`, `atom`, `ack`, `presence`, …) |
+| `from` | string | yes | author id; **must equal the lane owner** (see paths) |
+| `to` | string \| null | one of to/chan | DM recipient id |
+| `chan` | string \| null | one of to/chan | channel name (no leading `#`) |
+| `key` | string \| null | no | LWW partition; `null` = event-stream record |
+| `id` | string | yes | stable unique id; ref impl uses `rec-<12 hex>` |
+| `ts` | string | yes | UTC, **exactly** `%Y-%m-%dT%H:%M:%SZ` (second resolution) |
+| `seq` | int | yes | per-lane monotonic, **0-based** = count of prior records in that lane |
+| `ttl` | int \| null | no | seconds; `null`/`0` = never expire |
+| `version` | int | yes | wire schema version; currently `1` |
+| `sig` | string \| null | no | signature over the record; reserved/unenforced in v1 |
+| `body` | any | yes | opaque payload (object in cleartext v1; ciphertext blob when encrypted) |
+
+Invariant: **exactly one** of `to` / `chan` is non-null (DM xor channel post).
+
+**Lane paths** (a record's location must agree with its `from`):
+- DM lane: `lanes/<from>.jsonl`
+- channel lane: `channels/<chan>/<from>.jsonl`
+- `<from>` and `<chan>` match `^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$` (safe single
+  path segment — no dots, slashes, or leading dash).
+
+**Append-only, single-writer:** an agent only ever appends to lanes whose
+filename is its own id. This is what makes every push a fast-forward. A
+conformant writer never edits another agent's file and never rewrites earlier
+lines (except opt-in compaction — off by default).
+
+**Not part of the contract** (each implementation owns these privately): the
+reader cursor / read-state, commit messages, and the commit author/email
+string (only the `from` field is load-bearing for routing; the git author is
+audit metadata).
+
 ### Cross-lane ordering
 
 Each lane is totally ordered (append-only). There is **no global cross-lane
