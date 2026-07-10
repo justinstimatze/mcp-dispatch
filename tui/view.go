@@ -23,7 +23,6 @@ var (
 	footerKeyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	channelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("170"))
 	countStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	unreadTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	nickStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	okStatusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	errStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
@@ -133,30 +132,20 @@ func (m model) headerView() string {
 	if m.snap.RepoDir != "" {
 		src += "  " + remoteStyle.Render("+git")
 	}
-	live := 0
-	for _, a := range m.snap.Agents {
-		if a.Live {
-			live++
-		}
-	}
 	title := headerStyle.Render("dispatch-tui")
-	meta := countStyle.Render(fmt.Sprintf(" %s · %d msgs · %d live / %d seen",
-		src, len(m.snap.Messages), live, len(m.snap.Agents)))
+	meta := countStyle.Render(fmt.Sprintf(" %s · %d msgs · %d live / %d agents",
+		src, len(m.transcript), m.nLive, m.nProjects))
 	return lipgloss.NewStyle().Width(m.width).Render(title + meta)
 }
 
 func (m model) rosterView() string {
-	agentByID := map[string]Agent{}
-	for _, a := range m.snap.Agents {
-		agentByID[a.ID] = a
-	}
 	end := m.rosterTop + m.rosterVisibleRows()
 	if end > len(m.targets) {
 		end = len(m.targets)
 	}
 	var b strings.Builder
 	for i := m.rosterTop; i < end; i++ {
-		line := m.rosterLine(m.targets[i], agentByID)
+		line := m.rosterLine(m.targets[i])
 		if i == m.selected {
 			line = selStyle.Render(padRight(line, rosterWidth-1))
 		}
@@ -172,31 +161,41 @@ func (m model) rosterView() string {
 }
 
 func (m model) composeView() string {
-	prompt := composePrompt.Render(sendTarget(m.currentTarget()) + " ▸")
+	prompt := composePrompt.Render(m.filterLabel() + " ▸")
 	body := prompt + composeBar.Render(" "+m.input.View())
 	return composeBar.Width(m.width).Render(body)
 }
 
-func (m model) rosterLine(t target, agents map[string]Agent) string {
+func (m model) rosterLine(t target) string {
 	switch t.kind {
 	case targetAll:
 		return "▸ all traffic"
 	case targetChannel:
 		return channelStyle.Render(t.label)
+	case targetPastHeader:
+		caret := "▸"
+		if m.pastOpen {
+			caret = "▾"
+		}
+		return dimStyle.Render(fmt.Sprintf("%s %d past sessions", caret, t.count))
 	case targetAgent:
-		a := agents[t.value]
+		offline := !t.live && !t.remote
 		glyph := dimStyle.Render("◦")
-		if a.Live {
+		if t.live {
 			glyph = liveStyle.Render("●")
-		} else if a.Remote {
+		} else if t.remote {
 			glyph = remoteStyle.Render("◆")
 		}
-		unread := ""
-		if a.Unread > 0 {
-			unread = " " + unreadTagStyle.Render(fmt.Sprintf("(%d)", a.Unread))
+		badge := ""
+		if t.count > 0 {
+			badge = " " + dimStyle.Render(fmt.Sprintf("·%d", t.count))
 		}
-		id := truncate(t.label, rosterWidth-6)
-		return fmt.Sprintf("%s %s%s", glyph, id, unread)
+		prefix := ""
+		if offline { // indent members shown under the expanded past-sessions group
+			prefix = "  "
+		}
+		name := truncate(t.label, rosterWidth-8)
+		return fmt.Sprintf("%s%s %s%s", prefix, glyph, name, badge)
 	}
 	return t.label
 }
@@ -232,7 +231,7 @@ func (m model) footerView() string {
 		status = "  " + st.Render(m.status)
 	}
 	left := fmt.Sprintf(" %s · [%s] %s%s",
-		nickStyle.Render("@"+m.nick), m.currentTarget().label, pos, scroll)
+		nickStyle.Render("@"+m.nick), m.filterLabel(), pos, scroll)
 	keys := footerKeyStyle.Render("i send · a ack · tab filter · pgup/pgdn scroll · f follow · q quit")
 	return footerStyle.Width(m.width).Render(left + status + "  " + keys)
 }

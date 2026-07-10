@@ -30,6 +30,21 @@ var idRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 func validID(s string) bool { return idRe.MatchString(s) }
 
+// pidSuffixRe strips the trailing "-<pid>" the launcher appends per session.
+var pidSuffixRe = regexp.MustCompile(`-[0-9]+$`)
+
+// project maps an agent id to its stable project identity by dropping the
+// trailing "-<pid>". Sessions churn pids on every restart, so the pid is an
+// ephemeral connection while the project is the persistent "nick" — grouping by
+// project is what makes a live session show the conversation its past sessions
+// had. Channels ("#x") and "all" pass through unchanged.
+func project(id string) string {
+	if id == "" || id == "all" || strings.HasPrefix(id, "#") {
+		return id
+	}
+	return pidSuffixRe.ReplaceAllString(id, "")
+}
+
 // Message is one dispatch message, from a local inbox file or a git bus lane.
 type Message struct {
 	ID        string `json:"id"`
@@ -65,7 +80,6 @@ type Agent struct {
 	Channels []string
 	Unread   int
 	PID      int
-	msgCount int // how many feed messages this agent is in (offline sort key)
 }
 
 // Snapshot is one read of the whole relay: the merged feed plus the roster.
@@ -546,60 +560,19 @@ func contains(xs []string, v string) bool {
 	return false
 }
 
-// withFeedParticipants appends agents that appear in the feed (as sender or
-// recipient) but are neither live nor remote — the quiet/offline participants
-// behind most of the traffic. Without them the roster lists only live sessions,
-// which on a busy relay carry little of the visible traffic, so every per-agent
-// filter looks empty even though channels and "all" are full. Offline
-// participants sort by how much they're talking, so the active names surface
-// right under the live ones.
-func withFeedParticipants(agents []Agent, msgs []Message, relay string) []Agent {
-	known := map[string]bool{}
-	for _, a := range agents {
-		known[a.ID] = true
-	}
-	count := map[string]int{}
-	var order []string
-	for _, m := range msgs {
-		for _, id := range [2]string{m.From, m.To} {
-			if id == "" || id == "all" || strings.HasPrefix(id, "#") || !validID(id) {
-				continue
-			}
-			if known[id] {
-				continue // already listed as live/remote
-			}
-			if _, seen := count[id]; !seen {
-				order = append(order, id)
-			}
-			count[id]++
-		}
-	}
-	extra := make([]Agent, 0, len(order))
-	for _, id := range order {
-		extra = append(extra, Agent{
-			ID: id, msgCount: count[id], Unread: unreadCount(filepath.Join(relay, id)),
-		})
-	}
-	sort.Slice(extra, func(i, j int) bool {
-		if extra[i].msgCount != extra[j].msgCount {
-			return extra[i].msgCount > extra[j].msgCount // busiest first
-		}
-		return extra[i].ID < extra[j].ID
-	})
-	return append(agents, extra...)
-}
-
-// Load reads one full snapshot of the relay (feed + roster). readGit=false
-// restricts it to local inboxes.
+// Load reads one full snapshot of the relay: the messages currently on disk
+// (inbox + git lanes) plus the live/remote presence roster. readGit=false
+// restricts it to local inboxes. The caller accumulates Messages into a
+// transcript across snapshots — the relay is an ephemeral queue (acked mail is
+// cleaned), so a snapshot alone would keep losing the conversation.
 func Load(relay, repo string, readGit bool) Snapshot {
 	if !readGit {
 		repo = ""
 	}
-	msgs := mergeMessages(scanInbox(relay), scanGit(repo))
 	return Snapshot{
 		Relay:    relay,
 		RepoDir:  repo,
-		Messages: msgs,
-		Agents:   withFeedParticipants(roster(relay, repo), msgs, relay),
+		Messages: mergeMessages(scanInbox(relay), scanGit(repo)),
+		Agents:   roster(relay, repo),
 	}
 }

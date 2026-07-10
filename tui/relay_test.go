@@ -229,43 +229,96 @@ func TestModelRendersAndFilters(t *testing.T) {
 	}
 }
 
-func TestWithFeedParticipantsSurfacesOfflineSenders(t *testing.T) {
+func TestProjectStripsPid(t *testing.T) {
+	cases := map[string]string{
+		"aipotluck-dualpath-2833067": "aipotluck-dualpath",
+		"agent-service-879152":       "agent-service",
+		"mcp-dispatch-1207946":       "mcp-dispatch",
+		"publicai-1767991":           "publicai",
+		"alice":                      "alice", // no pid suffix → unchanged
+		"#eng":                       "#eng",  // channel passthrough
+		"all":                        "all",
+	}
+	for in, want := range cases {
+		if got := project(in); got != want {
+			t.Fatalf("project(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestModelGroupsPidsAndCollapsesOffline(t *testing.T) {
 	relay := t.TempDir()
-	live := []Agent{{ID: "alice", Live: true}}
-	msgs := []Message{
-		{ID: "1", From: "ghost", To: "alice"}, // ghost: offline but in the feed
-		{ID: "2", From: "ghost", To: "#eng"},  // ghost again (2 total)
-		{ID: "3", From: "quiet", To: "bob"},   // quiet + bob (1 each)
+	var mi tea.Model = newModel(relay, "", false, time.Second, "test", "console-1")
+	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 90, Height: 20})
+	snap := Snapshot{
+		// one live pid of publicai; the traffic is from OTHER publicai pids +
+		// an offline project — grouping must land it all under "publicai".
+		Agents: []Agent{{ID: "publicai-1664385", Live: true}},
+		Messages: []Message{
+			{ID: "1", From: "publicai-1767991", To: "documents-9", Content: "hi", Timestamp: "2026-07-10T18:00:00Z"},
+			{ID: "2", From: "publicai-3580621", To: "publicai-1767991", Content: "yo", Timestamp: "2026-07-10T18:00:01Z"},
+			{ID: "3", From: "ghost-42", To: "documents-9", Content: "old", Timestamp: "2026-07-10T18:00:02Z"},
+		},
 	}
-	out := withFeedParticipants(live, msgs, relay)
-	byID := map[string]Agent{}
-	for _, a := range out {
-		byID[a.ID] = a
-	}
-	for _, want := range []string{"alice", "ghost", "bob", "quiet"} {
-		if _, ok := byID[want]; !ok {
-			t.Fatalf("roster missing %q", want)
+	mi, _ = mi.Update(snapshotMsg(snap))
+	m := mi.(model)
+	// publicai is live (grouped) and carries the traffic even though the live pid
+	// itself sent nothing; ghost/documents are offline → behind the past group.
+	var pub target
+	for _, tg := range m.targets {
+		if tg.value == "publicai" {
+			pub = tg
 		}
 	}
-	if _, ok := byID["all"]; ok {
-		t.Fatal("'all' must not become an agent")
+	if !pub.live || pub.count == 0 {
+		t.Fatalf("publicai should be live with traffic: %+v", pub)
 	}
-	if _, ok := byID["#eng"]; ok {
-		t.Fatal("a channel must not become an agent")
-	}
-	// live leads; among offline, the busiest (ghost, 2 msgs) comes first
-	if out[0].ID != "alice" {
-		t.Fatalf("live should lead: %s", out[0].ID)
-	}
-	var firstOffline string
-	for _, a := range out {
-		if !a.Live {
-			firstOffline = a.ID
-			break
+	hasPast := false
+	for _, tg := range m.targets {
+		if tg.kind == targetPastHeader {
+			hasPast = true
+			if tg.count < 2 { // ghost + documents
+				t.Fatalf("expected offline projects in the past group, got %d", tg.count)
+			}
+		}
+		if tg.kind == targetAgent && (tg.value == "ghost" || tg.value == "documents") {
+			t.Fatalf("offline project %q should be collapsed, not top-level", tg.value)
 		}
 	}
-	if firstOffline != "ghost" {
-		t.Fatalf("busiest offline participant should lead the offline block: %s", firstOffline)
+	if !hasPast {
+		t.Fatal("expected a collapsible past-sessions group")
+	}
+	// selecting live publicai shows its cross-pid traffic (was empty pre-grouping)
+	for i, tg := range m.targets {
+		if tg.value == "publicai" {
+			m.selected = i
+		}
+	}
+	m.refreshFeed()
+	if got := m.vp.View(); !strings.Contains(got, "hi") || !strings.Contains(got, "yo") {
+		t.Fatalf("live publicai filter should show its pids' traffic:\n%s", got)
+	}
+}
+
+func TestTranscriptAccumulatesAcrossSnapshots(t *testing.T) {
+	var mi tea.Model = newModel("/r", "", false, time.Second, "test", "c")
+	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 80, Height: 16})
+	// snapshot 1 carries m1
+	mi, _ = mi.Update(snapshotMsg(Snapshot{Messages: []Message{
+		{ID: "m1", From: "alice-1", To: "bob-1", Content: "first", Timestamp: "2026-07-10T18:00:00Z", sortMS: 1},
+	}}))
+	// snapshot 2 no longer has m1 (its recipient acked → the file was deleted) but
+	// brings m2. The transcript must KEEP m1 — that's the inbox→transcript shift.
+	mi, _ = mi.Update(snapshotMsg(Snapshot{Messages: []Message{
+		{ID: "m2", From: "alice-1", To: "bob-1", Content: "second", Timestamp: "2026-07-10T18:00:01Z", sortMS: 2},
+	}}))
+	m := mi.(model)
+	if len(m.transcript) != 2 {
+		t.Fatalf("transcript should retain the acked-away m1 plus m2, got %d", len(m.transcript))
+	}
+	view := m.vp.View()
+	if !strings.Contains(view, "first") || !strings.Contains(view, "second") {
+		t.Fatalf("a message deleted from the queue must persist in the transcript:\n%s", view)
 	}
 }
 
@@ -315,21 +368,21 @@ func TestComposeAndSendThroughModel(t *testing.T) {
 func TestRosterScrollsToSelection(t *testing.T) {
 	var mi tea.Model = newModel("/r", "", false, time.Second, "test", "c")
 	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 60, Height: 8}) // feed height 6 → 6 roster rows
+	// distinct PROJECTS (each a different name so grouping doesn't collapse them),
+	// each with a pid suffix that project() strips.
 	var agents []Agent
 	for i := 0; i < 20; i++ {
-		agents = append(agents, Agent{ID: fmt.Sprintf("agent-%02d", i), Live: true})
+		agents = append(agents, Agent{ID: fmt.Sprintf("proj%02dx-1", i), Live: true})
 	}
 	mi, _ = mi.Update(snapshotMsg(Snapshot{Agents: agents}))
-	// 21 targets (all + 20). Tab 20 times lands selection on the last (agent-19);
-	// the window must have scrolled to reveal it.
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 20; i++ { // land the selection on the last project
 		mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyTab})
 	}
 	view := mi.View()
-	if !strings.Contains(view, "agent-19") {
+	if !strings.Contains(view, "proj19x") {
 		t.Fatalf("roster did not scroll to reveal the selection:\n%s", view)
 	}
-	if strings.Contains(view, "agent-00") {
+	if strings.Contains(view, "proj00x") {
 		t.Fatal("top of a scrolled roster should be off-screen")
 	}
 }

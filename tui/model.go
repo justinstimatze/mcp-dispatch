@@ -1,10 +1,20 @@
-// model.go — the Bubble Tea model: a read-only "passive IRC client" for the
-// dispatch relay. A roster/channel sidebar picks a filter; the feed viewport
-// scrolls the (local + cross-host) message stream, following new arrivals.
+// model.go — the Bubble Tea model: an IRC-style client for the dispatch relay.
+//
+// Two ideas make it read like a chat client over what is really an ephemeral
+// message queue:
+//
+//   - Transcript, not inbox. The relay deletes a message when its recipient
+//     acks it (and when it expires), so a snapshot keeps losing the
+//     conversation. We ACCUMULATE every message seen across polls into a
+//     transcript that persists after the on-disk copy is gone.
+//   - Project, not pid. Ids are <project>-<pid> and pids churn every session
+//     restart, so we group the roster by project — the persistent "nick" —
+//     with old/offline projects tucked into a collapsible group.
 package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,24 +24,30 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const rosterWidth = 26
+const (
+	rosterWidth   = 26
+	maxTranscript = 5000 // cap the accumulated log; evict oldest beyond this
+)
 
 type tickMsg time.Time
 type snapshotMsg Snapshot
 
-// targetKind is what a sidebar row filters the feed to.
 type targetKind int
 
 const (
-	targetAll targetKind = iota
-	targetAgent
-	targetChannel
+	targetAll        targetKind = iota
+	targetAgent                 // a project (grouped across its pids)
+	targetChannel               // a "#name" channel
+	targetPastHeader            // the collapsible "N past sessions" divider
 )
 
 type target struct {
-	kind  targetKind
-	value string // agent id or channel ("#name"); empty for all
-	label string
+	kind   targetKind
+	value  string // project id or "#channel"; empty for all/header
+	label  string
+	live   bool
+	remote bool
+	count  int // transcript messages involving this project (offline count for header)
 }
 
 type model struct {
@@ -41,16 +57,23 @@ type model struct {
 	version     string
 	nick        string // console identity for send/ack
 
-	snap      Snapshot
-	targets   []target
-	selected  int // index into targets
-	rosterTop int // first visible roster row (scrolls to keep selection in view)
+	snap       Snapshot       // latest raw snapshot (current presence + on-disk msgs)
+	transcript []Message      // accumulated, deduped, chronological
+	seen       map[string]int // msg id -> index in transcript
+	targets    []target
+	selected   int
+	rosterTop  int             // first visible roster row
+	offline    map[string]bool // offline project set (for the past-group feed filter)
+	pastOpen   bool            // is the past-sessions group expanded
+	nLive      int             // live project count (header)
+	nProjects  int             // total project count (header)
+
 	vp        viewport.Model
 	ready     bool
-	follow    bool // stick to the bottom as new messages arrive
-	composing bool // the compose bar is open
+	follow    bool
+	composing bool
 	input     textinput.Model
-	status    string // transient feedback (send/ack result); cleared on next action
+	status    string
 	statusErr bool
 	width     int
 	height    int
@@ -64,12 +87,20 @@ func newModel(relay, repo string, readGit bool, interval time.Duration, version,
 	return model{
 		relay: relay, repo: repo, readGit: readGit, interval: interval,
 		version: version, nick: nick, follow: true, input: ti,
+		seen:    map[string]int{},
+		offline: map[string]bool{},
 		targets: []target{{kind: targetAll, label: "all traffic"}},
 	}
 }
 
-func (m model) Init() tea.Cmd {
-	return tea.Batch(m.load(), m.tick())
+func (m model) Init() tea.Cmd { return tea.Batch(m.load(), m.tick()) }
+
+func (m model) load() tea.Cmd {
+	return func() tea.Msg { return snapshotMsg(Load(m.relay, m.repo, m.readGit)) }
+}
+
+func (m model) tick() tea.Cmd {
+	return tea.Tick(m.interval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m model) rosterVisibleRows() int {
@@ -91,14 +122,6 @@ func (m *model) ensureVisible() {
 	if m.rosterTop < 0 || len(m.targets) <= h {
 		m.rosterTop = 0
 	}
-}
-
-func (m model) load() tea.Cmd {
-	return func() tea.Msg { return snapshotMsg(Load(m.relay, m.repo, m.readGit)) }
-}
-
-func (m model) tick() tea.Cmd {
-	return tea.Tick(m.interval, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -124,6 +147,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case snapshotMsg:
 		m.snap = Snapshot(msg)
+		m.accumulate(m.snap.Messages)
 		m.rebuildTargets()
 		m.refreshFeed()
 		return m, nil
@@ -137,16 +161,239 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// accumulate merges a snapshot's messages into the transcript, deduped by id, so
+// a message keeps showing after the relay deletes its on-disk copy on ack. An
+// existing id is updated in place (e.g. its state changed); new ids are appended
+// and the transcript re-sorted chronologically and capped.
+func (m *model) accumulate(msgs []Message) {
+	added := false
+	for _, nm := range msgs {
+		if i, ok := m.seen[nm.ID]; ok {
+			m.transcript[i] = nm
+			continue
+		}
+		m.seen[nm.ID] = len(m.transcript)
+		m.transcript = append(m.transcript, nm)
+		added = true
+	}
+	if !added {
+		return
+	}
+	sort.SliceStable(m.transcript, func(i, j int) bool {
+		if m.transcript[i].sortMS != m.transcript[j].sortMS {
+			return m.transcript[i].sortMS < m.transcript[j].sortMS
+		}
+		return m.transcript[i].ID < m.transcript[j].ID
+	})
+	if len(m.transcript) > maxTranscript {
+		m.transcript = m.transcript[len(m.transcript)-maxTranscript:]
+	}
+	m.seen = make(map[string]int, len(m.transcript))
+	for i, mm := range m.transcript {
+		m.seen[mm.ID] = i
+	}
+}
+
+// rebuildTargets recomputes the sidebar from current presence + the transcript:
+// live/remote projects up top (busiest first), channels, then the collapsible
+// past-sessions group of offline projects. Selection is kept stable by value.
+func (m *model) rebuildTargets() {
+	prev, prevKind := "", targetAll
+	if m.selected >= 0 && m.selected < len(m.targets) {
+		prev, prevKind = m.targets[m.selected].value, m.targets[m.selected].kind
+	}
+
+	liveP, remoteP := map[string]bool{}, map[string]bool{}
+	for _, a := range m.snap.Agents {
+		p := project(a.ID)
+		if a.Live {
+			liveP[p] = true
+		} else if a.Remote {
+			remoteP[p] = true
+		}
+	}
+
+	count := map[string]int{}
+	var projOrder []string
+	chans := map[string]bool{}
+	for _, msg := range m.transcript {
+		for _, id := range [2]string{msg.From, msg.To} {
+			if strings.HasPrefix(id, "#") {
+				chans[strings.TrimPrefix(id, "#")] = true
+				continue
+			}
+			if id == "" || id == "all" {
+				continue
+			}
+			p := project(id)
+			if !validID(p) {
+				continue
+			}
+			if _, ok := count[p]; !ok {
+				projOrder = append(projOrder, p)
+			}
+			count[p]++
+		}
+	}
+	for p := range liveP {
+		if _, ok := count[p]; !ok {
+			count[p] = 0
+			projOrder = append(projOrder, p)
+		}
+	}
+	for p := range remoteP {
+		if _, ok := count[p]; !ok {
+			count[p] = 0
+			projOrder = append(projOrder, p)
+		}
+	}
+
+	var active, offline []string
+	m.offline = map[string]bool{}
+	for _, p := range projOrder {
+		if liveP[p] || remoteP[p] {
+			active = append(active, p)
+		} else {
+			offline = append(offline, p)
+			m.offline[p] = true
+		}
+	}
+	byCount := func(s []string) {
+		sort.SliceStable(s, func(i, j int) bool {
+			if count[s[i]] != count[s[j]] {
+				return count[s[i]] > count[s[j]]
+			}
+			return s[i] < s[j]
+		})
+	}
+	byCount(active)
+	byCount(offline)
+	var chanList []string
+	for c := range chans {
+		chanList = append(chanList, c)
+	}
+	sort.Strings(chanList)
+
+	targets := []target{{kind: targetAll, label: "all traffic"}}
+	for _, p := range active {
+		targets = append(targets, target{
+			kind: targetAgent, value: p, label: p,
+			live: liveP[p], remote: remoteP[p], count: count[p],
+		})
+	}
+	for _, c := range chanList {
+		targets = append(targets, target{kind: targetChannel, value: "#" + c, label: "#" + c})
+	}
+	if len(offline) > 0 {
+		targets = append(targets, target{kind: targetPastHeader, count: len(offline)})
+		if m.pastOpen {
+			for _, p := range offline {
+				targets = append(targets, target{kind: targetAgent, value: p, label: p, count: count[p]})
+			}
+		}
+	}
+	m.targets = targets
+
+	m.nProjects = len(active) + len(offline)
+	m.nLive = 0
+	for _, p := range active {
+		if liveP[p] {
+			m.nLive++
+		}
+	}
+
+	m.selected = 0
+	for i, t := range targets {
+		if prev != "" && t.value == prev {
+			m.selected = i
+			break
+		}
+		if prev == "" && prevKind == targetPastHeader && t.kind == targetPastHeader {
+			m.selected = i
+			break
+		}
+	}
+	m.ensureVisible()
+}
+
+func (m model) currentTarget() target {
+	if m.selected >= 0 && m.selected < len(m.targets) {
+		return m.targets[m.selected]
+	}
+	return target{kind: targetAll}
+}
+
+func (msg Message) matches(t target) bool {
+	switch t.kind {
+	case targetAll:
+		return true
+	case targetAgent:
+		return project(msg.From) == t.value || project(msg.To) == t.value
+	case targetChannel:
+		return msg.To == t.value
+	}
+	return false
+}
+
+func (m *model) refreshFeed() {
+	if !m.ready {
+		return
+	}
+	t := m.currentTarget()
+	match := func(msg Message) bool {
+		if t.kind == targetPastHeader { // the group header shows all offline chatter
+			return m.offline[project(msg.From)] || m.offline[project(msg.To)]
+		}
+		return msg.matches(t)
+	}
+	var b strings.Builder
+	shown := 0
+	for _, msg := range m.transcript {
+		if !match(msg) {
+			continue
+		}
+		b.WriteString(formatMessage(msg, m.vp.Width))
+		b.WriteByte('\n')
+		shown++
+	}
+	if shown == 0 {
+		b.WriteString(dimStyle.Render("  (no messages yet — waiting for traffic…)"))
+	}
+	m.vp.SetContent(b.String())
+	if m.follow {
+		m.vp.GotoBottom()
+	}
+}
+
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
-	case "i", "enter", "/":
-		// Open the compose bar to send to the current target.
+	case "enter", "i", "/":
+		if m.currentTarget().kind == targetPastHeader { // toggle the group
+			m.pastOpen = !m.pastOpen
+			m.rebuildTargets()
+			m.refreshFeed()
+			return m, nil
+		}
 		m.composing = true
 		m.status = ""
 		m.input.Focus()
 		return m, textinput.Blink
+	case "right", "l":
+		if m.currentTarget().kind == targetPastHeader && !m.pastOpen {
+			m.pastOpen = true
+			m.rebuildTargets()
+			m.refreshFeed()
+		}
+		return m, nil
+	case "left", "h":
+		if m.currentTarget().kind == targetPastHeader && m.pastOpen {
+			m.pastOpen = false
+			m.rebuildTargets()
+			m.refreshFeed()
+		}
+		return m, nil
 	case "a":
 		n, err := AckInbox(m.relay, m.nick)
 		if err != nil {
@@ -158,21 +405,21 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		if m.selected != 0 {
 			m.selected = 0
-			(&m).ensureVisible()
+			m.ensureVisible()
 			m.refreshFeed()
 		}
 		return m, nil
 	case "tab", "down", "j":
 		if len(m.targets) > 0 {
 			m.selected = (m.selected + 1) % len(m.targets)
-			(&m).ensureVisible()
+			m.ensureVisible()
 			m.refreshFeed()
 		}
 		return m, nil
 	case "shift+tab", "up", "k":
 		if len(m.targets) > 0 {
 			m.selected = (m.selected - 1 + len(m.targets)) % len(m.targets)
-			(&m).ensureVisible()
+			m.ensureVisible()
 			m.refreshFeed()
 		}
 		return m, nil
@@ -219,14 +466,26 @@ func (m model) handleCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
-		target := sendTarget(m.currentTarget())
-		n, err := Send(m.relay, m.nick, target, text, m.snap, "normal")
-		if err != nil {
-			m.status, m.statusErr = err.Error(), true
-		} else {
-			m.status, m.statusErr = fmt.Sprintf("✓ sent to %s → %d inbox(es)", target, n), false
-			m.follow = true // jump to the bottom so the sent message is visible
+		label, ids, meta := m.resolveSend(m.currentTarget())
+		switch {
+		case meta: // "all" / "#channel": Send does the fan-out
+			n, err := Send(m.relay, m.nick, label, text, m.snap, "normal")
+			m.setSendStatus(label, n, err)
+		case len(ids) == 0:
+			m.status, m.statusErr = fmt.Sprintf("no live session for %s to send to", label), true
+		default: // a project: deliver to each of its live sessions
+			total := 0
+			var err error
+			for _, id := range ids {
+				n, e := Send(m.relay, m.nick, id, text, m.snap, "normal")
+				total += n
+				if e != nil {
+					err = e
+				}
+			}
+			m.setSendStatus(label, total, err)
 		}
+		m.follow = true
 		return m, m.load()
 	}
 	var cmd tea.Cmd
@@ -234,90 +493,45 @@ func (m model) handleCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func sendTarget(t target) string {
-	if t.kind == targetAll {
-		return "all"
-	}
-	return t.value // agent id or "#channel"
-}
-
-// rebuildTargets refreshes the sidebar list from the current snapshot, keeping
-// the current selection stable by value across refreshes.
-func (m *model) rebuildTargets() {
-	prev := ""
-	if m.selected >= 0 && m.selected < len(m.targets) {
-		prev = m.targets[m.selected].value
-	}
-	targets := []target{{kind: targetAll, label: "all traffic"}}
-	for _, a := range m.snap.Agents {
-		targets = append(targets, target{kind: targetAgent, value: a.ID, label: a.ID})
-	}
-	seen := map[string]bool{}
-	for _, a := range m.snap.Agents {
-		for _, c := range a.Channels {
-			if !seen[c] {
-				seen[c] = true
-				targets = append(targets, target{kind: targetChannel, value: "#" + c, label: "#" + c})
-			}
-		}
-	}
-	for _, msg := range m.snap.Messages {
-		if c := msg.Channel(); c != "" && !seen[c] {
-			seen[c] = true
-			targets = append(targets, target{kind: targetChannel, value: "#" + c, label: "#" + c})
-		}
-	}
-	m.targets = targets
-	m.selected = 0
-	for i, t := range targets {
-		if t.value == prev && prev != "" {
-			m.selected = i
-			break
-		}
-	}
-	m.ensureVisible()
-}
-
-func (m model) currentTarget() target {
-	if m.selected >= 0 && m.selected < len(m.targets) {
-		return m.targets[m.selected]
-	}
-	return target{kind: targetAll}
-}
-
-func (m Message) matches(t target) bool {
-	switch t.kind {
-	case targetAll:
-		return true
-	case targetAgent:
-		return m.From == t.value || m.To == t.value
-	case targetChannel:
-		return m.To == t.value
-	}
-	return false
-}
-
-func (m *model) refreshFeed() {
-	if !m.ready {
+func (m *model) setSendStatus(label string, n int, err error) {
+	if err != nil {
+		m.status, m.statusErr = err.Error(), true
 		return
 	}
-	t := m.currentTarget()
-	var b strings.Builder
-	shown := 0
-	for _, msg := range m.snap.Messages {
-		if !msg.matches(t) {
-			continue
+	m.status, m.statusErr = fmt.Sprintf("✓ sent to %s → %d inbox(es)", label, n), false
+}
+
+// resolveSend maps the selected target to a delivery. all/#channel are handled
+// by Send's own fan-out (meta=true). A project resolves to its live sessions'
+// pids (empty if none are live — you can't reach an offline project).
+func (m model) resolveSend(t target) (label string, ids []string, meta bool) {
+	switch t.kind {
+	case targetAll:
+		return "all", nil, true
+	case targetChannel:
+		return t.value, nil, true
+	case targetAgent:
+		var pids []string
+		for _, a := range m.snap.Agents {
+			if a.Live && project(a.ID) == t.value {
+				pids = append(pids, a.ID)
+			}
 		}
-		b.WriteString(formatMessage(msg, m.vp.Width))
-		b.WriteByte('\n')
-		shown++
+		return t.value, pids, false
 	}
-	if shown == 0 {
-		b.WriteString(dimStyle.Render("  (no messages yet — waiting for traffic…)"))
-	}
-	m.vp.SetContent(b.String())
-	if m.follow {
-		m.vp.GotoBottom()
+	return t.label, nil, false
+}
+
+// filterLabel is the human name of the current filter, for the footer/compose.
+func (m model) filterLabel() string {
+	t := m.currentTarget()
+	switch t.kind {
+	case targetAll:
+		return "all traffic"
+	case targetPastHeader:
+		return "past sessions"
+	default:
+		return t.label
 	}
 }
 
