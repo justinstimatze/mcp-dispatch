@@ -133,9 +133,15 @@ func (m model) headerView() string {
 	if m.snap.RepoDir != "" {
 		src += "  " + remoteStyle.Render("+git")
 	}
+	live := 0
+	for _, a := range m.snap.Agents {
+		if a.Live {
+			live++
+		}
+	}
 	title := headerStyle.Render("dispatch-tui")
-	meta := countStyle.Render(fmt.Sprintf(" %s · %d msgs · %d agents",
-		src, len(m.snap.Messages), len(m.snap.Agents)))
+	meta := countStyle.Render(fmt.Sprintf(" %s · %d msgs · %d live / %d seen",
+		src, len(m.snap.Messages), live, len(m.snap.Agents)))
 	return lipgloss.NewStyle().Width(m.width).Render(title + meta)
 }
 

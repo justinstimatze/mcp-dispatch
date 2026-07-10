@@ -65,6 +65,7 @@ type Agent struct {
 	Channels []string
 	Unread   int
 	PID      int
+	msgCount int // how many feed messages this agent is in (offline sort key)
 }
 
 // Snapshot is one read of the whole relay: the merged feed plus the roster.
@@ -545,6 +546,49 @@ func contains(xs []string, v string) bool {
 	return false
 }
 
+// withFeedParticipants appends agents that appear in the feed (as sender or
+// recipient) but are neither live nor remote — the quiet/offline participants
+// behind most of the traffic. Without them the roster lists only live sessions,
+// which on a busy relay carry little of the visible traffic, so every per-agent
+// filter looks empty even though channels and "all" are full. Offline
+// participants sort by how much they're talking, so the active names surface
+// right under the live ones.
+func withFeedParticipants(agents []Agent, msgs []Message, relay string) []Agent {
+	known := map[string]bool{}
+	for _, a := range agents {
+		known[a.ID] = true
+	}
+	count := map[string]int{}
+	var order []string
+	for _, m := range msgs {
+		for _, id := range [2]string{m.From, m.To} {
+			if id == "" || id == "all" || strings.HasPrefix(id, "#") || !validID(id) {
+				continue
+			}
+			if known[id] {
+				continue // already listed as live/remote
+			}
+			if _, seen := count[id]; !seen {
+				order = append(order, id)
+			}
+			count[id]++
+		}
+	}
+	extra := make([]Agent, 0, len(order))
+	for _, id := range order {
+		extra = append(extra, Agent{
+			ID: id, msgCount: count[id], Unread: unreadCount(filepath.Join(relay, id)),
+		})
+	}
+	sort.Slice(extra, func(i, j int) bool {
+		if extra[i].msgCount != extra[j].msgCount {
+			return extra[i].msgCount > extra[j].msgCount // busiest first
+		}
+		return extra[i].ID < extra[j].ID
+	})
+	return append(agents, extra...)
+}
+
 // Load reads one full snapshot of the relay (feed + roster). readGit=false
 // restricts it to local inboxes.
 func Load(relay, repo string, readGit bool) Snapshot {
@@ -556,6 +600,6 @@ func Load(relay, repo string, readGit bool) Snapshot {
 		Relay:    relay,
 		RepoDir:  repo,
 		Messages: msgs,
-		Agents:   roster(relay, repo),
+		Agents:   withFeedParticipants(roster(relay, repo), msgs, relay),
 	}
 }

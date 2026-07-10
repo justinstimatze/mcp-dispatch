@@ -229,6 +229,46 @@ func TestModelRendersAndFilters(t *testing.T) {
 	}
 }
 
+func TestWithFeedParticipantsSurfacesOfflineSenders(t *testing.T) {
+	relay := t.TempDir()
+	live := []Agent{{ID: "alice", Live: true}}
+	msgs := []Message{
+		{ID: "1", From: "ghost", To: "alice"}, // ghost: offline but in the feed
+		{ID: "2", From: "ghost", To: "#eng"},  // ghost again (2 total)
+		{ID: "3", From: "quiet", To: "bob"},   // quiet + bob (1 each)
+	}
+	out := withFeedParticipants(live, msgs, relay)
+	byID := map[string]Agent{}
+	for _, a := range out {
+		byID[a.ID] = a
+	}
+	for _, want := range []string{"alice", "ghost", "bob", "quiet"} {
+		if _, ok := byID[want]; !ok {
+			t.Fatalf("roster missing %q", want)
+		}
+	}
+	if _, ok := byID["all"]; ok {
+		t.Fatal("'all' must not become an agent")
+	}
+	if _, ok := byID["#eng"]; ok {
+		t.Fatal("a channel must not become an agent")
+	}
+	// live leads; among offline, the busiest (ghost, 2 msgs) comes first
+	if out[0].ID != "alice" {
+		t.Fatalf("live should lead: %s", out[0].ID)
+	}
+	var firstOffline string
+	for _, a := range out {
+		if !a.Live {
+			firstOffline = a.ID
+			break
+		}
+	}
+	if firstOffline != "ghost" {
+		t.Fatalf("busiest offline participant should lead the offline block: %s", firstOffline)
+	}
+}
+
 func TestFormatMessageWrapsNotTruncates(t *testing.T) {
 	long := strings.TrimSpace(strings.Repeat("word ", 40)) // ~200 chars
 	out := formatMessage(Message{From: "alice", To: "bob", Content: long}, 60)
