@@ -92,9 +92,8 @@ def _inbox_files(dispatch_dir: Path, agent_id: str) -> list[dict]:
     return out
 
 
-@pytest.fixture
-def hosts(tmp_path: Path):
-    """A bare repo + two host clones, each with its own DISPATCH_DIR + GitBridge."""
+def _bus_and_clones(tmp_path: Path):
+    """A seeded bare 'bus' repo + two working clones + two empty DISPATCH_DIRs."""
     bare = tmp_path / "bus.git"
     _git(tmp_path, "init", "--bare", "-b", "main", str(bare))
 
@@ -114,6 +113,13 @@ def hosts(tmp_path: Path):
     dir_b = tmp_path / "dirB"
     dir_a.mkdir()
     dir_b.mkdir()
+    return dir_a, dir_b, repo_a, repo_b
+
+
+@pytest.fixture
+def hosts(tmp_path: Path):
+    """A bare repo + two host clones, each with its own DISPATCH_DIR + GitBridge."""
+    dir_a, dir_b, repo_a, repo_b = _bus_and_clones(tmp_path)
 
     return SimpleNamespace(
         dir_a=dir_a,
@@ -124,6 +130,27 @@ def hosts(tmp_path: Path):
         b=GitBridge(dir_b, repo_b, remote="origin"),
         holds=[],  # keep presence flocks alive
     )
+
+
+def test_first_run_does_not_dump_backlog(tmp_path):
+    """Enabling the bridge on a relay that already has history must NOT push that
+    backlog to git — only messages that arrive after enable bridge ('from now on')."""
+    dir_a, dir_b, repo_a, repo_b = _bus_and_clones(tmp_path)
+
+    # Backlog exists BEFORE the bridge is ever constructed (git just got enabled).
+    _local_dm(dir_a, "alice", "bob", "ancient backlog")
+
+    a = GitBridge(dir_a, repo_a, remote="origin")  # first run → seeds ledger, no push
+    b = GitBridge(dir_b, repo_b, remote="origin")
+    a.tick()
+    b.tick()
+    assert _inbox_files(dir_b, "bob") == []  # backlog stayed out of git
+
+    # A message that lands AFTER enable bridges normally.
+    _local_dm(dir_a, "alice", "bob", "fresh message")
+    a.tick()
+    b.tick()
+    assert [m["content"] for m in _inbox_files(dir_b, "bob")] == ["fresh message"]
 
 
 def test_dm_crosses_hosts(hosts):

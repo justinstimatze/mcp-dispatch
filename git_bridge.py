@@ -80,7 +80,16 @@ class GitBridge:
         self._reader = GitBus(repo_dir, READER_ID, remote=remote, state_dir=self._state)
         self._writers: dict[str, GitBus] = {}
         self._ledger_path = self._state / "gitsync-outbound.json"
+        # "Bridge from now on": if no ledger exists yet (git was just enabled), the
+        # messages already sitting in local inboxes are pre-existing backlog, NOT
+        # traffic to sync. Snapshot their ids as already-handled so the first tick
+        # doesn't dump weeks of history to git. Only messages arriving *after* this
+        # construction (daemon start) bridge. Captured at __init__ so a message that
+        # lands between start and the first tick still counts as new.
+        first_run = not self._ledger_path.exists()
         self._ledger = self._load_ledger()
+        if first_run:
+            self._seed_ledger_from_backlog()
 
     # -- public surface -----------------------------------------------------
 
@@ -109,8 +118,10 @@ class GitBridge:
 
     # -- outbound: local inbox -> git lane ----------------------------------
 
-    def _outbound(self) -> None:
-        published = 0
+    def _local_messages(self):
+        """Yield each locally-originated (non-``_via:git``) inbox message dict,
+        across every inbox. The single scan both ``_outbound`` and the first-run
+        ``_seed_ledger_from_backlog`` share, so their skip logic can't drift."""
         for inbox in self._inbox_dirs():
             for f in sorted(inbox.glob("*.json")):
                 try:
@@ -119,15 +130,20 @@ class GitBridge:
                     continue
                 if msg.get("_via") == "git":
                     continue  # arrived over git — never echo back
-                mid = msg.get("id")
-                if not mid or mid in self._ledger:
-                    continue
-                # One routing decision per logical message; ledger it either way
-                # so live-local / broadcast messages aren't re-examined every tick
-                # and a fan-out's N inbox copies publish exactly once.
-                if self._publish_one(msg):
-                    published += 1
-                self._ledger[mid] = time.time()
+                yield msg
+
+    def _outbound(self) -> None:
+        published = 0
+        for msg in self._local_messages():
+            mid = msg.get("id")
+            if not mid or mid in self._ledger:
+                continue
+            # One routing decision per logical message; ledger it either way so
+            # live-local / broadcast messages aren't re-examined every tick and a
+            # fan-out's N inbox copies publish exactly once.
+            if self._publish_one(msg):
+                published += 1
+            self._ledger[mid] = time.time()
         if published:
             self._save_ledger()
             if self.remote:
@@ -288,6 +304,21 @@ class GitBridge:
         return bus
 
     # -- ledger -------------------------------------------------------------
+
+    def _seed_ledger_from_backlog(self) -> None:
+        """First-run guard: record every message currently in local inboxes as
+        already-handled WITHOUT publishing it, so enabling the bridge on a busy
+        relay means 'bridge from now on' rather than dumping the whole pre-existing
+        backlog to git. Idempotent-safe: only called when no ledger existed yet."""
+        now = time.time()
+        seeded = 0
+        for msg in self._local_messages():
+            mid = msg.get("id")
+            if mid and mid not in self._ledger:
+                self._ledger[mid] = now
+                seeded += 1
+        if seeded:
+            self._save_ledger()
 
     def _load_ledger(self) -> dict[str, float]:
         try:
