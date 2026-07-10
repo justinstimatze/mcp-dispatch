@@ -1,8 +1,9 @@
-"""Unit tests for hooks/_dispatch_common.py — the shared hook plumbing.
+"""Unit tests for dispatch_common.py — the shared hook + bin/ plumbing.
 
-Its whole reason to exist is that the two arm hooks had drifted; the key
-regression it fixes is that gitsync-arm ignored `[dispatch].auto_arm`. These
-tests pin the unified behavior at the source so neither hook can drift again.
+Its whole reason to exist is that the arm hooks and the bin/ scripts had each
+carried near-copies that drifted; the key regression it fixes is that gitsync-arm
+ignored `[dispatch].auto_arm`. These tests pin the unified behavior at the source
+so no consumer can drift again.
 """
 
 from __future__ import annotations
@@ -12,9 +13,9 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "hooks"))
+sys.path.insert(0, str(REPO_ROOT))
 
-import _dispatch_common as common  # noqa: E402
+import dispatch_common as common  # noqa: E402
 
 
 def test_flat_top_level_wins_over_dispatch_table():
@@ -89,3 +90,38 @@ def test_flock_held_read_only_probe_does_not_create(tmp_path):
     missing = tmp_path / "ghost.lock"
     common.flock_held(missing)
     assert not missing.exists()
+
+
+def test_acquire_flock_returns_held_handle(tmp_path):
+    lock = tmp_path / "held.lock"
+    fh = common.acquire_flock(lock)
+    try:
+        assert fh is not None
+        assert lock.exists()  # unlike flock_held, acquire DOES create the anchor file
+        assert common.flock_held(lock) is True  # a concurrent probe sees it held
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_acquire_flock_none_when_already_held(tmp_path):
+    lock = tmp_path / "contended.lock"
+    holder = common.acquire_flock(lock)
+    assert holder is not None
+    try:
+        assert common.acquire_flock(lock) is None  # second acquire loses
+    finally:
+        holder.close()
+
+
+def test_acquire_flock_after_release_succeeds(tmp_path):
+    lock = tmp_path / "reusable.lock"
+    first = common.acquire_flock(lock)
+    assert first is not None
+    first.close()  # release
+    second = common.acquire_flock(lock)  # now free again
+    try:
+        assert second is not None
+    finally:
+        if second is not None:
+            second.close()

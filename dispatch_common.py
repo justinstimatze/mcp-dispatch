@@ -1,11 +1,14 @@
-"""Shared, side-effect-free plumbing for the dispatch SessionStart/Stop hooks.
+"""Shared, side-effect-free plumbing for the dispatch hooks *and* bin/ scripts.
 
-``dispatch-arm.py`` and ``dispatch-gitsync-arm.py`` both resolve config, the
-dispatch dir, the state dir, and probe flocks. Historically each carried its own
-near-copy of these — and they had drifted: dispatch-arm merged a ``[dispatch]``
-table so it honored ``[dispatch].auto_arm``, while gitsync-arm read the raw dict
-and silently ignored it. This module is the single source both import, so the two
-hooks can't diverge again. Stdlib only; safe to import from a standalone hook.
+Config resolution (top-level-over-``[dispatch]``-table), the dispatch/state dir
+lookups, the md5 lock-key, and the flock probe/acquire primitives were each
+copy-pasted across ``hooks/dispatch-arm.py``, ``hooks/dispatch-gitsync-arm.py``,
+``bin/dispatch-wait`` and ``bin/dispatch-gitsync`` — four near-copies that had
+already drifted once (gitsync-arm silently ignored ``[dispatch].auto_arm``). This
+module is the single source all four import, so they can't diverge again. It
+lives at the repo root beside the other shared modules (``notify_policy``,
+``dispatch_fs``) the bin scripts already import. Stdlib only; safe to import from
+a standalone hook.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import time
 from pathlib import Path
 
 
@@ -92,3 +96,30 @@ def flock_held(path: Path) -> bool:
         return True
     finally:
         fh.close()
+
+
+def acquire_flock(path: Path, *, attempts: int = 1, backoff: float = 0.05):
+    """Take an exclusive flock on ``path`` and RETURN the held handle (kept open so
+    the lock lives for the caller's lifetime; the kernel releases it on exit/death).
+    Returns ``None`` if the lock is already held elsewhere or the dir is unwritable.
+
+    Single-instance guard for the waiter and the git daemon. Unlike ``flock_held``
+    (a probe that immediately releases), this holds. ``attempts>1`` retries with a
+    short ``backoff`` between tries — the arm hook probes this same lock to test
+    liveness, and that momentary hold can collide with a just-starting holder, so
+    one retry keeps a probe from masquerading as a rival. Opened ``a+`` so it does
+    create the lock file (that's the point — the file's existence anchors the lock)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")  # noqa: SIM115 - held for the caller's process lifetime
+    except OSError:
+        return None
+    for attempt in range(max(1, attempts)):
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if attempt < attempts - 1:
+                time.sleep(backoff)
+    fh.close()
+    return None

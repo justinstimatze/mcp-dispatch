@@ -51,8 +51,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _dispatch_common as common  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
 
 MAX_BLOCKS = 2  # consecutive Stop blocks before degrading, so a bad launch can't wedge
 # On SessionStart the MCP server may not have claimed presence yet, so id

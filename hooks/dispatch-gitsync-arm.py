@@ -28,8 +28,8 @@ import subprocess  # nosec B404
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _dispatch_common as common  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
 
 
 def main() -> int:

@@ -53,8 +53,6 @@ from __future__ import annotations
 
 import argparse
 import calendar
-import fcntl
-import hashlib
 import json
 import os
 import re
@@ -62,8 +60,9 @@ import sys
 import time
 from pathlib import Path
 
-# notify_policy.py lives at the repo root (parent of bin/).
+# notify_policy.py and dispatch_common.py live at the repo root (parent of bin/).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
 from notify_policy import should_notify  # noqa: E402
 
 # When launched standalone (no live server holding the agent's presence), there's
@@ -71,75 +70,20 @@ from notify_policy import should_notify  # noqa: E402
 STANDALONE_FALLBACK_SECONDS = 1800.0
 
 
-def _configured(key: str) -> str | None:
-    """Read a scalar key from the config file, if present (stdlib tomllib)."""
-    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
-        "~/.config/mcp-dispatch/config.toml"
-    )
-    if not os.path.exists(cfg):
-        return None
-    try:
-        import tomllib
-
-        with open(cfg, "rb") as f:
-            data = tomllib.load(f)
-    except Exception:
-        return None
-    sub = data.get("dispatch")
-    section = sub if isinstance(sub, dict) else {}
-    val = data.get(key)
-    if val is None:
-        val = section.get(key)
-    return str(val) if val is not None else None
-
-
-def _dispatch_dir() -> Path:
-    raw = (
-        os.environ.get("MCP_DISPATCH_DIR")
-        or os.environ.get("DISPATCH_DIR")
-        or _configured("dispatch_dir")
-        or "~/.config/mcp-dispatch/messages"
-    )
-    return Path(os.path.expanduser(raw))
-
-
-def _state_dir() -> Path:
-    """Per-user scratch dir for arm lockfiles. Overridable for tests."""
-    raw = os.environ.get("MCP_DISPATCH_STATE_DIR") or "~/.cache/mcp-dispatch"
-    return Path(os.path.expanduser(raw))
-
-
 def _arm_lock_path(agent_id: str) -> Path:
-    key = hashlib.md5(agent_id.encode(), usedforsecurity=False).hexdigest()[:8]
-    return _state_dir() / f"wait-{key}.lock"
+    return common.state_dir() / f"wait-{common.md5_key(agent_id)}.lock"
 
 
 def _notify_on(cli_value: str | None) -> str:
     """Resolve the policy: CLI flag > env > config > "important" (server default)."""
+    cfg_val = common.flat(common.load_config(), "notify_on")
     raw = (
         cli_value
         or os.environ.get("MCP_DISPATCH_NOTIFY_ON")
-        or _configured("notify_on")
+        or (str(cfg_val) if cfg_val is not None else None)
         or "important"
     )
     return raw.strip().lower()
-
-
-def _presence_is_live(pf: Path) -> bool:
-    """A live owner holds the exclusive flock on its presence file. If we can take
-    the lock, nobody's home (uid-agnostic, pid-reuse-immune)."""
-    try:
-        fh = open(pf)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        return False
-    except OSError:
-        return True
-    finally:
-        fh.close()
 
 
 def _resolve_agent_id(dispatch_dir: Path) -> str | None:
@@ -158,7 +102,7 @@ def _resolve_agent_id(dispatch_dir: Path) -> str | None:
         except (json.JSONDecodeError, OSError):
             continue
         aid = data.get("agent_id", "")
-        if aid.startswith(f"{prefix}-") and _presence_is_live(pf):
+        if aid.startswith(f"{prefix}-") and common.flock_held(pf):
             matches.append(aid)
     return matches[0] if len(matches) == 1 else None
 
@@ -240,7 +184,7 @@ def _follow(
             if mid not in emitted:
                 print(_oneline(agent_id, m), flush=True)
         emitted = current
-        if gated and not _presence_is_live(presence_pf):
+        if gated and not common.flock_held(presence_pf):
             print(
                 f"[mcp-dispatch] session for {agent_id} ended (presence dropped) — watch exiting.",
                 flush=True,
@@ -299,7 +243,7 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    dispatch_dir = _dispatch_dir()
+    dispatch_dir = common.dispatch_dir(common.load_config())
     if not dispatch_dir.is_dir():
         print(f"[mcp-dispatch] no relay at {dispatch_dir} — nothing to wait on.")
         return 0
@@ -313,35 +257,16 @@ def main() -> int:
 
     # Single-instance lock: hold it for our lifetime so (a) two waiters never arm
     # the same agent and (b) hooks/dispatch-arm.py can detect liveness by probing
-    # this same flock. Released automatically by the kernel when we exit. Degrade
-    # to running unlocked if the scratch dir is unwritable.
-    lock_fh = None
-    try:
-        lock_path = _arm_lock_path(agent_id)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fh = open(lock_path, "a+")  # noqa: SIM115 — held for process lifetime
-    except OSError:
-        lock_fh = None
-    if lock_fh is not None:
-        locked = False
-        for attempt in range(2):
-            try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
-            except OSError:
-                # The arm hook probes this same lock (acquire+release) to test
-                # liveness; that momentary hold could collide with us starting up.
-                # Retry once after a beat so a probe never masquerades as a rival
-                # waiter — only a truly-held lock survives the retry.
-                if attempt == 0:
-                    time.sleep(0.05)
-        if not locked:
-            lock_fh.close()
-            print(
-                f"[mcp-dispatch] a waiter is already armed for {agent_id}; not starting a second."
-            )
-            return 0
+    # this same flock. Released automatically by the kernel when we exit. attempts=2
+    # rides out the arm hook's momentary liveness probe (see acquire_flock).
+    lock_path = _arm_lock_path(agent_id)
+    lock_fh = common.acquire_flock(lock_path, attempts=2)
+    if lock_fh is None and common.flock_held(lock_path):
+        # None + genuinely held ⇒ a rival waiter owns it: stand down. (None with the
+        # lock *not* held means the scratch dir was unwritable — degrade to running
+        # unlocked rather than refuse to arm.)
+        print(f"[mcp-dispatch] a waiter is already armed for {agent_id}; not starting a second.")
+        return 0
 
     notify_on = _notify_on(args.notify_on)
 
@@ -380,7 +305,7 @@ def main() -> int:
         if hits:
             print(_summary(agent_id, notify_on, hits))
             return 0
-        if gated and not _presence_is_live(presence_pf):
+        if gated and not common.flock_held(presence_pf):
             print(
                 f"[mcp-dispatch] session for {agent_id} ended (presence dropped) — waiter exiting."
             )

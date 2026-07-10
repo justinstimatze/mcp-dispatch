@@ -24,15 +24,15 @@ wire hooks/dispatch-gitsync-arm.py into SessionStart to start it hands-free.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-# git_bridge.py and its deps live at the repo root (parent of bin/).
+# git_bridge.py, dispatch_fs.py and dispatch_common.py live at the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
 import dispatch_fs  # noqa: E402
 from git_bridge import GitBridge  # noqa: E402
 
@@ -40,45 +40,15 @@ STARTUP_GRACE_SECONDS = 60.0  # exit if no agent ever appears (standalone safety
 
 
 # ---------------------------------------------------------------------------
-# Config / path resolution (mirrors bin/dispatch-wait's idiom)
+# Config / path resolution — the shared plumbing (config load, flat lookup,
+# dispatch/state dir, md5 key, flock probe/acquire) lives in dispatch_common;
+# only the git-specific bits stay here.
 # ---------------------------------------------------------------------------
-
-
-def _load_config() -> dict:
-    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
-        "~/.config/mcp-dispatch/config.toml"
-    )
-    if not os.path.exists(cfg):
-        return {}
-    try:
-        import tomllib
-
-        with open(cfg, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
-        return {}
-
-
-def _flat(data: dict, key: str):
-    sub = data.get("dispatch")
-    section = sub if isinstance(sub, dict) else {}
-    val = data.get(key)
-    return section.get(key) if val is None else val
 
 
 def _git_section(data: dict) -> dict:
     git = data.get("git")
     return git if isinstance(git, dict) else {}
-
-
-def _dispatch_dir(data: dict) -> Path:
-    raw = (
-        os.environ.get("MCP_DISPATCH_DIR")
-        or os.environ.get("DISPATCH_DIR")
-        or _flat(data, "dispatch_dir")
-        or "~/.config/mcp-dispatch/messages"
-    )
-    return Path(os.path.expanduser(str(raw)))
 
 
 def _config_path() -> Path:
@@ -88,51 +58,9 @@ def _config_path() -> Path:
     )
 
 
-def _state_dir() -> Path:
-    raw = os.environ.get("MCP_DISPATCH_STATE_DIR") or "~/.cache/mcp-dispatch"
-    return Path(os.path.expanduser(raw))
-
-
 def _host_lock_path(dispatch_dir: Path) -> Path:
-    key = hashlib.md5(str(dispatch_dir).encode(), usedforsecurity=False).hexdigest()[:8]
-    return _state_dir() / f"gitsync-{key}.lock"
-
-
-def _acquire_host_lock(dispatch_dir: Path):
-    """Single-instance lock: one daemon per DISPATCH_DIR. Returns the held handle,
-    or None if another daemon already holds it. Released by the kernel on exit."""
-    import fcntl
-
-    try:
-        _state_dir().mkdir(parents=True, exist_ok=True)
-        fh = open(_host_lock_path(dispatch_dir), "a+")  # noqa: SIM115 - held for lifetime
-    except OSError:
-        return None
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
-    return fh
-
-
-def _host_lock_held(dispatch_dir: Path) -> bool:
-    """Probe the host lock without taking it for keeps (status read)."""
-    import fcntl
-
-    pf = _host_lock_path(dispatch_dir)
-    try:
-        fh = open(pf)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        return False
-    except OSError:
-        return True
-    finally:
-        fh.close()
+    """One daemon per DISPATCH_DIR — the lock key is the dir, not an agent id."""
+    return common.state_dir() / f"gitsync-{common.md5_key(str(dispatch_dir))}.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +192,14 @@ def cmd_init(argv: list[str]) -> int:
 
 def cmd_status(argv: list[str]) -> int:
     argparse.ArgumentParser(prog="dispatch-gitsync status").parse_args(argv)
-    data = _load_config()
+    data = common.load_config()
     git = _git_section(data)
-    dispatch_dir = _dispatch_dir(data)
+    dispatch_dir = common.dispatch_dir(data)
     repo_dir = git.get("repo_dir") or os.environ.get("MCP_DISPATCH_GIT_REPO")
     repo_dir = Path(os.path.expanduser(str(repo_dir))) if repo_dir else None
 
     print(f"enabled:          {bool(git.get('enabled'))}")
-    print(f"daemon running:   {_host_lock_held(dispatch_dir)}")
+    print(f"daemon running:   {common.flock_held(_host_lock_path(dispatch_dir))}")
     print(f"dispatch_dir:     {dispatch_dir}")
     print(f"repo_dir:         {repo_dir or '(unset)'}")
     print(f"remote:           {git.get('remote') or '(local-only)'}")
@@ -298,7 +226,7 @@ def cmd_run(argv: list[str]) -> int:
     ap.add_argument("--repo-dir", default=None, help="override the git clone path")
     args = ap.parse_args(argv)
 
-    data = _load_config()
+    data = common.load_config()
     git = _git_section(data)
 
     enabled = bool(git.get("enabled")) or bool(os.environ.get("MCP_DISPATCH_GIT_ENABLED"))
@@ -321,7 +249,7 @@ def cmd_run(argv: list[str]) -> int:
         )
         return 2
 
-    dispatch_dir = _dispatch_dir(data)
+    dispatch_dir = common.dispatch_dir(data)
     if not dispatch_dir.is_dir():
         print(f"[gitsync] no relay at {dispatch_dir} — nothing to mirror.")
         return 0
@@ -329,7 +257,7 @@ def cmd_run(argv: list[str]) -> int:
     remote = os.environ.get("MCP_DISPATCH_GIT_REMOTE") or git.get("remote")
     mirror = args.mirror or git.get("mirror") or "remote-only"
     interval = args.interval if args.interval is not None else float(git.get("interval", 2.0))
-    group_mode = bool(_flat(data, "group_mode"))
+    group_mode = bool(common.flat(data, "group_mode"))
 
     bridge = GitBridge(dispatch_dir, repo_dir, remote=remote, mirror=mirror, group_mode=group_mode)
 
@@ -339,7 +267,7 @@ def cmd_run(argv: list[str]) -> int:
 
     # One daemon per host. A second invocation (e.g. a racing SessionStart hook)
     # finds the lock held and exits quietly.
-    lock = _acquire_host_lock(dispatch_dir)
+    lock = common.acquire_flock(_host_lock_path(dispatch_dir))
     if lock is None:
         print(f"[gitsync] a daemon is already mirroring {dispatch_dir}; not starting a second.")
         return 0

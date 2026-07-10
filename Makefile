@@ -1,8 +1,8 @@
 .PHONY: test test-ci lint typecheck security quality
 
-PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_policy.py tests/ \
-	hooks/_dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py \
-	hooks/dispatch-gitsync-arm.py \
+PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_policy.py \
+	dispatch_common.py tests/ \
+	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
 	bin/dispatch-status bin/dispatch-tail bin/dispatch-wait bin/dispatch-gitsync \
 	scripts/
 
@@ -21,10 +21,10 @@ lint:
 	uv run ruff format --check $(PY_SOURCES)
 
 typecheck:
-	uv run mypy --scripts-are-modules server.py hooks/_dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py bin/dispatch-status bin/dispatch-tail bin/dispatch-wait
+	uv run mypy --scripts-are-modules server.py dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py bin/dispatch-status bin/dispatch-tail bin/dispatch-wait
 
 security:
-	uv run bandit -q -c pyproject.toml -r server.py hooks/_dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py bin/dispatch-status bin/dispatch-tail bin/dispatch-wait
+	uv run bandit -q -c pyproject.toml -r server.py dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py bin/dispatch-status bin/dispatch-tail bin/dispatch-wait
 
 # Full gate: lint + types + security + tests (CI-faithful, identity-stripped).
 quality: lint typecheck security test-ci
