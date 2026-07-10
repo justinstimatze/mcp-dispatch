@@ -309,16 +309,20 @@ class GitBridge:
         """First-run guard: record every message currently in local inboxes as
         already-handled WITHOUT publishing it, so enabling the bridge on a busy
         relay means 'bridge from now on' rather than dumping the whole pre-existing
-        backlog to git. Idempotent-safe: only called when no ledger existed yet."""
+        backlog to git. Idempotent-safe: only called when no ledger existed yet.
+
+        Always persists the ledger, even when nothing was seeded (an empty relay):
+        the file's *existence* is what latches ``first_run`` to false. Without this,
+        a bridge first constructed on a quiet relay never writes the marker, so the
+        NEXT bridge (a ``--once``/cron pass, or a daemon restarted by a fresh
+        SessionStart) is first_run again and would seed messages that arrived in the
+        meantime as backlog — silently dropping them instead of bridging."""
         now = time.time()
-        seeded = 0
         for msg in self._local_messages():
             mid = msg.get("id")
             if mid and mid not in self._ledger:
                 self._ledger[mid] = now
-                seeded += 1
-        if seeded:
-            self._save_ledger()
+        self._save_ledger()
 
     def _load_ledger(self) -> dict[str, float]:
         try:

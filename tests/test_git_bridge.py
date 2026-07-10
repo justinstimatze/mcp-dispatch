@@ -153,6 +153,25 @@ def test_first_run_does_not_dump_backlog(tmp_path):
     assert [m["content"] for m in _inbox_files(dir_b, "bob")] == ["fresh message"]
 
 
+def test_empty_relay_first_run_latches_ledger(tmp_path):
+    """A bridge first constructed on an EMPTY relay must still persist the ledger
+    marker, so a SECOND bridge (a --once/cron pass, or a daemon restarted by a
+    fresh SessionStart) isn't first_run again and misclassify a since-arrived
+    message as backlog. Regression for a silent cross-host drop on a quiet-start
+    relay: without the marker, bridge #2 re-seeds and never bridges the message."""
+    dir_a, dir_b, repo_a, repo_b = _bus_and_clones(tmp_path)
+
+    GitBridge(dir_a, repo_a, remote="origin")  # bridge #1: empty relay, no seed
+    # A message arrives AFTER that first construction (not pre-existing backlog).
+    _local_dm(dir_a, "alice", "bob", "arrived after start")
+
+    a2 = GitBridge(dir_a, repo_a, remote="origin")  # bridge #2: must not re-seed
+    b = GitBridge(dir_b, repo_b, remote="origin")
+    a2.tick()
+    b.tick()
+    assert [m["content"] for m in _inbox_files(dir_b, "bob")] == ["arrived after start"]
+
+
 def test_dm_crosses_hosts(hosts):
     _local_dm(hosts.dir_a, "alice", "bob", "hello bob")
     hosts.a.tick()  # outbound: publish to git (bob not live-local on A)
