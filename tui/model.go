@@ -27,6 +27,7 @@ import (
 const (
 	rosterWidth   = 26
 	maxTranscript = 5000 // cap the accumulated log; evict oldest beyond this
+	wrapIndent    = 2    // fixed hanging indent for wrapped feed lines
 )
 
 type tickMsg time.Time
@@ -150,6 +151,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.accumulate(m.snap.Messages)
 		m.rebuildTargets()
 		m.refreshFeed()
+		return m, nil
+
+	case tea.MouseMsg:
+		// The scroll wheel only ever moves the feed (right pane), wherever the
+		// cursor is — the roster is keyboard-navigated.
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.vp.LineUp(3)
+			m.follow = m.vp.AtBottom()
+		case tea.MouseButtonWheelDown:
+			m.vp.LineDown(3)
+			m.follow = m.vp.AtBottom()
+		}
 		return m, nil
 
 	case tea.KeyMsg:

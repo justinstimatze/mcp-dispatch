@@ -17,7 +17,7 @@ var (
 	remoteStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("111")) // soft indigo
 	liveStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))  // green
 	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("24")).Padding(0, 1)
-	selStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("238"))
+	selStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("32"))
 	rosterBox      = lipgloss.NewStyle().Width(rosterWidth).BorderStyle(lipgloss.NormalBorder()).BorderRight(true).BorderForeground(lipgloss.Color("238"))
 	footerStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	footerKeyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
@@ -67,18 +67,12 @@ func formatMessage(m Message, width int) string {
 	if width <= 0 {
 		return head + content
 	}
-	// Word-wrap the content and hang continuation lines under it (IRC-style)
-	// instead of truncating. The continuation indent is capped so a long
-	// from→to header (these ids are project-pid, easily 40+ cols) doesn't squeeze
-	// the content into a thin ribbon: short ids align under the content, long
-	// ids fall back to a modest indent that gives the content near-full width.
+	// Word-wrap the content, hanging continuation lines at a FIXED small indent
+	// (not the header width — that varies with name/time length and made the left
+	// edge jagged from message to message). Continuation lines get near-full width.
 	headW := lipgloss.Width(head)
-	indentW := headW
-	if indentW > width/3 {
-		indentW = min(width/3, 14)
-	}
-	lines := wrapHanging(content, width-headW, width-indentW)
-	indent := strings.Repeat(" ", indentW)
+	lines := wrapHanging(content, width-headW, width-wrapIndent)
+	indent := strings.Repeat(" ", wrapIndent)
 	var b strings.Builder
 	b.WriteString(head + lines[0])
 	for _, l := range lines[1:] {
