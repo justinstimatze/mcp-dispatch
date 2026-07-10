@@ -4,9 +4,11 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -37,26 +39,58 @@ type model struct {
 	readGit     bool
 	interval    time.Duration
 	version     string
+	nick        string // console identity for send/ack
 
-	snap     Snapshot
-	targets  []target
-	selected int // index into targets
-	vp       viewport.Model
-	ready    bool
-	follow   bool // stick to the bottom as new messages arrive
-	width    int
-	height   int
+	snap      Snapshot
+	targets   []target
+	selected  int // index into targets
+	rosterTop int // first visible roster row (scrolls to keep selection in view)
+	vp        viewport.Model
+	ready     bool
+	follow    bool // stick to the bottom as new messages arrive
+	composing bool // the compose bar is open
+	input     textinput.Model
+	status    string // transient feedback (send/ack result); cleared on next action
+	statusErr bool
+	width     int
+	height    int
 }
 
-func newModel(relay, repo string, readGit bool, interval time.Duration, version string) model {
+func newModel(relay, repo string, readGit bool, interval time.Duration, version, nick string) model {
+	ti := textinput.New()
+	ti.Placeholder = "message… (enter to send · esc to cancel)"
+	ti.CharLimit = 4000
+	ti.Prompt = ""
 	return model{
 		relay: relay, repo: repo, readGit: readGit, interval: interval,
-		version: version, follow: true, targets: []target{{kind: targetAll, label: "all traffic"}},
+		version: version, nick: nick, follow: true, input: ti,
+		targets: []target{{kind: targetAll, label: "all traffic"}},
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(m.load(), m.tick())
+}
+
+func (m model) rosterVisibleRows() int {
+	if m.vp.Height < 1 {
+		return 1
+	}
+	return m.vp.Height
+}
+
+// ensureVisible scrolls the roster window so the selected row stays on screen.
+func (m *model) ensureVisible() {
+	h := m.rosterVisibleRows()
+	if m.selected < m.rosterTop {
+		m.rosterTop = m.selected
+	}
+	if m.selected >= m.rosterTop+h {
+		m.rosterTop = m.selected - h + 1
+	}
+	if m.rosterTop < 0 || len(m.targets) <= h {
+		m.rosterTop = 0
+	}
 }
 
 func (m model) load() tea.Cmd {
@@ -95,6 +129,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.composing {
+			return m.handleCompose(msg)
+		}
 		return m.handleKey(msg)
 	}
 	return m, nil
@@ -104,21 +141,38 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
+	case "i", "enter", "/":
+		// Open the compose bar to send to the current target.
+		m.composing = true
+		m.status = ""
+		m.input.Focus()
+		return m, textinput.Blink
+	case "a":
+		n, err := AckInbox(m.relay, m.nick)
+		if err != nil {
+			m.status, m.statusErr = err.Error(), true
+		} else {
+			m.status, m.statusErr = fmt.Sprintf("acked %d in %s", n, m.nick), false
+		}
+		return m, m.load()
 	case "esc":
 		if m.selected != 0 {
 			m.selected = 0
+			(&m).ensureVisible()
 			m.refreshFeed()
 		}
 		return m, nil
 	case "tab", "down", "j":
 		if len(m.targets) > 0 {
 			m.selected = (m.selected + 1) % len(m.targets)
+			(&m).ensureVisible()
 			m.refreshFeed()
 		}
 		return m, nil
 	case "shift+tab", "up", "k":
 		if len(m.targets) > 0 {
 			m.selected = (m.selected - 1 + len(m.targets)) % len(m.targets)
+			(&m).ensureVisible()
 			m.refreshFeed()
 		}
 		return m, nil
@@ -146,6 +200,45 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+// handleCompose routes keys while the compose bar is open: enter sends to the
+// current target as the console nick, esc cancels, everything else edits.
+func (m model) handleCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.composing = false
+		m.input.Blur()
+		m.input.Reset()
+		return m, nil
+	case tea.KeyEnter:
+		text := strings.TrimSpace(m.input.Value())
+		m.composing = false
+		m.input.Blur()
+		m.input.Reset()
+		if text == "" {
+			return m, nil
+		}
+		target := sendTarget(m.currentTarget())
+		n, err := Send(m.relay, m.nick, target, text, m.snap, "normal")
+		if err != nil {
+			m.status, m.statusErr = err.Error(), true
+		} else {
+			m.status, m.statusErr = fmt.Sprintf("✓ sent to %s → %d inbox(es)", target, n), false
+			m.follow = true // jump to the bottom so the sent message is visible
+		}
+		return m, m.load()
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func sendTarget(t target) string {
+	if t.kind == targetAll {
+		return "all"
+	}
+	return t.value // agent id or "#channel"
 }
 
 // rebuildTargets refreshes the sidebar list from the current snapshot, keeping
@@ -182,6 +275,7 @@ func (m *model) rebuildTargets() {
 			break
 		}
 	}
+	m.ensureVisible()
 }
 
 func (m model) currentTarget() target {
@@ -231,9 +325,13 @@ func (m model) View() string {
 	if !m.ready {
 		return "starting dispatch-tui…"
 	}
+	bottom := m.footerView()
+	if m.composing {
+		bottom = m.composeView()
+	}
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.headerView(),
 		lipgloss.JoinHorizontal(lipgloss.Top, m.rosterView(), m.vp.View()),
-		m.footerView(),
+		bottom,
 	)
 }

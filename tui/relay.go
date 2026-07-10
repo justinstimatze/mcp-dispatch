@@ -7,9 +7,13 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +22,13 @@ import (
 
 	"github.com/BurntSushi/toml"
 )
+
+// idRe matches a safe single path segment, mirroring dispatch_fs.ID_RE. An id or
+// channel becomes a directory under the relay, so it must never contain
+// separators or traversal — the write path validates against this.
+var idRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+func validID(s string) bool { return idRe.MatchString(s) }
 
 // Message is one dispatch message, from a local inbox file or a git bus lane.
 type Message struct {
@@ -370,6 +381,168 @@ func unreadCount(inbox string) int {
 		}
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// Writing — send / ack, ported byte-for-byte from server._send + dispatch_fs so
+// a message the TUI sends is indistinguishable from one a session sent.
+// ---------------------------------------------------------------------------
+
+func randHex8() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "00000000"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func nowISO() string { return time.Now().UTC().Format("2006-01-02T15:04:05Z") }
+
+// messageFilename is dispatch_fs.message_filename: <ms>-<from>-<uuid8>.json. The
+// uuid suffix keeps two same-millisecond sends from colliding.
+func messageFilename(from string) string {
+	return fmt.Sprintf("%d-%s-%s.json", time.Now().UnixMilli(), from, randHex8())
+}
+
+// atomicWrite is dispatch_fs.atomic_write: tmp → fsync file → rename → fsync dir,
+// so a reader never sees a partial message and a crash can't lose the rename.
+func atomicWrite(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := strings.TrimSuffix(path, ".json") + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	_ = f.Sync()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+// outMessage is the on-disk message shape (server._send), with explicit nulls so
+// the JSON matches byte-for-byte what a session writes.
+type outMessage struct {
+	ID        string `json:"id"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Timestamp string `json:"timestamp"`
+	Priority  string `json:"priority"`
+	Content   string `json:"content"`
+	Payload   any    `json:"payload"`
+	ThreadID  any    `json:"thread_id"`
+	ReplyTo   any    `json:"reply_to"`
+	TTL       any    `json:"ttl"`
+	MustRead  bool   `json:"must_read"`
+	State     string `json:"state"`
+}
+
+// Send delivers a message from `from` to `target` (an agent id, "#channel", or
+// "all"), replicating server._send's fan-out from the current snapshot: "all" →
+// every live agent, "#chan" → its live subscribers, both excluding the sender.
+// A DM to a remote-only nick is written to its local inbox and the gitsync
+// daemon bridges it. Returns the number of inboxes written.
+func Send(relay, from, target, content string, snap Snapshot, priority string) (int, error) {
+	if !validID(from) {
+		return 0, fmt.Errorf("invalid nick %q", from)
+	}
+	var targets []string
+	switch {
+	case target == "all":
+		for _, a := range snap.Agents {
+			if a.Live && a.ID != from {
+				targets = append(targets, a.ID)
+			}
+		}
+	case strings.HasPrefix(target, "#"):
+		ch := target[1:]
+		if !validID(ch) {
+			return 0, fmt.Errorf("invalid channel %q", target)
+		}
+		for _, a := range snap.Agents {
+			if a.Live && a.ID != from && contains(a.Channels, ch) {
+				targets = append(targets, a.ID)
+			}
+		}
+	default:
+		if !validID(target) {
+			return 0, fmt.Errorf("invalid target %q", target)
+		}
+		targets = []string{target}
+	}
+	if priority == "" {
+		priority = "normal"
+	}
+	msg := outMessage{
+		ID: "msg-" + randHex8(), From: from, To: target, Timestamp: nowISO(),
+		Priority: priority, Content: content, State: "pending",
+	}
+	for _, t := range targets {
+		dir := filepath.Join(relay, t)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return 0, err
+		}
+		if err := atomicWrite(filepath.Join(dir, messageFilename(from)), msg); err != nil {
+			return 0, err
+		}
+	}
+	return len(targets), nil
+}
+
+// AckInbox marks every pending message in `nick`'s inbox read (state=read +
+// read_at), mirroring server.ack. Only the console's OWN inbox — no session owns
+// it, so this can't race another writer. Returns the number acked.
+func AckInbox(relay, nick string) (int, error) {
+	if !validID(nick) {
+		return 0, fmt.Errorf("invalid nick %q", nick)
+	}
+	files, err := filepath.Glob(filepath.Join(relay, nick, "*.json"))
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f) //nolint:gosec // enumerated own-inbox file
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		if s, ok := m["state"].(string); ok && s != "" && s != "pending" {
+			continue
+		}
+		m["state"] = "read"
+		m["read_at"] = nowISO()
+		if atomicWrite(f, m) == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func contains(xs []string, v string) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // Load reads one full snapshot of the relay (feed + roster). readGit=false

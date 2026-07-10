@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,7 +200,7 @@ func TestFormatMessageRemoteMarker(t *testing.T) {
 }
 
 func TestModelRendersAndFilters(t *testing.T) {
-	m := newModel("/relay", "", false, time.Second, "test")
+	m := newModel("/relay", "", false, time.Second, "test", "console-1")
 	var mi tea.Model = m
 	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
 	snap := Snapshot{
@@ -224,5 +225,122 @@ func TestModelRendersAndFilters(t *testing.T) {
 	view = mi.View()
 	if !strings.Contains(view, "hello bob") || strings.Contains(view, "remote hi") {
 		t.Fatalf("agent filter didn't apply:\n%s", view)
+	}
+}
+
+func TestComposeAndSendThroughModel(t *testing.T) {
+	relay := t.TempDir()
+	var mi tea.Model = newModel(relay, "", false, time.Second, "test", "console-1")
+	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	mi, _ = mi.Update(snapshotMsg(Snapshot{Agents: []Agent{{ID: "bob", Live: true}}}))
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyTab})                             // select bob
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})       // open compose
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ship it")}) // type
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyEnter})                           // send
+
+	files, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json"))
+	if len(files) != 1 {
+		t.Fatalf("compose→send didn't reach bob: %d files", len(files))
+	}
+	data, _ := os.ReadFile(files[0])
+	var msg Message
+	json.Unmarshal(data, &msg)
+	if msg.Content != "ship it" || msg.From != "console-1" || msg.To != "bob" {
+		t.Fatalf("bad message from the compose flow: %+v", msg)
+	}
+}
+
+func TestRosterScrollsToSelection(t *testing.T) {
+	var mi tea.Model = newModel("/r", "", false, time.Second, "test", "c")
+	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 60, Height: 8}) // feed height 6 → 6 roster rows
+	var agents []Agent
+	for i := 0; i < 20; i++ {
+		agents = append(agents, Agent{ID: fmt.Sprintf("agent-%02d", i), Live: true})
+	}
+	mi, _ = mi.Update(snapshotMsg(Snapshot{Agents: agents}))
+	// 21 targets (all + 20). Tab 20 times lands selection on the last (agent-19);
+	// the window must have scrolled to reveal it.
+	for i := 0; i < 20; i++ {
+		mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyTab})
+	}
+	view := mi.View()
+	if !strings.Contains(view, "agent-19") {
+		t.Fatalf("roster did not scroll to reveal the selection:\n%s", view)
+	}
+	if strings.Contains(view, "agent-00") {
+		t.Fatal("top of a scrolled roster should be off-screen")
+	}
+}
+
+func TestSendDM(t *testing.T) {
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{{ID: "bob", Live: true}}}
+	n, err := Send(relay, "console-1", "bob", "hi bob", snap, "normal")
+	if err != nil || n != 1 {
+		t.Fatalf("send DM: n=%d err=%v", n, err)
+	}
+	files, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json"))
+	if len(files) != 1 {
+		t.Fatalf("expected 1 inbox file, got %d", len(files))
+	}
+	data, _ := os.ReadFile(files[0])
+	var m Message
+	json.Unmarshal(data, &m)
+	if m.From != "console-1" || m.To != "bob" || m.Content != "hi bob" || m.State != "pending" {
+		t.Fatalf("bad message: %+v", m)
+	}
+	if !strings.HasSuffix(files[0], ".json") || strings.Contains(filepath.Base(files[0]), ".tmp") {
+		t.Fatalf("filename scheme wrong: %s", files[0])
+	}
+}
+
+func TestSendChannelFansOutToLiveSubscribers(t *testing.T) {
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{
+		{ID: "carol", Live: true, Channels: []string{"eng"}},
+		{ID: "dave", Live: true, Channels: []string{"eng"}},
+		{ID: "erin", Live: true, Channels: []string{"ops"}},      // not subscribed
+		{ID: "console-1", Live: true, Channels: []string{"eng"}}, // sender excluded
+	}}
+	n, err := Send(relay, "console-1", "#eng", "team update", snap, "normal")
+	if err != nil || n != 2 {
+		t.Fatalf("channel fan-out should hit 2 subscribers: n=%d err=%v", n, err)
+	}
+	for _, who := range []string{"carol", "dave"} {
+		if fs, _ := filepath.Glob(filepath.Join(relay, who, "*.json")); len(fs) != 1 {
+			t.Fatalf("%s should have 1 message", who)
+		}
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "erin", "*.json")); len(fs) != 0 {
+		t.Fatal("non-subscriber erin should get nothing")
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "console-1", "*.json")); len(fs) != 0 {
+		t.Fatal("sender should not receive its own channel post")
+	}
+}
+
+func TestSendRejectsBadTarget(t *testing.T) {
+	if _, err := Send(t.TempDir(), "console-1", "../escape", "x", Snapshot{}, "normal"); err == nil {
+		t.Fatal("path-traversal target must be rejected")
+	}
+}
+
+func TestAckInboxMarksRead(t *testing.T) {
+	relay := t.TempDir()
+	writeInbox(t, relay, "console-1", "1780000000000-bob-a.json", map[string]any{
+		"id": "m1", "from": "bob", "to": "console-1", "state": "pending", "content": "hi",
+	})
+	writeInbox(t, relay, "console-1", "1780000000001-bob-b.json", map[string]any{
+		"id": "m2", "from": "bob", "to": "console-1", "state": "read", "content": "old",
+	})
+	n, err := AckInbox(relay, "console-1")
+	if err != nil || n != 1 {
+		t.Fatalf("only the pending one acks: n=%d err=%v", n, err)
+	}
+	data, _ := os.ReadFile(filepath.Join(relay, "console-1", "1780000000000-bob-a.json"))
+	var m map[string]any
+	json.Unmarshal(data, &m)
+	if m["state"] != "read" || m["read_at"] == nil {
+		t.Fatalf("message not marked read: %+v", m)
 	}
 }

@@ -65,6 +65,7 @@ func main() {
 	gitRepo := flag.String("git-repo", "", "git-bus clone dir (default: config [git].repo_dir)")
 	noGit := flag.Bool("no-git", false, "local inboxes only — don't read the cross-host git bus")
 	interval := flag.Float64("interval", 1.0, "poll seconds")
+	nick := flag.String("nick", "", "console identity for send/ack (default: console-<pid>)")
 	dump := flag.Bool("dump", false, "render one frame to stdout and exit (no TTY; for scripts/screenshots)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -96,7 +97,16 @@ func main() {
 		poll = 100 * time.Millisecond
 	}
 
-	m := newModel(relay, repo, readGit, poll, buildVersion())
+	consoleNick := *nick
+	if consoleNick == "" {
+		consoleNick = fmt.Sprintf("console-%d", os.Getpid())
+	}
+	if !validID(consoleNick) {
+		fmt.Fprintf(os.Stderr, "invalid --nick %q (need lowercase [a-z0-9_-], 1-64 chars)\n", consoleNick)
+		os.Exit(1)
+	}
+
+	m := newModel(relay, repo, readGit, poll, buildVersion(), consoleNick)
 
 	if *dump {
 		// One-shot render: drive the Model directly (no tea loop, no TTY) so it

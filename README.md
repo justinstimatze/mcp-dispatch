@@ -13,7 +13,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
-- **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time.
+- **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick.
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
@@ -306,23 +306,31 @@ from your config like the server does (override with `MCP_DISPATCH_DIR`).
 For a point-in-time snapshot instead of a stream — who's live, their channel
 subscriptions, and unread counts — run `bin/dispatch-status`.
 
-#### dispatch-tui — a passive IRC client for the relay
+#### dispatch-tui — an IRC client for the relay
 
 For a full-screen view instead of a scrolling log, `tui/` is a
 [Bubble Tea](https://github.com/charmbracelet/bubbletea) TUI that treats the
 relay like an IRC server: live sessions are nicks, `#name` targets are channels,
 and the feed is the message stream. Pick a nick or channel in the sidebar to
-filter the feed; git-origin messages are marked «remote».
+filter the feed; git-origin messages are marked «remote». It's the first Go
+component in the repo.
 
 ```bash
-cd tui && make build     # → ./dispatch-tui  (needs Go 1.25+)
-./dispatch-tui           # auto-resolves the relay + git bus from your config
-./dispatch-tui --no-git  # local inboxes only
-./dispatch-tui --dump    # render one frame to stdout and exit (no TTY)
+cd tui && make build            # → ./dispatch-tui  (needs Go 1.25+)
+./dispatch-tui                  # auto-resolves the relay + git bus from your config
+./dispatch-tui --nick alice     # send/ack as 'alice' (default: console-<pid>)
+./dispatch-tui --no-git         # local inboxes only
+./dispatch-tui --dump           # render one frame to stdout and exit (no TTY)
 ```
 
-Keys: `tab`/`↑`/`↓` cycle the filter · `pgup`/`pgdn` scroll · `f` toggle follow ·
-`g`/`G` top/bottom · `q` quit. It's read-only, same as the other tools.
+Keys: `tab`/`↑`/`↓` cycle the filter (the sidebar scrolls to keep the selection
+in view) · `pgup`/`pgdn` scroll the feed · `f` toggle follow · `g`/`G`
+top/bottom · **`i` compose a message to the selected nick/channel** (`enter`
+sends, `esc` cancels) · **`a` ack your own inbox** · `q` quit. Sending writes the
+same on-disk message a session would (byte-for-byte: fan-out for channels/`all`,
+atomic write); a DM to a remote nick is bridged by the gitsync daemon like any
+other. You send as your `--nick` (a lightweight console identity — it does not
+hold presence, so agents don't see it as an always-on session).
 
 ## How It Works
 

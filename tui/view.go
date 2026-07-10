@@ -20,9 +20,15 @@ var (
 	selStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("238"))
 	rosterBox      = lipgloss.NewStyle().Width(rosterWidth).BorderStyle(lipgloss.NormalBorder()).BorderRight(true).BorderForeground(lipgloss.Color("238"))
 	footerStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	footerKeyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	channelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("170"))
 	countStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	unreadTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	nickStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	okStatusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	errStatusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
+	composeBar     = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("231"))
+	composePrompt  = lipgloss.NewStyle().Background(lipgloss.Color("30")).Foreground(lipgloss.Color("231")).Bold(true).Padding(0, 1)
 )
 
 func hhmmss(ts string) string {
@@ -91,13 +97,17 @@ func (m model) headerView() string {
 }
 
 func (m model) rosterView() string {
-	var b strings.Builder
 	agentByID := map[string]Agent{}
 	for _, a := range m.snap.Agents {
 		agentByID[a.ID] = a
 	}
-	for i, t := range m.targets {
-		line := m.rosterLine(t, agentByID)
+	end := m.rosterTop + m.rosterVisibleRows()
+	if end > len(m.targets) {
+		end = len(m.targets)
+	}
+	var b strings.Builder
+	for i := m.rosterTop; i < end; i++ {
+		line := m.rosterLine(m.targets[i], agentByID)
 		if i == m.selected {
 			line = selStyle.Render(padRight(line, rosterWidth-1))
 		}
@@ -110,6 +120,12 @@ func (m model) rosterView() string {
 		body += "\n"
 	}
 	return rosterBox.Height(m.vp.Height).Render(body)
+}
+
+func (m model) composeView() string {
+	prompt := composePrompt.Render(sendTarget(m.currentTarget()) + " ▸")
+	body := prompt + composeBar.Render(" "+m.input.View())
+	return composeBar.Width(m.width).Render(body)
 }
 
 func (m model) rosterLine(t target, agents map[string]Agent) string {
@@ -153,8 +169,21 @@ func (m model) footerView() string {
 	default:
 		pos = fmt.Sprintf("%3.0f%%", m.vp.ScrollPercent()*100)
 	}
-	filter := m.currentTarget().label
-	keys := "tab/↑↓ filter · pgup/pgdn scroll · f follow · g/G top/bottom · q quit"
-	return footerStyle.Width(m.width).Render(
-		fmt.Sprintf(" [%s] %s · %s", filter, pos, keys))
+	scroll := ""
+	if len(m.targets) > m.rosterVisibleRows() {
+		scroll = fmt.Sprintf(" · roster %d-%d/%d",
+			m.rosterTop+1, min(m.rosterTop+m.rosterVisibleRows(), len(m.targets)), len(m.targets))
+	}
+	status := ""
+	if m.status != "" {
+		st := okStatusStyle
+		if m.statusErr {
+			st = errStatusStyle
+		}
+		status = "  " + st.Render(m.status)
+	}
+	left := fmt.Sprintf(" %s · [%s] %s%s",
+		nickStyle.Render("@"+m.nick), m.currentTarget().label, pos, scroll)
+	keys := footerKeyStyle.Render("i send · a ack · tab filter · pgup/pgdn scroll · f follow · q quit")
+	return footerStyle.Width(m.width).Render(left + status + "  " + keys)
 }
