@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Block until a notify-worthy message arrives, then print it and exit.
+"""Wake a *parked* Claude Code session when a notify-worthy message arrives.
 
-The bridge that wakes a *parked* Claude Code session. The MCP server can detect
-a new message (its background poll fires notify_command) but cannot inject a
-turn into the model's loop — only the harness can, and it does so when a
-`run_in_background` task exits. So launch this in the background:
+The MCP server can detect a new message (its background poll fires notify_command)
+but cannot inject a turn into the model's loop — only the harness can. Two harness
+mechanisms do that, and this script serves both:
 
-    dispatch-wait                 # block until a direct/must_read message lands
+  --follow (RECOMMENDED — run under the Monitor tool):
+    dispatch-wait --follow        # stream one wake event per message, forever
+    Monitor streams each printed line into the parked session as a wake event, so
+    ONE persistent registration covers the whole session — nothing to re-arm after
+    each message. This is what hooks/dispatch-arm.py nudges the model to start.
+
+  one-shot (run as a Bash run_in_background task):
+    dispatch-wait                 # block until a direct/must_read message, then exit
+    The harness re-invokes the model on the task's *exit*; you must relaunch it to
+    re-arm for the next message. Kept for standalone/scripted use.
+
     dispatch-wait --interval 1    # poll faster (default 2.0s)
     dispatch-wait --notify-on all # override the configured policy for this run
     dispatch-wait --max-lifetime 600
-
-When it exits, the harness re-invokes the model with the message summary in
-hand. Handle it, then launch another dispatch-wait to re-arm for the next one.
 
 Why this beats `/loop`: /loop fires a whole model turn every interval whether
 or not anything arrived. This spends *zero* model tokens while blocking and
@@ -184,6 +190,72 @@ def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]
     return out
 
 
+def _oneline(agent_id: str, m: dict) -> str:
+    """One-line render of a single qualifying message, for --follow stream mode.
+
+    Under the Monitor tool each printed line becomes one wake event, so this must
+    be a single flushed line carrying enough to triage without a peek()."""
+    flags = ""
+    if m.get("must_read"):
+        flags += " 🔒"
+    if m.get("priority") == "urgent":
+        flags += " ‼"
+    elif m.get("priority") == "high":
+        flags += " !"
+    # Surface cross-host provenance: a git-materialized message is tagged _via.
+    via = " «remote»" if m.get("_via") == "git" else ""
+    preview = (m.get("content", "") or "")[:140].replace("\n", " ")
+    return (
+        f"[mcp-dispatch] {m.get('from', '?')} → {agent_id}{flags}{via}: {preview}  "
+        f"(id {m.get('id', '?')}) — peek() to read, ack() when handled"
+    )
+
+
+def _follow(
+    dispatch_dir: Path,
+    agent_id: str,
+    notify_on: str,
+    interval: float,
+    gated: bool,
+    presence_pf: Path,
+    deadline: float | None,
+    max_lifetime: float,
+) -> int:
+    """Stream mode: never exit on a hit. Print one line per newly-seen qualifying
+    message and keep running, so a single persistent Monitor registration wakes a
+    parked session on every arrival with zero re-arming. Exits only when the
+    session's presence drops (or an explicit lifetime cap fires).
+
+    Level-triggered like the one-shot path: any backlog already queued at launch
+    is emitted immediately. Dedup is by message id — an id is emitted once, then
+    remembered until it leaves the inbox (ack/expiry), which (ids being unique)
+    can't recur, so `emitted` tracks only live messages, never full history."""
+    emitted: set[str] = set()
+    while True:
+        hits = _qualifying(dispatch_dir, agent_id, notify_on)
+        current: set[str] = set()
+        for m in hits:
+            mid = str(m.get("id") or "")
+            current.add(mid)
+            if mid not in emitted:
+                print(_oneline(agent_id, m), flush=True)
+        emitted = current
+        if gated and not _presence_is_live(presence_pf):
+            print(
+                f"[mcp-dispatch] session for {agent_id} ended (presence dropped) — watch exiting.",
+                flush=True,
+            )
+            return 0
+        if deadline is not None and time.monotonic() >= deadline:
+            print(
+                f"[mcp-dispatch] watch for {agent_id} hit its {int(max_lifetime)}s "
+                f"cap (notify_on={notify_on}). Re-arm if still idle.",
+                flush=True,
+            )
+            return 0
+        time.sleep(interval)
+
+
 def _summary(agent_id: str, notify_on: str, msgs: list[dict]) -> str:
     lines = [f"[mcp-dispatch] {len(msgs)} message(s) for {agent_id} (notify_on={notify_on}):"]
     for m in msgs[:10]:
@@ -197,8 +269,10 @@ def _summary(agent_id: str, notify_on: str, msgs: list[dict]) -> str:
             f"  from {m.get('from', '?')} → {m.get('to', '?')}{flags}: "
             f"{preview}  (id {m.get('id', '?')})"
         )
-    lines.append("Use peek() to read in full and ack() when handled, "
-                 "then launch dispatch-wait again to re-arm.")
+    lines.append(
+        "Use peek() to read in full and ack() when handled, "
+        "then launch dispatch-wait again to re-arm."
+    )
     return "\n".join(lines)
 
 
@@ -215,6 +289,14 @@ def main() -> int:
         "at startup (standalone use), 0 falls back to a finite cap.",
     )
     ap.add_argument("--notify-on", default=None, help="override the configured policy for this run")
+    ap.add_argument(
+        "--follow",
+        action="store_true",
+        help="stream mode: don't exit on the first hit — print one line per "
+        "qualifying message and keep running until presence drops. Designed to run "
+        "under the Monitor tool so a single registration wakes a parked session on "
+        "every message, with no re-arming.",
+    )
     args = ap.parse_args()
 
     dispatch_dir = _dispatch_dir()
@@ -225,8 +307,7 @@ def main() -> int:
     agent_id = _resolve_agent_id(dispatch_dir)
     if not agent_id:
         print(
-            "[mcp-dispatch] could not resolve agent id "
-            "(set $MCP_DISPATCH_AGENT_ID) — not waiting."
+            "[mcp-dispatch] could not resolve agent id (set $MCP_DISPATCH_AGENT_ID) — not waiting."
         )
         return 0
 
@@ -257,8 +338,9 @@ def main() -> int:
                     time.sleep(0.05)
         if not locked:
             lock_fh.close()
-            print(f"[mcp-dispatch] a waiter is already armed for {agent_id}; "
-                  "not starting a second.")
+            print(
+                f"[mcp-dispatch] a waiter is already armed for {agent_id}; not starting a second."
+            )
             return 0
 
     notify_on = _notify_on(args.notify_on)
@@ -281,6 +363,18 @@ def main() -> int:
             max_lifetime = STANDALONE_FALLBACK_SECONDS
     deadline = None if max_lifetime <= 0 else time.monotonic() + max_lifetime
 
+    if args.follow:
+        return _follow(
+            dispatch_dir,
+            agent_id,
+            notify_on,
+            args.interval,
+            gated,
+            presence_pf,
+            deadline,
+            max_lifetime,
+        )
+
     while True:
         hits = _qualifying(dispatch_dir, agent_id, notify_on)
         if hits:
@@ -288,8 +382,7 @@ def main() -> int:
             return 0
         if gated and not _presence_is_live(presence_pf):
             print(
-                f"[mcp-dispatch] session for {agent_id} ended (presence dropped) — "
-                "waiter exiting."
+                f"[mcp-dispatch] session for {agent_id} ended (presence dropped) — waiter exiting."
             )
             return 0
         if deadline is not None and time.monotonic() >= deadline:

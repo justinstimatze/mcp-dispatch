@@ -14,7 +14,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Live tail** — `bin/dispatch-tail` streams every message across the relay to a terminal, IRC-style, so you can watch sessions talk in real time.
-- **Wake on arrival** — `bin/dispatch-wait` blocks until a message matching the notify policy lands, then exits to wake a parked model — an event-driven replacement for polling with `/loop`.
+- **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
 - **Local-first & per-user** — `0700`/`0600` perms, validated ids, no network by default. See [Security](#security).
@@ -212,47 +212,59 @@ the message itself waits until that session next takes a turn and acks it. See
 
 A desktop notification alerts *you*, but the model still won't act until its
 next turn. To wake the **model** on arrival without burning turns on a timer,
-launch `bin/dispatch-wait` as a background task. It blocks until a message that
-matches `notify_on` lands in this agent's inbox, prints a summary, and exits —
-and Claude Code re-invokes the model when a backgrounded task exits. Handle the
-message, then launch `dispatch-wait` again to re-arm.
+run `bin/dispatch-wait --follow` under the **Monitor** tool. Monitor streams each
+line the script prints into the parked session as a wake event, and
+`dispatch-wait --follow` prints one line per qualifying message and keeps
+running — so a **single registration covers the whole session**, waking the model
+on every arrival (local or cross-host) with nothing to re-arm.
 
-A waiter holds a per-agent lock for its lifetime, so launching a second
-`dispatch-wait` for the same agent exits immediately rather than double-arming.
+A watch holds a per-agent lock for its lifetime, so starting a second one for the
+same agent exits immediately rather than double-arming.
 
 ```bash
-dispatch-wait                  # block until a notify_on-qualifying message lands
+# the wake path (started for you by the Monitor tool, see below)
+dispatch-wait --follow             # stream one wake event per qualifying message
+
+# one-shot / standalone forms (exit on first hit; relaunch to re-arm)
+dispatch-wait                      # block until a notify_on-qualifying message lands
 dispatch-wait --notify-on direct   # wake only on messages addressed to me
-dispatch-wait --interval 1     # poll seconds (default 2.0)
+dispatch-wait --interval 1         # poll seconds (default 2.0)
 dispatch-wait --max-lifetime 600   # add a wall-clock cap (default 0 = none)
 ```
 
-By default there's no time cap: the waiter exits the instant its agent's presence
-flock drops (the session's server died), so a backgrounded waiter can't outlive
-its session and orphan — independent of whether the harness reaps background
-tasks on close. `--max-lifetime` adds a wall-clock cap on top; standalone use
-with no live server to gate on falls back to a finite cap automatically.
+By default there's no time cap: the watch exits the instant its agent's presence
+flock drops (the session's server died), so it can't outlive its session and
+orphan — independent of whether the harness reaps background tasks on close.
+`--max-lifetime` adds a wall-clock cap on top; standalone use with no live server
+to gate on falls back to a finite cap automatically.
 
 This replaces `/loop` for staying responsive while idle: `/loop` fires a whole
-model turn every interval whether or not anything arrived; `dispatch-wait`
-spends **zero** model tokens while blocking and wakes only on a real qualifying
-arrival. It reads the same `notify_on` policy the desktop notifier uses (one
-source of truth, `notify_policy.py`), so the two paths never disagree. It is
-level-triggered — a message already unread at launch exits it immediately, so
-re-arming after handling one leaves no window to miss the next. Resolves
-identity from `$MCP_DISPATCH_AGENT_ID` (set it, for a dozen sessions especially).
+model turn every interval whether or not anything arrived; the watch spends
+**zero** model tokens while blocking and wakes only on a real qualifying arrival.
+It reads the same `notify_on` policy the desktop notifier uses (one source of
+truth, `notify_policy.py`), so the two paths never disagree. It is level-triggered
+— a message already unread at launch is emitted immediately, so a watch started
+mid-session never misses a backlog. Cross-host messages arrive as ordinary inbox
+files (see the git transport below), so the same watch covers them and flags them
+`«remote»`. Resolves identity from `$MCP_DISPATCH_AGENT_ID` (set it, for a dozen
+sessions especially).
 
 #### Arming it hands-free (`hooks/dispatch-arm.py`)
 
-Launching and re-launching `dispatch-wait` by hand is the manual step. Only the
-model can start the wake task (the harness wakes on a *model-launched*
-`run_in_background` task, not on an arbitrary process), but a hook can make the
-model do it. `hooks/dispatch-arm.py`, wired into **SessionStart and Stop**,
-checks whether a waiter holds the arm lock; if none does, it tells the model to
-launch one. On SessionStart it injects the instruction; on Stop it *blocks*
-(capped, so a failing launch can't wedge the session) so the model never parks
-unarmed. Once a waiter is armed the hook is silent. Net: the session arms itself
-at startup and re-arms after every wake, with no human in the loop.
+Starting the watch is the one manual step. Only the model can start a wake source
+(the harness wakes on a *model-launched* Monitor event or background-task exit,
+not on an arbitrary process), but a hook can make the model do it.
+`hooks/dispatch-arm.py`, wired into **SessionStart and Stop**, checks whether a
+watch holds the arm lock; if none does, it tells the model to start
+`dispatch-wait --follow` under Monitor. On SessionStart it injects the instruction
+(retrying identity resolution briefly to ride out the race with the server
+claiming presence); on Stop it *blocks* (capped, so a failing launch can't wedge
+the session — past the cap it warns loudly instead of going silent) so the model
+never parks unarmed. Because the watch is persistent, this fires **once per
+session**, not once per message — the old per-message re-arm loop (and its
+flakiness) is gone. When cross-host git comms are enabled, the nudge also reports
+whether the bridge daemon is actually running. Once a watch is armed the hook is
+silent.
 
 ```json
 { "hooks": {
@@ -343,6 +355,20 @@ automatically whenever `[git].enabled`:
 `mirror = "remote-only"` (default) only bridges messages with no live-local
 recipient — same-host chatter stays local and private; `mirror = "all"` makes a
 full audited cross-host replica.
+
+**Testing cross-host with only one machine.** You don't need a second box to
+verify the whole path. `scripts/loopback-smoke.py` simulates two hosts on one
+machine — two throwaway DISPATCH_DIRs and two clones of the same bus repo — and
+round-trips a DM between them over a **real** git remote, asserting both
+directions land tagged `via: "remote"`:
+
+```bash
+scripts/loopback-smoke.py                    # against the default bus repo
+scripts/loopback-smoke.py --repo you/agent-bus --keep
+```
+
+It never touches your live config or real relay (everything lives in a temp dir),
+so it's safe to run repeatedly.
 
 The git **wire format** (an 11-field JSONL envelope + lane layout) is the
 cross-language contract — see [`docs/git-transport.md`](docs/git-transport.md).

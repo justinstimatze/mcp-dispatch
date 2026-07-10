@@ -125,6 +125,39 @@ def test_top_level_auto_arm_overrides_section(tmp_path):
     assert proc.stdout.strip() == ""  # top-level false wins → opted out, silent
 
 
+def test_session_start_nudges_monitor(tmp_path):
+    """The nudge now points at the Monitor tool + --follow, not run_in_background."""
+    dispatch_dir, state_dir = _setup(tmp_path)
+    proc = _run("SessionStart", dispatch_dir=dispatch_dir, state_dir=state_dir)
+    assert "Monitor(" in proc.stdout
+    assert "--follow" in proc.stdout
+
+
+def test_git_enabled_bridge_down_warns(tmp_path):
+    """git enabled but no daemon lock held → the nudge flags the bridge as down."""
+    dispatch_dir, state_dir = _setup(tmp_path)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[git]\nenabled = true\n")
+    proc = _run("SessionStart", dispatch_dir=dispatch_dir, state_dir=state_dir, config_path=cfg)
+    out = proc.stdout.lower()
+    assert "bridge" in out and "not running" in out
+
+
+def test_git_enabled_bridge_live_note(tmp_path):
+    """git enabled and the gitsync daemon lock is held → the nudge says LIVE."""
+    dispatch_dir, state_dir = _setup(tmp_path)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[git]\nenabled = true\n")
+    key = hashlib.md5(str(dispatch_dir).encode(), usedforsecurity=False).hexdigest()[:8]
+    lock = open(state_dir / f"gitsync-{key}.lock", "a+")  # noqa: SIM115
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # simulate a live daemon
+    try:
+        proc = _run("SessionStart", dispatch_dir=dispatch_dir, state_dir=state_dir, config_path=cfg)
+    finally:
+        lock.close()
+    assert "live" in proc.stdout.lower()
+
+
 def test_opt_out_env(tmp_path):
     dispatch_dir, state_dir = _setup(tmp_path)
     env_extra = {"MCP_DISPATCH_NO_AUTO_ARM": "1"}

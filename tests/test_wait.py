@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import select
 import subprocess
 import sys
 import time
@@ -97,4 +98,75 @@ def test_explicit_cap_honoured_when_gated(tmp_path):
         assert proc.returncode == 0
         assert "within" in out  # timed out despite live presence
     finally:
+        holder.close()
+
+
+# ── --follow stream mode (the Monitor-driven watch) ──────────────────────────
+
+
+def _write_msg(dispatch_dir, agent, *, to, content, mid, **extra):
+    inbox = dispatch_dir / agent
+    inbox.mkdir(parents=True, exist_ok=True)
+    msg = {
+        "id": mid,
+        "from": "bob",
+        "to": to,
+        "content": content,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "state": "pending",
+        **extra,
+    }
+    # Millisecond-prefixed filename → chronological glob order, matching the server.
+    (inbox / f"{int(time.time() * 1000)}-{mid}.json").write_text(json.dumps(msg))
+
+
+def _readline(proc, timeout):
+    """Read one line from proc.stdout, or '' if nothing lands within timeout."""
+    ready, _, _ = select.select([proc.stdout], [], [], timeout)
+    return proc.stdout.readline() if ready else ""
+
+
+def test_follow_streams_each_message_without_rearming(tmp_path):
+    """--follow emits one line per new qualifying message and keeps running — the
+    property that lets a single Monitor registration cover the whole session."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir)
+    proc = _launch(
+        dispatch_dir, state_dir, "--follow", agent="alice", MCP_DISPATCH_NOTIFY_ON="direct"
+    )
+    try:
+        _write_msg(dispatch_dir, "alice", to="alice", content="first ping", mid="m1")
+        l1 = _readline(proc, 4)
+        assert "m1" in l1 and "first ping" in l1
+        assert proc.poll() is None  # still running — did NOT exit on the hit
+
+        _write_msg(dispatch_dir, "alice", to="alice", content="second ping", mid="m2")
+        l2 = _readline(proc, 4)
+        assert "m2" in l2 and "second ping" in l2
+
+        holder.close()  # session ends → presence drops → watch exits
+        rest, _ = proc.communicate(timeout=5)
+        assert proc.returncode == 0
+        assert "watch exiting" in rest
+        assert "m1" not in rest  # dedup: an already-emitted id is not repeated
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        if not holder.closed:
+            holder.close()
+
+
+def test_follow_marks_remote_provenance(tmp_path):
+    """A git-materialized message (_via='git') is flagged «remote» in the stream."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir)
+    proc = _launch(
+        dispatch_dir, state_dir, "--follow", agent="alice", MCP_DISPATCH_NOTIFY_ON="direct"
+    )
+    try:
+        _write_msg(dispatch_dir, "alice", to="alice", content="cross-host hi", mid="r1", _via="git")
+        line = _readline(proc, 4)
+        assert "r1" in line and "«remote»" in line
+    finally:
+        proc.kill()
         holder.close()

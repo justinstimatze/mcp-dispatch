@@ -45,16 +45,18 @@ default_ttl = 604800  # 7 days
 #   "all"       — everything
 # notify_on = "important"
 #
-# The SAME notify_on also drives bin/dispatch-wait, the model-wake long-poll that
-# replaces /loop for parked sessions: launch it in the background and the harness
-# re-invokes the model when a qualifying message lands (zero tokens while idle).
-# For "wake me only on messages addressed to me", set:
+# The SAME notify_on also drives bin/dispatch-wait, the model-wake watch that
+# replaces /loop for parked sessions: run `dispatch-wait --follow` under the
+# Monitor tool and the harness re-invokes the model on every qualifying message
+# (zero tokens while idle). For "wake me only on messages addressed to me", set:
 #   notify_on = "direct"
 #
 # auto_arm (default true): when hooks/dispatch-arm.py is wired into SessionStart
-# and Stop, the session arms a dispatch-wait at startup and re-arms after every
-# wake with no human in the loop (the hook nudges the model — only the model can
-# launch the wake task). Set false to disable, or export MCP_DISPATCH_NO_AUTO_ARM=1.
+# and Stop, the session starts one persistent `dispatch-wait --follow` watch at
+# startup with no human in the loop (the hook nudges the model — only the model
+# can start the wake source). Because the watch is persistent it's armed once per
+# session, not once per message. Set false to disable, or export
+# MCP_DISPATCH_NO_AUTO_ARM=1.
 # auto_arm = false
 #
 # Cross-account note: notify-send needs the target user's desktop session bus.
