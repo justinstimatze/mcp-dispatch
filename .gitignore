@@ -2,5 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 
+# dispatch-tui build output (Go binary; source in tui/)
+/tui/dispatch-tui
+
 # plancheck debug artifact
 .plancheck-debug.json

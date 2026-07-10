@@ -22,6 +22,22 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest -q
 
+  tui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: tui/go.sum
+      - run: test -z "$(gofmt -l .)" || { echo 'gofmt needed:'; gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
   dependabot-automerge:
     needs: test  # only consider merging once tests are green
     runs-on: ubuntu-latest
