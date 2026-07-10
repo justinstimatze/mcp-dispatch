@@ -65,16 +65,59 @@ func formatMessage(m Message, width int) string {
 	head := fmt.Sprintf("%s  %s %s %s%s%s  ",
 		dimStyle.Render(hhmmss(m.Timestamp)),
 		fromStyle.Render(m.From), arrow, toStyle.Render(m.To), flags, via)
-	line := head + content
-	// Truncate on display width so styled runs aren't cut mid-escape.
-	if width > 0 && lipgloss.Width(line) > width {
-		budget := width - lipgloss.Width(head) - 1
-		if budget < 1 {
-			budget = 1
-		}
-		line = head + truncate(content, budget) + "…"
+	if width <= 0 {
+		return head + content
 	}
-	return line
+	// Word-wrap the content and hang continuation lines under it (IRC-style)
+	// instead of truncating. The continuation indent is capped so a long
+	// from→to header (these ids are project-pid, easily 40+ cols) doesn't squeeze
+	// the content into a thin ribbon: short ids align under the content, long
+	// ids fall back to a modest indent that gives the content near-full width.
+	headW := lipgloss.Width(head)
+	indentW := headW
+	if indentW > width/3 {
+		indentW = min(width/3, 14)
+	}
+	lines := wrapHanging(content, width-headW, width-indentW)
+	indent := strings.Repeat(" ", indentW)
+	var b strings.Builder
+	b.WriteString(head + lines[0])
+	for _, l := range lines[1:] {
+		b.WriteByte('\n')
+		b.WriteString(indent + l)
+	}
+	return b.String()
+}
+
+// wrapHanging greedily word-wraps s, using firstW for the first line and restW
+// for every line after it (so a wide header on line 1 and a modest indent on the
+// rest can coexist without overflowing the terminal). A single word longer than
+// the line width is left to overflow (the viewport clips it) rather than split
+// mid-word.
+func wrapHanging(s string, firstW, restW int) []string {
+	if firstW < 1 {
+		firstW = 1
+	}
+	if restW < 1 {
+		restW = 1
+	}
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return []string{""}
+	}
+	var lines []string
+	cur := words[0]
+	w := firstW
+	for _, word := range words[1:] {
+		if lipgloss.Width(cur)+1+lipgloss.Width(word) <= w {
+			cur += " " + word
+		} else {
+			lines = append(lines, cur)
+			cur = word
+			w = restW
+		}
+	}
+	return append(lines, cur)
 }
 
 func truncate(s string, n int) string {

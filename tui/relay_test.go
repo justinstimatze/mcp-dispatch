@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func write(t *testing.T, path string, v any) {
@@ -225,6 +226,27 @@ func TestModelRendersAndFilters(t *testing.T) {
 	view = mi.View()
 	if !strings.Contains(view, "hello bob") || strings.Contains(view, "remote hi") {
 		t.Fatalf("agent filter didn't apply:\n%s", view)
+	}
+}
+
+func TestFormatMessageWrapsNotTruncates(t *testing.T) {
+	long := strings.TrimSpace(strings.Repeat("word ", 40)) // ~200 chars
+	out := formatMessage(Message{From: "alice", To: "bob", Content: long}, 60)
+	lines := strings.Split(out, "\n")
+	if len(lines) < 3 {
+		t.Fatalf("long content should wrap to several lines, got %d:\n%s", len(lines), out)
+	}
+	if strings.Contains(out, "…") {
+		t.Fatal("wrapping must not truncate with an ellipsis")
+	}
+	for _, l := range lines {
+		if lipgloss.Width(l) > 60 {
+			t.Fatalf("wrapped line exceeds width 60 (w=%d): %q", lipgloss.Width(l), l)
+		}
+	}
+	// every word survives (nothing dropped by the wrap)
+	if got := strings.Count(out, "word"); got != 40 {
+		t.Fatalf("expected all 40 words, got %d", got)
 	}
 }
 
