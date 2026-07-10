@@ -19,66 +19,17 @@ Wire into ~/.claude/settings.json under SessionStart:
 
 from __future__ import annotations
 
-import fcntl
-import hashlib
 import json
 import os
-import subprocess
+
+# subprocess only launches our own daemon by fixed path (no shell, no untrusted
+# args); detached so it outlives this hook.
+import subprocess  # nosec B404
 import sys
 from pathlib import Path
 
-
-def _truthy(val: str | None) -> bool:
-    return (val or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _config() -> dict:
-    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
-        "~/.config/mcp-dispatch/config.toml"
-    )
-    if not os.path.exists(cfg):
-        return {}
-    try:
-        import tomllib
-
-        with open(cfg, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
-        return {}
-
-
-def _dispatch_dir(cfg: dict) -> Path:
-    sub = cfg.get("dispatch") if isinstance(cfg.get("dispatch"), dict) else {}
-    raw = (
-        os.environ.get("MCP_DISPATCH_DIR")
-        or os.environ.get("DISPATCH_DIR")
-        or cfg.get("dispatch_dir")
-        or sub.get("dispatch_dir")
-        or "~/.config/mcp-dispatch/messages"
-    )
-    return Path(os.path.expanduser(str(raw)))
-
-
-def _state_dir() -> Path:
-    raw = os.environ.get("MCP_DISPATCH_STATE_DIR") or "~/.cache/mcp-dispatch"
-    return Path(os.path.expanduser(raw))
-
-
-def _host_lock_held(dispatch_dir: Path) -> bool:
-    key = hashlib.md5(str(dispatch_dir).encode(), usedforsecurity=False).hexdigest()[:8]
-    pf = _state_dir() / f"gitsync-{key}.lock"
-    try:
-        fh = open(pf)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        return False
-    except OSError:
-        return True
-    finally:
-        fh.close()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _dispatch_common as common  # noqa: E402
 
 
 def main() -> int:
@@ -88,31 +39,31 @@ def main() -> int:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    if _truthy(os.environ.get("MCP_DISPATCH_NO_AUTO_ARM")):
-        return 0
-    cfg = _config()
-    if cfg.get("auto_arm") is False:
+    cfg = common.load_config()
+    if common.auto_arm_disabled(cfg):
         return 0
 
-    git = cfg.get("git") if isinstance(cfg.get("git"), dict) else {}
+    raw_git = cfg.get("git")
+    git = raw_git if isinstance(raw_git, dict) else {}
     if not (git.get("enabled") or os.environ.get("MCP_DISPATCH_GIT_ENABLED")):
         return 0  # cross-host comms not configured — nothing to start
 
-    dispatch_dir = _dispatch_dir(cfg)
+    dispatch_dir = common.dispatch_dir(cfg)
     if not dispatch_dir.is_dir():
         return 0
-    if _host_lock_held(dispatch_dir):
+    lock = common.state_dir() / f"gitsync-{common.md5_key(str(dispatch_dir))}.lock"
+    if common.flock_held(lock):
         return 0  # a daemon is already mirroring this host
 
     daemon = Path(__file__).resolve().parent.parent / "bin" / "dispatch-gitsync"
-    log_dir = _state_dir()
+    log_dir = common.state_dir()
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         log = open(log_dir / "gitsync.log", "a")  # noqa: SIM115 - handed to the child
     except OSError:
         log = subprocess.DEVNULL  # type: ignore[assignment]
     try:
-        subprocess.Popen(
+        subprocess.Popen(  # nosec B603
             [sys.executable, str(daemon)],
             stdin=subprocess.DEVNULL,
             stdout=log,
