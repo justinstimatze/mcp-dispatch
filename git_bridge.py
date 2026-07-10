@@ -110,6 +110,28 @@ class GitBridge:
             print(f"[gitsync] sync pass failed (will retry): {e}", file=sys.stderr, flush=True)
             return False
 
+    def flush_pending(self) -> bool:
+        """Push lane records the remote is missing because a PRIOR run committed
+        them locally but couldn't push (a network/auth/identity outage froze the
+        remote while the daemon kept committing). Called once at daemon start so a
+        RESTART ALONE recovers a frozen remote — without waiting for the next
+        outbound message to trigger a push. No-op with no remote or an up-to-date
+        remote; never raises (a still-broken remote just retries on the next
+        push). This is the recovery path for the 'remote lane stuck at an old
+        date while agents keep talking' symptom."""
+        if not self.remote:
+            return False
+        try:
+            self._reader.push()
+            return True
+        except Exception as e:  # noqa: BLE001 - startup best-effort; real pushes retry
+            print(
+                f"[gitsync] startup catch-up push failed (will retry on next send): {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+
     def run(self, interval: float) -> None:  # pragma: no cover - thin loop
         """Tick forever (resiliently), sleeping ``interval`` seconds between passes."""
         while True:

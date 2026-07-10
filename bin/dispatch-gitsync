@@ -261,6 +261,11 @@ def cmd_run(argv: list[str]) -> int:
 
     bridge = GitBridge(dispatch_dir, repo_dir, remote=remote, mirror=mirror, group_mode=group_mode)
 
+    # Startup catch-up: if a prior run committed lane records but couldn't push
+    # (a network/auth outage froze the remote), flush them now so a restart alone
+    # recovers — no need to wait for new traffic to trigger the next push.
+    bridge.flush_pending()
+
     if args.once:
         bridge.tick_guarded()
         return 0

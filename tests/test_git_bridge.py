@@ -172,6 +172,37 @@ def test_empty_relay_first_run_latches_ledger(tmp_path):
     assert [m["content"] for m in _inbox_files(dir_b, "bob")] == ["arrived after start"]
 
 
+def test_flush_pending_recovers_frozen_remote(tmp_path):
+    """Steven's bug: pushes fail for a while (auth/network/identity), so the
+    remote lane freezes while the local daemon keeps committing. On restart,
+    flush_pending() must push the piled-up commits — WITHOUT any new traffic — so
+    the remote catches up and the other host finally sees the missed messages."""
+    dir_a, dir_b, repo_a, repo_b = _bus_and_clones(tmp_path)
+    bare = str(tmp_path / "bus.git")
+
+    a = GitBridge(dir_a, repo_a, remote="origin")
+    _local_dm(dir_a, "alice", "bob", "before outage")
+    a.tick()  # published + pushed → remote has it
+
+    # Outage: point origin at nothing so the push fails; the daemon keeps going.
+    _git(repo_a, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    _local_dm(dir_a, "alice", "bob", "during outage")
+    a.tick_guarded()  # commits locally, push fails, swallowed — remote now frozen
+
+    b = GitBridge(dir_b, repo_b, remote="origin")
+    b.tick()
+    assert [m["content"] for m in _inbox_files(dir_b, "bob")] == ["before outage"]  # frozen
+
+    # Update + restart: push works again; a fresh daemon flushes on startup with
+    # NO new message sent.
+    _git(repo_a, "remote", "set-url", "origin", bare)
+    a2 = GitBridge(dir_a, repo_a, remote="origin")
+    assert a2.flush_pending() is True
+
+    b.tick()
+    assert [m["content"] for m in _inbox_files(dir_b, "bob")] == ["before outage", "during outage"]
+
+
 def test_dm_crosses_hosts(hosts):
     _local_dm(hosts.dir_a, "alice", "bob", "hello bob")
     hosts.a.tick()  # outbound: publish to git (bob not live-local on A)
