@@ -63,14 +63,6 @@ type Message struct {
 // Remote reports whether the message arrived from another host over git.
 func (m Message) Remote() bool { return m.Via == "git" }
 
-// Channel returns the channel name (without '#') if this is a channel post.
-func (m Message) Channel() string {
-	if strings.HasPrefix(m.To, "#") {
-		return m.To[1:]
-	}
-	return ""
-}
-
 // Agent is a participant on the relay: a live-local session, or a cross-host
 // agent known only through the git roster.
 type Agent struct {
@@ -78,8 +70,6 @@ type Agent struct {
 	Live     bool // holds its presence flock right now (local session)
 	Remote   bool // known via the .remote git roster (reachable, maybe offline)
 	Channels []string
-	Unread   int
-	PID      int
 }
 
 // Snapshot is one read of the whole relay: the merged feed plus the roster.
@@ -338,15 +328,18 @@ func roster(relay, repo string) []Agent {
 				continue
 			}
 			var p presenceFile
-			if json.Unmarshal(data, &p) != nil || p.AgentID == "" {
+			// Validate the id: it becomes a path segment in Send's fan-out, and a
+			// presence file is group-writable in group_mode, so a crafted agent_id
+			// (traversal, separators) must never reach filepath.Join. Mirrors the
+			// server's own ID_RE guard.
+			if json.Unmarshal(data, &p) != nil || !validID(p.AgentID) {
 				continue
 			}
 			if !flockHeld(pf) {
 				continue
 			}
 			live[p.AgentID] = &Agent{
-				ID: p.AgentID, Live: true, Channels: p.Channels, PID: p.PID,
-				Unread: unreadCount(filepath.Join(relay, p.AgentID)),
+				ID: p.AgentID, Live: true, Channels: p.Channels,
 			}
 		}
 	}
@@ -360,7 +353,7 @@ func roster(relay, repo string) []Agent {
 				continue
 			}
 			var r remoteFile
-			if json.Unmarshal(data, &r) != nil || r.AgentID == "" {
+			if json.Unmarshal(data, &r) != nil || !validID(r.AgentID) {
 				continue
 			}
 			if _, isLive := live[r.AgentID]; isLive {
@@ -377,25 +370,6 @@ func roster(relay, repo string) []Agent {
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	sort.Slice(remotes, func(i, j int) bool { return remotes[i].ID < remotes[j].ID })
 	return append(out, remotes...)
-}
-
-func unreadCount(inbox string) int {
-	files, err := filepath.Glob(filepath.Join(inbox, "*.json"))
-	if err != nil {
-		return 0
-	}
-	n := 0
-	for _, f := range files {
-		data, err := os.ReadFile(f) //nolint:gosec // enumerated inbox file
-		if err != nil {
-			continue
-		}
-		var m Message
-		if json.Unmarshal(data, &m) == nil && (m.State == "" || m.State == "pending") {
-			n++
-		}
-	}
-	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +453,7 @@ func Send(relay, from, target, content string, snap Snapshot, priority string) (
 	switch {
 	case target == "all":
 		for _, a := range snap.Agents {
-			if a.Live && a.ID != from {
+			if a.Live && a.ID != from && validID(a.ID) {
 				targets = append(targets, a.ID)
 			}
 		}
@@ -489,7 +463,7 @@ func Send(relay, from, target, content string, snap Snapshot, priority string) (
 			return 0, fmt.Errorf("invalid channel %q", target)
 		}
 		for _, a := range snap.Agents {
-			if a.Live && a.ID != from && contains(a.Channels, ch) {
+			if a.Live && a.ID != from && validID(a.ID) && contains(a.Channels, ch) {
 				targets = append(targets, a.ID)
 			}
 		}

@@ -158,10 +158,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// cursor is — the roster is keyboard-navigated.
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
-			m.vp.LineUp(3)
+			m.vp.ScrollUp(3)
 			m.follow = m.vp.AtBottom()
 		case tea.MouseButtonWheelDown:
-			m.vp.LineDown(3)
+			m.vp.ScrollDown(3)
 			m.follow = m.vp.AtBottom()
 		}
 		return m, nil
@@ -438,11 +438,11 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "pgdown", "ctrl+f", " ":
-		m.vp.ViewDown()
+		m.vp.PageDown()
 		m.follow = m.vp.AtBottom()
 		return m, nil
 	case "pgup", "ctrl+b", "b":
-		m.vp.ViewUp()
+		m.vp.PageUp()
 		m.follow = m.vp.AtBottom()
 		return m, nil
 	case "g", "home":

@@ -351,7 +351,7 @@ func TestComposeAndSendThroughModel(t *testing.T) {
 	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyTab})                             // select bob
 	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})       // open compose
 	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("ship it")}) // type
-	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyEnter})                           // send
+	_, _ = mi.Update(tea.KeyMsg{Type: tea.KeyEnter})                            // send (writes to disk)
 
 	files, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json"))
 	if len(files) != 1 {
@@ -437,6 +437,46 @@ func TestSendChannelFansOutToLiveSubscribers(t *testing.T) {
 func TestSendRejectsBadTarget(t *testing.T) {
 	if _, err := Send(t.TempDir(), "console-1", "../escape", "x", Snapshot{}, "normal"); err == nil {
 		t.Fatal("path-traversal target must be rejected")
+	}
+}
+
+func TestSendFanoutSkipsMaliciousAgentID(t *testing.T) {
+	// A crafted presence file could carry a traversal in agent_id; Send's "all"
+	// fan-out must not turn it into a path outside the relay.
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{
+		{ID: "bob", Live: true},
+		{ID: "../../etc/evil", Live: true}, // hostile id
+	}}
+	n, err := Send(relay, "console-1", "all", "hi", snap, "normal")
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("only the valid recipient should get the message, got %d", n)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json")); len(fs) != 1 {
+		t.Fatal("valid recipient bob should have received it")
+	}
+	// nothing must have been written up and out of the relay
+	if _, err := os.Stat(filepath.Join(filepath.Dir(relay), "etc")); err == nil {
+		t.Fatal("traversal escaped the relay dir")
+	}
+}
+
+func TestRosterSkipsInvalidAgentID(t *testing.T) {
+	relay := t.TempDir()
+	writeInbox(t, relay, ".presence", "evil.json", map[string]any{"agent_id": "../escape", "pid": 1})
+	writeInbox(t, relay, ".presence", "ok.json", map[string]any{"agent_id": "alice", "pid": 2})
+	// hold alice's lock so she reads live
+	f, _ := os.Open(filepath.Join(relay, ".presence", "ok.json"))
+	defer f.Close()
+	syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+
+	for _, a := range roster(relay, "") {
+		if !validID(a.ID) {
+			t.Fatalf("roster surfaced an unvalidated id: %q", a.ID)
+		}
 	}
 }
 

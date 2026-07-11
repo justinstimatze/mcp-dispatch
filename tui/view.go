@@ -40,7 +40,7 @@ func hhmmss(ts string) string {
 	return ts
 }
 
-// formatMessage renders one feed line, truncated to width.
+// formatMessage renders one message as a header line plus word-wrapped content.
 func formatMessage(m Message, width int) string {
 	arrow := toStyle.Render("→")
 	if m.Priority == "urgent" {

@@ -1,15 +1,19 @@
-// dispatch-tui — a read-only "passive IRC client" for the mcp-dispatch relay.
+// dispatch-tui — an IRC-style client for the mcp-dispatch relay.
 //
-// The relay is the IRC server: live sessions are nicks, '#name' targets are
-// channels, and the feed is the message stream. When cross-host comms are
-// configured it also reads the git bus, so remote agents (nicks from other
-// hosts) and their traffic show up too, marked «remote». It touches nothing —
-// no ack, no delete — it only watches.
+// The relay is the IRC server: projects are nicks (grouped across their session
+// pids), '#name' targets are channels, and the feed is a transcript accumulated
+// as messages flow (the relay deletes a message on ack, so a snapshot alone
+// keeps losing the conversation). When cross-host comms are configured it also
+// reads the git bus, so remote agents and their traffic show up, marked
+// «remote». Watching is read-only; you can also send (i) to the selected
+// nick/channel and ack (a) your own console inbox.
 //
 //	dispatch-tui                 # auto-resolve the relay + git bus from config
 //	dispatch-tui --dir PATH      # point at a specific relay dir
+//	dispatch-tui --nick NAME     # send/ack identity (default console-<pid>)
 //	dispatch-tui --no-git        # local inboxes only
 //	dispatch-tui --interval 0.5  # poll faster (default 1s)
+//	dispatch-tui --dump          # render one frame to stdout and exit
 //	dispatch-tui --version
 package main
 
