@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 func write(t *testing.T, path string, v any) {
@@ -423,6 +424,36 @@ func TestRosterScrollsToSelection(t *testing.T) {
 	}
 	if strings.Contains(view, "proj00x") {
 		t.Fatal("top of a scrolled roster should be off-screen")
+	}
+}
+
+// A live-agent row built for the selection path must be plain text (no ANSI):
+// inner Render calls emit \x1b[0m resets that break the selStyle highlight
+// background, so only the leading cell stayed highlighted (the reported bug).
+// With a color profile forced, the rendered selection must be one contiguous
+// highlight span — no interior reset before the trailing pad.
+func TestSelectedRosterRowHighlightIsContiguous(t *testing.T) {
+	restore := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(restore)
+
+	m := newModel("/r", "", false, time.Second, "test", "c")
+	tg := target{kind: targetAgent, value: "alice", label: "alice", live: true}
+
+	if strings.ContainsRune(m.rosterLine(tg, false), '\x1b') {
+		t.Fatalf("selection row must be plain text, got ANSI: %q", m.rosterLine(tg, false))
+	}
+	if !strings.ContainsRune(m.rosterLine(tg, true), '\x1b') {
+		t.Fatalf("unselected row should carry glyph styling, got plain: %q", m.rosterLine(tg, true))
+	}
+	// The selection path: selStyle over the plain, padded row → exactly one
+	// reset, at the very end. An interior reset is the bug.
+	sel := selStyle.Render(padRight(m.rosterLine(tg, false), rosterWidth-1))
+	if n := strings.Count(sel, "\x1b[0m"); n != 1 {
+		t.Fatalf("selected row should have one trailing reset, got %d: %q", n, sel)
+	}
+	if !strings.HasSuffix(sel, "\x1b[0m") {
+		t.Fatalf("selection highlight must run to the row's end: %q", sel)
 	}
 }
 

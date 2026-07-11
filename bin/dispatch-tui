@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# mcp-dispatch TUI launcher — a thin shim so the terminal UI starts the same way
+# as the other bin/ tools, even though its source is a separate Go module in
+# tui/. Builds the binary on first run (or when a source file is newer than it),
+# then execs it with all args passed through.
+#
+#   bin/dispatch-tui --nick alice
+#
+# The version is baked in via the tui/Makefile's -ldflags; see tui/main.go.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TUI_DIR="$REPO_DIR/tui"
+BIN="$TUI_DIR/dispatch-tui"
+
+# Rebuild if the binary is missing or any Go source is newer than it.
+needs_build=0
+if [[ ! -x "$BIN" ]]; then
+  needs_build=1
+else
+  while IFS= read -r src; do
+    [[ "$src" -nt "$BIN" ]] && { needs_build=1; break; }
+  done < <(find "$TUI_DIR" -maxdepth 1 -name '*.go' ! -name '*_test.go' -type f)
+fi
+
+if [[ "$needs_build" -eq 1 ]]; then
+  echo "dispatch-tui: building…" >&2
+  make -C "$TUI_DIR" build >&2
+fi
+
+exec "$BIN" "$@"

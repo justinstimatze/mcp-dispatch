@@ -139,9 +139,14 @@ func (m model) rosterView() string {
 	}
 	var b strings.Builder
 	for i := m.rosterTop; i < end; i++ {
-		line := m.rosterLine(m.targets[i])
+		var line string
 		if i == m.selected {
-			line = selStyle.Render(padRight(line, rosterWidth-1))
+			// Build the row unstyled so selStyle owns the whole width — inner
+			// Render calls emit \x1b[0m resets that otherwise punch holes in
+			// the selection background.
+			line = selStyle.Render(padRight(m.rosterLine(m.targets[i], false), rosterWidth-1))
+		} else {
+			line = m.rosterLine(m.targets[i], true)
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -171,29 +176,39 @@ func (m model) composeView() string {
 	return composeBar.Width(m.width).Render(body)
 }
 
-func (m model) rosterLine(t target) string {
+// rosterLine renders one sidebar row. When styled is false it returns plain
+// text (no ANSI) so the caller can wrap a selected row in selStyle without inner
+// resets breaking the highlight background.
+func (m model) rosterLine(t target, styled bool) string {
+	paint := func(s lipgloss.Style, txt string) string {
+		if !styled {
+			return txt
+		}
+		return s.Render(txt)
+	}
 	switch t.kind {
 	case targetAll:
 		return "▸ all traffic"
 	case targetChannel:
-		return channelStyle.Render(t.label)
+		return paint(channelStyle, t.label)
 	case targetPastHeader:
 		caret := "▸"
 		if m.pastOpen {
 			caret = "▾"
 		}
-		return dimStyle.Render(fmt.Sprintf("%s %d past sessions", caret, t.count))
+		return paint(dimStyle, fmt.Sprintf("%s %d past sessions", caret, t.count))
 	case targetAgent:
 		offline := !t.live && !t.remote
-		glyph := dimStyle.Render("◦")
+		glyphChar, glyphStyle := "◦", dimStyle
 		if t.live {
-			glyph = liveStyle.Render("●")
+			glyphChar, glyphStyle = "●", liveStyle
 		} else if t.remote {
-			glyph = remoteStyle.Render("◆")
+			glyphChar, glyphStyle = "◆", remoteStyle
 		}
+		glyph := paint(glyphStyle, glyphChar)
 		badge := ""
 		if t.count > 0 {
-			badge = " " + dimStyle.Render(fmt.Sprintf("·%d", t.count))
+			badge = " " + paint(dimStyle, fmt.Sprintf("·%d", t.count))
 		}
 		prefix := ""
 		if offline { // indent members shown under the expanded past-sessions group

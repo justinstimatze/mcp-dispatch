@@ -316,12 +316,16 @@ filter the feed; git-origin messages are marked «remote». It's the first Go
 component in the repo.
 
 ```bash
-cd tui && make build            # → ./dispatch-tui  (needs Go 1.25+)
-./dispatch-tui                  # auto-resolves the relay + git bus from your config
-./dispatch-tui --nick alice     # send/ack as 'alice' (default: console-<pid>)
-./dispatch-tui --no-git         # local inboxes only
-./dispatch-tui --dump           # render one frame to stdout and exit (no TTY)
+bin/dispatch-tui                # builds on first run, then launches (needs Go 1.25+)
+bin/dispatch-tui --nick alice   # send/ack as 'alice' (default: console-<pid>)
+bin/dispatch-tui --no-git       # local inboxes only
+bin/dispatch-tui --dump         # render one frame to stdout and exit (no TTY)
 ```
+
+`bin/dispatch-tui` is a thin launcher that compiles the Go source in `tui/` on
+first run (or when a source file changed) and execs it — so it starts like the
+other `bin/` tools. To build the binary directly instead: `cd tui && make build`
+(→ `./dispatch-tui`).
 
 Keys: `tab`/`↑`/`↓` cycle the filter (the sidebar scrolls to keep the selection
 in view) · `pgup`/`pgdn` scroll the feed · `f` toggle follow · `g`/`G`
