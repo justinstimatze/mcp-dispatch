@@ -69,15 +69,16 @@ type model struct {
 	nLive      int             // live project count (header)
 	nProjects  int             // total project count (header)
 
-	vp        viewport.Model
-	ready     bool
-	follow    bool
-	composing bool
-	input     textinput.Model
-	status    string
-	statusErr bool
-	width     int
-	height    int
+	vp               viewport.Model
+	ready            bool
+	follow           bool
+	composing        bool
+	confirmBroadcast bool // armed: a broadcast-to-all send awaits a second enter
+	input            textinput.Model
+	status           string
+	statusErr        bool
+	width            int
+	height           int
 }
 
 func newModel(relay, repo string, readGit bool, interval time.Duration, version, nick string) model {
@@ -469,17 +470,30 @@ func (m model) handleCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.composing = false
+		m.confirmBroadcast = false
 		m.input.Blur()
 		m.input.Reset()
 		return m, nil
 	case tea.KeyEnter:
 		text := strings.TrimSpace(m.input.Value())
-		m.composing = false
-		m.input.Blur()
-		m.input.Reset()
 		if text == "" {
+			m.composing = false
+			m.confirmBroadcast = false
+			m.input.Blur()
+			m.input.Reset()
 			return m, nil
 		}
+		// Broadcast guard: sending to "all traffic" hits every live agent, so the
+		// first enter only ARMS the send (see composeView's warning); a second
+		// enter confirms. Editing disarms it (handled in the default case below).
+		if m.currentTarget().kind == targetAll && !m.confirmBroadcast {
+			m.confirmBroadcast = true
+			return m, nil
+		}
+		m.composing = false
+		m.confirmBroadcast = false
+		m.input.Blur()
+		m.input.Reset()
 		label, ids, meta := m.resolveSend(m.currentTarget())
 		switch {
 		case meta: // "all" / "#channel": Send does the fan-out
@@ -502,6 +516,7 @@ func (m model) handleCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.follow = true
 		return m, m.load()
 	}
+	m.confirmBroadcast = false // editing re-arms the broadcast guard
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd

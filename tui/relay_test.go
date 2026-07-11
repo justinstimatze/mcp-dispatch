@@ -365,6 +365,45 @@ func TestComposeAndSendThroughModel(t *testing.T) {
 	}
 }
 
+func TestBroadcastRequiresDoubleConfirm(t *testing.T) {
+	relay := t.TempDir()
+	var mi tea.Model = newModel(relay, "", false, time.Second, "test", "console-1")
+	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	mi, _ = mi.Update(snapshotMsg(Snapshot{Agents: []Agent{{ID: "bob", Live: true}}}))
+	// stay on "all traffic" (selected 0), compose, type, then enter → arms only
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("all hands")})
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if fs, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json")); len(fs) != 0 {
+		t.Fatal("first enter on a broadcast must NOT send")
+	}
+	if !mi.(model).confirmBroadcast {
+		t.Fatal("first enter should arm the broadcast confirm")
+	}
+	// second enter confirms and broadcasts (the send is a filesystem side effect)
+	_, _ = mi.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if fs, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json")); len(fs) != 1 {
+		t.Fatal("second enter should broadcast to the live agent")
+	}
+}
+
+func TestBroadcastConfirmDisarmedByEdit(t *testing.T) {
+	relay := t.TempDir()
+	var mi tea.Model = newModel(relay, "", false, time.Second, "test", "console-1")
+	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	mi, _ = mi.Update(snapshotMsg(Snapshot{Agents: []Agent{{ID: "bob", Live: true}}}))
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")})
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyEnter})                     // arm
+	mi, _ = mi.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")}) // edit → disarm
+	if mi.(model).confirmBroadcast {
+		t.Fatal("editing after arming must disarm the confirm")
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "bob", "*.json")); len(fs) != 0 {
+		t.Fatal("no send should have happened")
+	}
+}
+
 func TestRosterScrollsToSelection(t *testing.T) {
 	var mi tea.Model = newModel("/r", "", false, time.Second, "test", "c")
 	mi, _ = mi.Update(tea.WindowSizeMsg{Width: 60, Height: 8}) // feed height 6 → 6 roster rows

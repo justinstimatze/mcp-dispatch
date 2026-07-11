@@ -12,6 +12,7 @@
 //	dispatch-tui --dir PATH      # point at a specific relay dir
 //	dispatch-tui --nick NAME     # send/ack identity (default console-<pid>)
 //	dispatch-tui --no-git        # local inboxes only
+//	dispatch-tui --no-mouse      # keep native terminal text selection
 //	dispatch-tui --interval 0.5  # poll faster (default 1s)
 //	dispatch-tui --dump          # render one frame to stdout and exit
 //	dispatch-tui --version
@@ -70,6 +71,7 @@ func main() {
 	noGit := flag.Bool("no-git", false, "local inboxes only — don't read the cross-host git bus")
 	interval := flag.Float64("interval", 1.0, "poll seconds")
 	nick := flag.String("nick", "", "console identity for send/ack (default: console-<pid>)")
+	noMouse := flag.Bool("no-mouse", false, "don't capture the mouse (keeps native terminal text selection)")
 	dump := flag.Bool("dump", false, "render one frame to stdout and exit (no TTY; for scripts/screenshots)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -122,7 +124,13 @@ func main() {
 		return
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if !*noMouse {
+		// Mouse wheel scrolls the feed; the trade-off is the terminal's own text
+		// selection then needs a modifier (shift/option). --no-mouse opts out.
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	p := tea.NewProgram(m, opts...)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "dispatch-tui:", err)
 		os.Exit(1)

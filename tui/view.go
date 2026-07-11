@@ -156,6 +156,17 @@ func (m model) rosterView() string {
 
 func (m model) composeView() string {
 	prompt := composePrompt.Render(m.filterLabel() + " ▸")
+	if m.confirmBroadcast {
+		n := 0
+		for _, a := range m.snap.Agents {
+			if a.Live && a.ID != m.nick {
+				n++
+			}
+		}
+		warn := errStatusStyle.Render(
+			fmt.Sprintf(" ⚠ broadcast to %d live agents — enter to confirm, esc to cancel ", n))
+		return composeBar.Width(m.width).Render(prompt + warn)
+	}
 	body := prompt + composeBar.Render(" "+m.input.View())
 	return composeBar.Width(m.width).Render(body)
 }
