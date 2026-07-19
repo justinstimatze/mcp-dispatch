@@ -101,3 +101,29 @@ def test_subscribe_tool_roundtrip(server):
     assert "gemot" in res["channels"]
     res2 = server.unsubscribe_tool("gemot")
     assert res2["channels"] == []
+
+
+# --- MCP_DISPATCH_CHANNELS: auto-subscribe standing rooms on startup ----------
+
+
+def test_initial_channels_from_env(server_factory):
+    s = server_factory(extra_env={"MCP_DISPATCH_CHANNELS": "agentops"})
+    assert s._PRESENCE_DATA["channels"] == ["agentops"]
+    pf = s.DISPATCH_DIR / ".presence" / f"{s.AGENT_ID}.json"
+    assert json.loads(pf.read_text())["channels"] == ["agentops"]
+
+
+def test_initial_channels_parsing(server_factory):
+    # Comma- or space-separated, leading '#' optional, deduped and sorted.
+    s = server_factory(extra_env={"MCP_DISPATCH_CHANNELS": "#ops, ops  agentops"})
+    assert s._PRESENCE_DATA["channels"] == ["agentops", "ops"]
+
+
+def test_initial_channels_skips_invalid(server_factory):
+    # Invalid ids are dropped (not fatal); valid ones survive so startup proceeds.
+    s = server_factory(extra_env={"MCP_DISPATCH_CHANNELS": "Good, bad/x, ok2"})
+    assert s._PRESENCE_DATA["channels"] == ["ok2"]
+
+
+def test_initial_channels_absent_is_empty(server_factory):
+    assert server_factory()._PRESENCE_DATA["channels"] == []
