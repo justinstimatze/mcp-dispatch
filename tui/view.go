@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -30,14 +31,48 @@ var (
 	composePrompt  = lipgloss.NewStyle().Background(lipgloss.Color("30")).Foreground(lipgloss.Color("231")).Bold(true).Padding(0, 1)
 )
 
-func hhmmss(ts string) string {
-	if i := strings.IndexByte(ts, 'T'); i >= 0 && strings.HasSuffix(ts, "Z") {
-		return ts[i+1 : len(ts)-1]
+// parseTS parses an RFC3339 timestamp (with or without fractional seconds) and
+// returns it in the viewer's local zone. ok is false when ts is empty or
+// unparseable, so callers can fall back rather than print garbage.
+func parseTS(ts string) (time.Time, bool) {
+	if ts == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t.Local(), true
+	}
+	return time.Time{}, false
+}
+
+// clockLocal renders a message timestamp as local wall-clock time at whole-second
+// precision (HH:MM:SS). Messages arrive in UTC (and from some senders carry
+// microseconds); showing raw UTC made the column read hours-off and ragged. On an
+// unparseable value it falls back to a best-effort raw time, dropping any date,
+// trailing Z, and fractional part.
+func clockLocal(ts string) string {
+	if t, ok := parseTS(ts); ok {
+		return t.Format("15:04:05")
+	}
+	if i := strings.IndexByte(ts, 'T'); i >= 0 {
+		s := strings.TrimSuffix(ts[i+1:], "Z")
+		if dot := strings.IndexByte(s, '.'); dot >= 0 {
+			s = s[:dot]
+		}
+		return s
 	}
 	if ts == "" {
 		return "--:--:--"
 	}
 	return ts
+}
+
+// dateLocal renders the local calendar day for a timestamp (used for day-change
+// dividers), or "" when unparseable so the caller simply omits the divider.
+func dateLocal(ts string) string {
+	if t, ok := parseTS(ts); ok {
+		return t.Format("Mon Jan 2 2006")
+	}
+	return ""
 }
 
 // formatMessage renders one message as a header line plus word-wrapped content.
@@ -62,7 +97,7 @@ func formatMessage(m Message, width int) string {
 	}
 	content := strings.ReplaceAll(m.Content, "\n", " ⏎ ")
 	head := fmt.Sprintf("%s  %s %s %s%s%s  ",
-		dimStyle.Render(hhmmss(m.Timestamp)),
+		dimStyle.Render(clockLocal(m.Timestamp)),
 		fromStyle.Render(m.From), arrow, toStyle.Render(m.To), flags, via)
 	if width <= 0 {
 		return head + content
