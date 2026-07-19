@@ -191,6 +191,7 @@ default_ttl = 604800
 | Variable | Description |
 |----------|-------------|
 | `MCP_DISPATCH_AGENT_ID` | Agent identity (required in dynamic mode) |
+| `MCP_DISPATCH_CHANNELS` | Channels to auto-subscribe on startup (comma/space separated, `#` optional) so standing rooms survive restarts without a manual `subscribe()` |
 | `MCP_DISPATCH_CONFIG` | Config file path (default: `~/.config/mcp-dispatch/config.toml`) |
 | `MCP_DISPATCH_DIR` | Override dispatch directory from config |
 

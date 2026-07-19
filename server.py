@@ -233,6 +233,29 @@ _PRESENCE_HANDLE = None
 _PRESENCE_DATA: dict = {}
 
 
+def _initial_channels() -> list[str]:
+    """Channels to auto-subscribe on startup, from MCP_DISPATCH_CHANNELS.
+
+    Comma- or space-separated; a leading '#' is optional. Invalid ids are
+    skipped with a warning rather than aborting startup. Lets a session rejoin
+    standing rooms (e.g. an ops channel) on every restart without a manual
+    subscribe() each time — the durable complement to ephemeral, presence-based
+    subscriptions.
+    """
+    out: list[str] = []
+    for tok in os.environ.get("MCP_DISPATCH_CHANNELS", "").replace(",", " ").split():
+        name = tok.lstrip("#")
+        if _ID_RE.match(name):
+            if name not in out:
+                out.append(name)
+        else:
+            print(
+                f"[dispatch] ignoring invalid channel {tok!r} in MCP_DISPATCH_CHANNELS",
+                file=sys.stderr,
+            )
+    return sorted(out)
+
+
 def _write_presence() -> None:
     """Persist _PRESENCE_DATA through the held, locked handle.
 
@@ -270,7 +293,7 @@ def _try_lock_presence(pf: Path, agent_id: str) -> bool:
         "agent_id": agent_id,
         "pid": os.getpid(),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "channels": [],
+        "channels": _initial_channels(),
     }
     _write_presence()
     return True
