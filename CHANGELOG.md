@@ -6,6 +6,17 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-18
+
+### Changed
+- `LICENSE` now lists both copyright holders — Sophia Labs (retained, as MIT
+  requires) and Justin Stimatze — reflecting the fork's mixed authorship.
+
+### Removed
+- The `SOPHIA_AGENT_ID` environment variable, a backward-compat alias for
+  `MCP_DISPATCH_AGENT_ID` inherited from the upstream. Set `MCP_DISPATCH_AGENT_ID`
+  instead.
+
 ## [0.8.0] - 2026-07-18
 
 ### Added
@@ -108,7 +119,8 @@ truth for versions.
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.6.0...v0.7.0

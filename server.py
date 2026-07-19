@@ -5,8 +5,8 @@ Each Claude Code window runs its own dispatch MCP server (stdio transport).
 They share a filesystem directory as a message relay.
 
 Agent identity:
-  Set MCP_DISPATCH_AGENT_ID=alpha (or SOPHIA_AGENT_ID for backward compat)
-  in the shell before launching Claude Code to pin a stable identity.
+  Set MCP_DISPATCH_AGENT_ID=alpha in the shell before launching Claude Code
+  to pin a stable identity.
   Without it, IDs are auto-claimed from the configured pool in startup order.
 
 Configuration:
@@ -279,17 +279,14 @@ def _try_lock_presence(pf: Path, agent_id: str) -> bool:
 def _claim_id() -> str:
     """Claim an agent ID.
 
-    If MCP_DISPATCH_AGENT_ID (or SOPHIA_AGENT_ID) is set, use that directly.
+    If MCP_DISPATCH_AGENT_ID is set, use that directly.
     Otherwise auto-claim the first available slot from the configured pool.
     In dynamic mode, the env var is required.
     """
     presence_dir = DISPATCH_DIR / ".presence"
 
     # Explicit identity via env var
-    explicit = (
-        os.environ.get("MCP_DISPATCH_AGENT_ID", "").strip().lower()
-        or os.environ.get("SOPHIA_AGENT_ID", "").strip().lower()
-    )
+    explicit = os.environ.get("MCP_DISPATCH_AGENT_ID", "").strip().lower()
 
     if explicit:
         _validate_id(explicit)
