@@ -236,15 +236,16 @@ _PRESENCE_DATA: dict = {}
 def _initial_channels() -> list[str]:
     """Channels to auto-subscribe on startup, from MCP_DISPATCH_CHANNELS.
 
-    Comma- or space-separated; a leading '#' is optional. Invalid ids are
-    skipped with a warning rather than aborting startup. Lets a session rejoin
-    standing rooms (e.g. an ops channel) on every restart without a manual
-    subscribe() each time — the durable complement to ephemeral, presence-based
-    subscriptions.
+    Comma- or space-separated; a leading '#' is optional. Names are lowercased
+    (matching MCP_DISPATCH_AGENT_ID) so `#Ops` joins `#ops` rather than being
+    dropped. Invalid ids are skipped with a warning rather than aborting startup.
+    Lets a session rejoin standing rooms (e.g. an ops channel) on every restart
+    without a manual subscribe() each time — the durable complement to ephemeral,
+    presence-based subscriptions.
     """
     out: list[str] = []
     for tok in os.environ.get("MCP_DISPATCH_CHANNELS", "").replace(",", " ").split():
-        name = tok.lstrip("#")
+        name = tok.lstrip("#").lower()
         if _ID_RE.match(name):
             if name not in out:
                 out.append(name)

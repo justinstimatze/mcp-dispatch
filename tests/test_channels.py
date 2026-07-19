@@ -120,9 +120,17 @@ def test_initial_channels_parsing(server_factory):
 
 
 def test_initial_channels_skips_invalid(server_factory):
-    # Invalid ids are dropped (not fatal); valid ones survive so startup proceeds.
-    s = server_factory(extra_env={"MCP_DISPATCH_CHANNELS": "Good, bad/x, ok2"})
+    # Structurally-invalid ids are dropped (not fatal); valid ones survive so
+    # startup proceeds. (Case alone is not invalid — see the normalize test.)
+    s = server_factory(extra_env={"MCP_DISPATCH_CHANNELS": "bad/x, ok2, ..trav"})
     assert s._PRESENCE_DATA["channels"] == ["ok2"]
+
+
+def test_initial_channels_lowercases(server_factory):
+    # Names are lowercased (like MCP_DISPATCH_AGENT_ID), so `#Ops` joins `#ops`
+    # rather than being dropped; a de-cased dup collapses.
+    s = server_factory(extra_env={"MCP_DISPATCH_CHANNELS": "#Ops, ops, AgentOps"})
+    assert s._PRESENCE_DATA["channels"] == ["agentops", "ops"]
 
 
 def test_initial_channels_absent_is_empty(server_factory):

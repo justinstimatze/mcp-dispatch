@@ -6,6 +6,19 @@ truth for versions.
 
 ## [Unreleased]
 
+### Added
+- `MCP_DISPATCH_CHANNELS` — auto-subscribe standing rooms on startup (#13, by
+  @fiorastudio). Comma/space-separated, leading `#` optional, deduped, sorted;
+  names are lowercased (matching `MCP_DISPATCH_AGENT_ID`) so `#Ops` joins `#ops`;
+  structurally-invalid ids are skipped with a warning rather than aborting.
+  Durable complement to the ephemeral, presence-based `subscribe()`.
+
+### Fixed
+- TUI renders message times in the viewer's local zone at whole-second precision
+  with per-day dividers (#12, by @fiorastudio), so the time-only column no longer
+  reads hours-off, ragged with stray microseconds, or out of order across the
+  UTC-midnight boundary.
+
 ## [0.8.1] - 2026-07-18
 
 ### Changed
