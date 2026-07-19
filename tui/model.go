@@ -363,9 +363,17 @@ func (m *model) refreshFeed() {
 	}
 	var b strings.Builder
 	shown := 0
+	prevDate := ""
 	for _, msg := range m.transcript {
 		if !match(msg) {
 			continue
+		}
+		// Insert a divider when the local calendar day changes, so time-only
+		// message stamps don't read out of order across a midnight boundary.
+		if d := dateLocal(msg.Timestamp); d != "" && d != prevDate {
+			b.WriteString(dimStyle.Render("──────── " + d + " ────────"))
+			b.WriteByte('\n')
+			prevDate = d
 		}
 		b.WriteString(formatMessage(msg, m.vp.Width))
 		b.WriteByte('\n')
