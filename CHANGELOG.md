@@ -6,6 +6,27 @@ truth for versions.
 
 ## [Unreleased]
 
+### Fixed
+- A post to a channel you subscribe to now wakes a parked session under
+  `notify_on = "direct"`. Fan-out already put a durable copy in each subscriber's
+  inbox, but the wake predicate matched only `to == my id` — and a channel
+  message's `to` is `#room`, so every subscriber's `dispatch-wait --follow` watch
+  silently dropped it. The sender saw it queued and stopped chasing; the message
+  was never read. Subscribing is the opt-in, so a subscribed room now counts as
+  addressed; broadcast (`all`) deliberately still does not.
+- Unread mail no longer dies with the session that was addressed. Dynamic-mode
+  ids are `<project>-<pid>`, so a restart is a new identity with an empty inbox
+  and the predecessor's `pending` messages rotted in a directory nobody would
+  open again. A successor now adopts them at startup (tagged `inherited_from`),
+  guarded to same project, dead presence lock, and same account. Opt out with
+  `inherit_inbox = false`; no effect in roster mode.
+
+### Changed
+- **Breaking:** `dispatch()` returns `queued_to` instead of `delivered_to`. The
+  old name conflated addressing with receipt — it only ever meant "written to
+  these inboxes." Whether anyone read it is `sent_receipts` in `peek()`, where a
+  message flips `pending` → `read`.
+
 ## [0.9.0] - 2026-07-18
 
 ### Added

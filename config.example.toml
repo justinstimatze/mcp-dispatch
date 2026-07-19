@@ -25,6 +25,14 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # Max message size in bytes.
 max_message_bytes = 65536
 
+# Adopt unread mail left behind by a dead session of the same project. Dynamic-mode
+# ids are <project>-<pid>, so a restart is a NEW id with an empty inbox — without
+# this, anything the old session never read rots unread in a directory nobody
+# opens again, while the sender's receipt still shows it queued. Only inherits
+# from a same-project id whose presence lock is gone and whose inbox belongs to
+# the same account. Default true; no effect in roster mode.
+# inherit_inbox = false
+
 # Default TTL in seconds. 0 = no expiry. must_read messages ignore it.
 # A week, so messages survive long-idle/parked sessions instead of expiring
 # unread. Time-sensitive sends should set a short ttl= explicitly.
@@ -40,7 +48,9 @@ default_ttl = 604800  # 7 days
 #
 # notify_on selects which messages count. must_read always pierces (except "none"):
 #   "none"      — never
-#   "direct"    — addressed to this agent (to == my id) — DMs, not channel/broadcast
+#   "direct"    — addressed to this agent: a DM (to == my id) OR a post to a
+#                 channel I subscribe to (subscribing is the opt-in). Broadcast
+#                 ("all") stays out — nobody opted into it.
 #   "important" — urgent priority (this default also fires on must_read)
 #   "all"       — everything
 # notify_on = "important"

@@ -61,7 +61,7 @@ def test_channel_send_reaches_only_subscribers(server, add_live):
     add_live(server, "beta", ["gemot"])
     add_live(server, "carol", [])
     sent = server._send("alpha", "#gemot", "channel hello")
-    assert sent["delivered_to"] == ["beta"]
+    assert sent["queued_to"] == ["beta"]
     assert any(m["content"] == "channel hello" for m in server._read_inbox("beta"))
     assert server._read_inbox("carol") == []
 
@@ -71,13 +71,13 @@ def test_channel_send_excludes_sender(server, add_live):
     server._set_subscription("gemot", True)
     add_live(server, "beta", ["gemot"])
     sent = server._send(server.AGENT_ID, "#gemot", "to the channel")
-    assert server.AGENT_ID not in sent["delivered_to"]
-    assert "beta" in sent["delivered_to"]
+    assert server.AGENT_ID not in sent["queued_to"]
+    assert "beta" in sent["queued_to"]
 
 
 def test_channel_send_with_no_subscribers_delivers_nothing(server):
     sent = server._send("alpha", "#empty", "into the void")
-    assert sent["delivered_to"] == []
+    assert sent["queued_to"] == []
 
 
 def test_dead_subscriber_is_skipped(server):
@@ -87,7 +87,7 @@ def test_dead_subscriber_is_skipped(server):
     (server.DISPATCH_DIR / "ghost").mkdir(exist_ok=True)
     pf.write_text(json.dumps({"agent_id": "ghost", "channels": ["gemot"]}))
     sent = server._send("alpha", "#gemot", "anyone there?")
-    assert "ghost" not in sent["delivered_to"]
+    assert "ghost" not in sent["queued_to"]
 
 
 def test_channel_name_validated(server):

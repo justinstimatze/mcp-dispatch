@@ -28,6 +28,7 @@ import atexit
 import fcntl
 import json
 import os
+import re
 import shlex
 import signal
 import stat
@@ -83,10 +84,15 @@ _DEFAULT_CONFIG = {
     "notify_command": "",
     # Which messages notify. must_read always pierces (except "none"):
     #   "none"      — never
-    #   "direct"    — messages addressed to this agent (to == my id)
+    #   "direct"    — addressed to this agent: a DM (to == my id) or a post to a
+    #                 channel I subscribe to. Broadcast ("all") excluded.
     #   "important" — urgent priority (this default also fires on must_read)
     #   "all"       — everything
     "notify_on": "important",
+    # Adopt unread mail left behind by a dead session of the same project. Ids are
+    # <project>-<pid>, so a restart is a NEW id with an empty inbox and the old
+    # one's pending messages would otherwise rot unread forever. Dynamic mode only.
+    "inherit_inbox": True,
 }
 
 
@@ -142,6 +148,7 @@ DEFAULT_TTL = int(CONFIG["default_ttl"])
 DYNAMIC_MODE = len(AGENT_IDS) == 0  # no roster = accept any agent name
 NOTIFY_COMMAND = str(CONFIG["notify_command"]).strip()
 NOTIFY_ON = str(CONFIG["notify_on"]).strip().lower()
+INHERIT_INBOX = bool(CONFIG["inherit_inbox"])
 NOTIFY_POLL_SECONDS = 4
 GROUP_MODE = bool(CONFIG["group_mode"])
 # Directory mode: setgid + group-rwx when sharing, else owner-only. The setgid
@@ -426,6 +433,66 @@ def _reap_empty_inboxes() -> int:
     return removed
 
 
+def _inherit_orphan_inbox(agent_id: str) -> int:
+    """Adopt pending mail from dead same-project inboxes. Returns count moved.
+
+    A dynamic-mode id is ``<project>-<pid>``, so every restart is a *new* identity
+    with an empty inbox — and anything the previous session never got to read stays
+    `pending` in a directory nobody will ever open again. The sender sees it queued
+    and stops chasing; the message is simply lost. This makes a successor session
+    the heir to its predecessor's unread mail.
+
+    Deliberately narrow, because adopting someone else's inbox is a serious act:
+      - dynamic mode only (a roster id keeps its identity across restarts, so its
+        inbox is not orphaned — it's waiting for the same agent to come back);
+      - same ``<project>-`` prefix and a numeric pid suffix, so unrelated agents
+        never inherit from each other;
+      - the donor must hold no presence lock (a live peer is not a corpse);
+      - same uid, so group_mode can't siphon another account's mail.
+
+    Claiming is the rename, not the read: two successors racing the same corpse
+    both see the file, but only one os.replace() succeeds, so a message is adopted
+    exactly once rather than duplicated.
+    """
+    if AGENT_IDS or not INHERIT_INBOX:
+        return 0
+    m = re.match(r"^(?P<base>.+)-\d+$", agent_id)
+    if not m:
+        return 0
+    sibling = re.compile(rf"^{re.escape(m.group('base'))}-\d+$")
+    mine = DISPATCH_DIR / agent_id
+    moved = 0
+    for d in sorted(DISPATCH_DIR.iterdir()):
+        if not d.is_dir() or d.name == agent_id or not sibling.match(d.name):
+            continue
+        pf = DISPATCH_DIR / ".presence" / f"{d.name}.json"
+        if pf.exists() and _presence_is_live(pf):
+            continue  # live peer, not a corpse
+        try:
+            if d.stat().st_uid != os.getuid():
+                continue  # another account's mail (group_mode)
+        except OSError:
+            continue
+        for f in sorted(d.glob("*.json")):
+            try:
+                msg = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if msg.get("state", "pending") != "pending":
+                continue
+            dest = mine / f.name
+            try:
+                os.replace(f, dest)  # atomic claim; loser of a race gets ENOENT
+            except OSError:
+                continue
+            # Tag provenance only after the claim succeeded, so a crash mid-rewrite
+            # leaves the message readable in its new inbox rather than half-moved.
+            msg["_inherited_from"] = d.name
+            _atomic_write(dest, msg)
+            moved += 1
+    return moved
+
+
 # ---------------------------------------------------------------------------
 # Message I/O
 # ---------------------------------------------------------------------------
@@ -577,7 +644,12 @@ def _send(
         delivered = [to]
 
     result: dict = dict(msg)
-    result["delivered_to"] = delivered
+    # `queued_to`, not `delivered_to`: this is the set of inboxes written, i.e.
+    # addressing — not receipt. Whether a recipient ever *reads* it shows up later
+    # as the message's state flipping pending → read, which peek() surfaces to the
+    # sender as sent_receipts. Conflating the two is how a channel post can look
+    # landed while nobody has seen it.
+    result["queued_to"] = delivered
     return result
 
 
@@ -655,6 +727,10 @@ def _public_msg(m: dict) -> dict:
     clean = {k: v for k, v in m.items() if not k.startswith("_")}
     if m.get("_via") == "git":
         clean["via"] = "remote"
+    # Adopted from a dead predecessor session: it was addressed to an id that no
+    # longer exists, so say so rather than let it look like fresh mail to me.
+    if m.get("_inherited_from"):
+        clean["inherited_from"] = m["_inherited_from"]
     return clean
 
 
@@ -680,7 +756,9 @@ def _with_pending(result: dict) -> dict:
 def _should_notify(msg: dict) -> bool:
     # Delegates to the shared predicate (notify_policy.py) so the OS-notification
     # poll here and the bin/dispatch-wait model-wake long-poll apply identical rules.
-    return should_notify(msg, NOTIFY_ON, AGENT_ID)
+    # Channels come from the live in-memory record; the waiter re-reads the same
+    # field off the presence file, so both see the same subscription set.
+    return should_notify(msg, NOTIFY_ON, AGENT_ID, _PRESENCE_DATA.get("channels", []))
 
 
 def _notify(msg: dict) -> None:
@@ -786,6 +864,15 @@ _reap_empty_inboxes()  # GC empty inbox dirs left by exited dynamic-mode agents
 AGENT_ID = _claim_id()
 print(f"[dispatch] I am {AGENT_ID} (PID {os.getpid()})", file=sys.stderr)
 
+# Before the watcher starts, so inherited mail rides the normal arrival path.
+_inherited = _inherit_orphan_inbox(AGENT_ID)
+if _inherited:
+    print(
+        f"[dispatch] adopted {_inherited} unread message(s) from a dead session "
+        f"of this project — peek() to read them",
+        file=sys.stderr,
+    )
+
 atexit.register(lambda: _release_id(AGENT_ID))
 
 
@@ -846,7 +933,9 @@ mcp = FastMCP("dispatch", instructions=_instructions)
         "payload carries structured data (dict), "
         "ttl sets expiry in seconds, "
         "must_read=true prevents auto-expiry. "
-        "Returns confirmation (incl. delivered_to) plus any pending messages for you."
+        "Returns queued_to — the inboxes written, which is addressing, NOT receipt. "
+        "Confirm a message was actually read via peek()'s sent_receipts (state: "
+        "pending vs read). Plus any pending messages for you."
     ),
 )
 def dispatch_tool(
@@ -877,7 +966,7 @@ def dispatch_tool(
             "id": sent["id"],
             "from": AGENT_ID,
             "to": target,
-            "delivered_to": sent.get("delivered_to", []),
+            "queued_to": sent.get("queued_to", []),
             "priority": priority,
             "thread_id": sent.get("thread_id"),
         }

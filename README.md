@@ -134,8 +134,11 @@ dispatch(
 )
 ```
 
-The response includes `delivered_to` — the list of agents the message actually
-reached (empty for a channel with no current subscribers).
+The response includes `queued_to` — the inboxes the message was written to
+(empty for a channel with no current subscribers). That is *addressing, not
+receipt*: it says the message is durably waiting, not that anyone has looked at
+it. To confirm it was read, check `sent_receipts` in your next `peek()` — a
+recipient flips the message from `pending` to `read` when they read it.
 
 ### channels
 
@@ -147,6 +150,10 @@ unsubscribe("#deploys")            # leave
 
 Channels are presence-derived and ephemeral: a subscription lives only as long
 as the session, and a channel send reaches whoever is subscribed *right now*.
+Fan-out happens at send time, so each subscriber gets a durable copy in its own
+inbox — and under `notify_on = "direct"` a post to a subscribed channel wakes a
+parked session exactly like a DM does. (Set `MCP_DISPATCH_CHANNELS` to rejoin
+standing rooms automatically on every restart.)
 
 ### peek
 
@@ -228,7 +235,8 @@ can't wake itself. But the server process stays alive, so it can alert **you**.
 Set `notify_command` (e.g. `notify-send` on GNOME) and the server shells out to
 it when a message arrives, even with the model idle — no Python dependency, no
 polling of the model. `notify_on` controls which messages alert: `direct`
-(addressed to this agent), `important` (urgent priority), `all`, or `none`;
+(addressed to this agent — a DM, or a post to a channel it subscribes to),
+`important` (urgent priority), `all`, or `none`;
 `must_read` always pierces except under `none`. Meanwhile `must_read` guarantees
 the message itself waits until that session next takes a turn and acks it. See
 `config.example.toml`.

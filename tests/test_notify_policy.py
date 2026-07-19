@@ -26,12 +26,29 @@ def test_all_always_notifies():
     assert should_notify(CHANNEL, "all", "alpha")
 
 
-def test_direct_wakes_on_dm_only():
+def test_direct_wakes_on_dm_and_not_broadcast():
     assert should_notify(DM, "direct", "alpha")
     assert not should_notify(BROADCAST, "direct", "alpha")
-    assert not should_notify(CHANNEL, "direct", "alpha")
     # A DM addressed to someone else is not mine.
     assert not should_notify({"to": "beta"}, "direct", "alpha")
+
+
+def test_direct_wakes_on_a_subscribed_channel():
+    # Subscribing IS the opt-in, so a post to a room I joined is "addressed to me".
+    assert should_notify(CHANNEL, "direct", "alpha", ["eng"])
+    assert should_notify(CHANNEL, "direct", "alpha", ["ops", "eng"])
+
+
+def test_direct_ignores_channels_i_did_not_join():
+    assert not should_notify(CHANNEL, "direct", "alpha", ["ops"])
+    # No channels supplied at all (e.g. an unreadable presence file) fails closed.
+    assert not should_notify(CHANNEL, "direct", "alpha")
+    assert not should_notify(CHANNEL, "direct", "alpha", [])
+
+
+def test_subscribed_channel_does_not_leak_into_broadcast():
+    # "all" is not a room anyone joined — a subscription must not make it wake.
+    assert not should_notify(BROADCAST, "direct", "alpha", ["eng", "all"])
 
 
 def test_direct_does_not_filter_dms_by_priority():

@@ -72,7 +72,7 @@ def test_broadcast_targets_only_live_agents(server):
     _make_presence(server, "ghost")  # dead
     try:
         sent = server._send("alpha", "all", "hello everyone")
-        assert "beta" in sent["delivered_to"]
-        assert "ghost" not in sent["delivered_to"]
+        assert "beta" in sent["queued_to"]
+        assert "ghost" not in sent["queued_to"]
     finally:
         fh.close()

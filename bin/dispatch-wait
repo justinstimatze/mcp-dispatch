@@ -107,6 +107,21 @@ def _resolve_agent_id(dispatch_dir: Path) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _my_channels(dispatch_dir: Path, agent_id: str) -> list[str]:
+    """This agent's current channel subscriptions, from its presence record.
+
+    Re-read on every poll rather than cached at launch: subscribe()/unsubscribe()
+    rewrite the presence file mid-session, and a watch that cached the startup set
+    would go deaf to a room joined afterwards (or keep waking on a left one).
+    """
+    pf = dispatch_dir / ".presence" / f"{agent_id}.json"
+    try:
+        chans = json.loads(pf.read_text()).get("channels", [])
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [c for c in chans if isinstance(c, str)]
+
+
 def _expired(msg: dict) -> bool:
     ttl = msg.get("ttl")
     if not ttl or ttl <= 0 or msg.get("must_read"):
@@ -121,6 +136,7 @@ def _expired(msg: dict) -> bool:
 def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]:
     """Unread, unexpired messages in this agent's inbox that the policy notifies on."""
     inbox = dispatch_dir / agent_id
+    channels = _my_channels(dispatch_dir, agent_id)
     out = []
     for f in sorted(inbox.glob("*.json")):
         try:
@@ -129,7 +145,7 @@ def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]
             continue
         if msg.get("state", "pending") != "pending" or _expired(msg):
             continue
-        if should_notify(msg, notify_on, agent_id):
+        if should_notify(msg, notify_on, agent_id, channels):
             out.append(msg)
     return out
 

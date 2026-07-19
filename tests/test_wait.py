@@ -49,11 +49,11 @@ def _dirs(tmp_path, agent="alice"):
     return dispatch_dir, state_dir
 
 
-def _hold_presence(dispatch_dir, agent="alice"):
+def _hold_presence(dispatch_dir, agent="alice", channels=()):
     pres = dispatch_dir / ".presence"
     pres.mkdir(parents=True, exist_ok=True)
     pf = pres / f"{agent}.json"
-    pf.write_text(json.dumps({"agent_id": agent, "channels": []}))
+    pf.write_text(json.dumps({"agent_id": agent, "channels": list(channels)}))
     fh = open(pf, "a+")
     fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # simulate the live server
     return fh
@@ -154,6 +154,45 @@ def test_follow_streams_each_message_without_rearming(tmp_path):
             proc.kill()
         if not holder.closed:
             holder.close()
+
+
+def test_follow_wakes_on_a_subscribed_channel_post(tmp_path):
+    """The regression this whole path exists for: a channel post is fanned out to
+    the subscriber's inbox as a normal file, but its `to` is '#eng', not the agent
+    id — so under notify_on="direct" the waiter used to silently drop it. The
+    sender saw it queued and stopped chasing; the message was never seen. The
+    subscription in the presence record is what makes it count as addressed."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir, channels=["eng"])
+    proc = _launch(
+        dispatch_dir, state_dir, "--follow", agent="alice", MCP_DISPATCH_NOTIFY_ON="direct"
+    )
+    try:
+        _write_msg(dispatch_dir, "alice", to="#eng", content="room ping", mid="c1")
+        line = _readline(proc, 4)
+        assert "c1" in line and "room ping" in line
+    finally:
+        proc.kill()
+        holder.close()
+
+
+def test_follow_ignores_a_channel_i_did_not_join(tmp_path):
+    """Symmetric guard: a stray file for a room this agent never joined must not
+    wake it, or 'direct' degenerates into 'all'."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir, channels=["ops"])
+    proc = _launch(
+        dispatch_dir, state_dir, "--follow", agent="alice", MCP_DISPATCH_NOTIFY_ON="direct"
+    )
+    try:
+        _write_msg(dispatch_dir, "alice", to="#eng", content="not my room", mid="c2")
+        assert _readline(proc, 1.5) == ""  # stayed silent
+        # ...and the watch is still healthy, not just dead.
+        _write_msg(dispatch_dir, "alice", to="alice", content="dm though", mid="c3")
+        assert "c3" in _readline(proc, 4)
+    finally:
+        proc.kill()
+        holder.close()
 
 
 def test_follow_marks_remote_provenance(tmp_path):
