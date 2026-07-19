@@ -1,10 +1,15 @@
-.PHONY: test test-ci lint typecheck security quality
+.PHONY: install test test-ci lint typecheck security quality
 
 PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_policy.py \
-	dispatch_common.py tests/ \
+	dispatch_common.py install.py tests/ \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
 	bin/dispatch-status bin/dispatch-tail bin/dispatch-wait bin/dispatch-gitsync \
 	scripts/
+
+# One-command setup: sync deps, register the MCP server, wire the hooks.
+# Idempotent — safe to re-run. `make install ARGS=--dry-run` to preview.
+install:
+	python3 install.py $(ARGS)
 
 test:
 	uv run pytest -q

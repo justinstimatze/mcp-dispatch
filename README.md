@@ -22,13 +22,35 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 
 ## Quick Start
 
-### 1. Install
-
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/sophia-labs/mcp-dispatch.git
+git clone https://github.com/justinstimatze/mcp-dispatch.git
 cd mcp-dispatch
+python3 install.py        # sync deps, register the server, wire the hooks
+```
+
+`install.py` does the whole setup in one shot — it syncs dependencies, registers
+the MCP server with Claude Code (`claude mcp add`), and wires the SessionStart /
+Stop hooks that arm the wake-watcher and keep the cross-host git daemon running.
+It's **idempotent** (re-run any time; it only adds what's missing) and writes a
+backup of `~/.claude/settings.json` before touching it. Preview without writing:
+
+```bash
+python3 install.py --dry-run
+```
+
+Then restart your Claude Code sessions so the new config loads, and jump to
+[Send messages](#3-send-messages). The manual steps below are what the installer
+automates — read them if you want to wire things by hand or understand what it
+did.
+
+<details>
+<summary>Manual setup (what <code>install.py</code> automates)</summary>
+
+### 1. Install
+
+```bash
 uv sync
 ```
 
@@ -72,8 +94,10 @@ a `<project>-<pid>` id from the working directory:
 }
 ```
 
-A session started in `~/Documents/gemot` then becomes agent `gemot-<pid>`. An
+A session started in `~/code/webapp` then becomes agent `webapp-<pid>`. An
 explicit `MCP_DISPATCH_AGENT_ID` always wins.
+
+</details>
 
 ### 3. Send messages
 
@@ -410,6 +434,24 @@ The canonical Go implementation is [`leat`](https://github.com/justinstimatze/le
 Cross-host **channel** membership currently relies on a local subscriber to carry
 a post onto git (shared presence across hosts is a later step); **DMs** bridge
 unconditionally.
+
+### Cross-host agents can't hear each other?
+
+Almost always the git daemon isn't running on one host — messages get written to
+a local inbox nobody bridges, so both sides look like they're talking to a wall.
+Check it:
+
+```bash
+bin/dispatch-gitsync status     # running? repo, lane count, who's reachable
+bin/dispatch-gitsync --once     # force one sync pass and print what moved
+```
+
+The daemon is presence-gated (it exits when no agent is live on the host), so it
+must be **restarted** each time the host goes quiet and comes back. That restart
+is what the `dispatch-gitsync-arm.py` SessionStart/Stop hook automates — if you
+wired the repo up before `install.py` existed, re-run `python3 install.py` to add
+it, then start a fresh session. Without the hook you'd have to relaunch the daemon
+by hand after every quiet period, which is the usual cause of this.
 
 ## Security
 

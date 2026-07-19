@@ -7,7 +7,7 @@
 #
 #   "dispatch": { "command": "/abs/path/to/mcp-dispatch/bin/dispatch-launcher" }
 #
-# A session started in ~/Documents/gemot then becomes agent "gemot-<pid>".
+# A session started in ~/code/webapp then becomes agent "webapp-<pid>".
 # An explicit MCP_DISPATCH_AGENT_ID in the environment always wins.
 set -euo pipefail
 
