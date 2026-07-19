@@ -1,6 +1,6 @@
 [project]
 name = "mcp-dispatch"
-version = "0.7.1"
+version = "0.8.0"
 description = "Local-first inter-agent messaging for AI coding agents via MCP, with an optional git transport for cross-host comms"
 requires-python = ">=3.11"
 dependencies = [
