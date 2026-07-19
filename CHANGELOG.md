@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-18
+
 ### Added
 - `MCP_DISPATCH_CHANNELS` — auto-subscribe standing rooms on startup (#13, by
   @fiorastudio). Comma/space-separated, leading `#` optional, deduped, sorted;
@@ -132,7 +134,8 @@ truth for versions.
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.7.0...v0.7.1
