@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-19
+
 ### Fixed
 - A post to a channel you subscribe to now wakes a parked session under
   `notify_on = "direct"`. Fan-out already put a durable copy in each subscriber's
@@ -155,7 +157,8 @@ truth for versions.
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.7.1...v0.8.0
