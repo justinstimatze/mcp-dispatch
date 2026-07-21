@@ -429,11 +429,22 @@ Presence gating compounds it: presence is claimed by the mcp-dispatch **MCP
 server**, so a hand-started daemon also self-terminates after ~60s if nothing else
 on the host is holding a presence lock.
 
-Put the daemon under your own init instead — one command, harness-agnostic:
+Put the daemon under your own init instead. **On a host that isn't running Claude
+Code, this is the entire setup — one idempotent command, safe to re-run:**
+
+```bash
+dispatch-gitsync init git@github.com:you/agent-bus.git --service
+```
+
+It clones (or reuses) the bus, seeds it, writes the `[git]` config, then installs
+and starts the service. Re-running it is also the upgrade path — an existing clone
+is reused, an existing `[git]` block is left alone, and the unit is regenerated
+from current config. Add `--dry-run` to see the plan first. If the bus is already
+configured, just the second half:
 
 ```bash
 dispatch-gitsync service install      # systemd user unit, enabled + started
-python3 install.py --service          # ...or as part of the normal installer
+python3 install.py --service          # ...or as part of the Claude Code installer
 ```
 
 That writes `~/.config/systemd/user/mcp-dispatch-gitsync.service` running the

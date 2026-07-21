@@ -13,6 +13,7 @@ dispatch(). All git knowledge lives here, not in the server.
 
     dispatch-gitsync init <url|slug|path>  # create/clone + seed + write [git] config
     dispatch-gitsync init --create owner/agent-bus   # gh-create a PRIVATE repo first
+    dispatch-gitsync init <repo> --service # ...and run it as a service: whole setup
     dispatch-gitsync service install       # run it as a systemd user service
     dispatch-gitsync status                # is it running? repo, lanes, who's reachable
 
@@ -47,15 +48,30 @@ import dispatch_fs  # noqa: E402
 import gitsync_service  # noqa: E402
 from git_bridge import GitBridge  # noqa: E402
 
+def _float_env(name: str, default: float) -> float:
+    """Parse a float from the environment, falling back on anything unparseable.
+    Raising here would happen at *import*, so a typo in a test-only knob would
+    traceback every subcommand — `status` and `init` don't even use this."""
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
 # Exit if no agent ever appears (standalone safety). Env-overridable so the tests
 # don't have to sit through a real minute — same idiom as dispatch-wait's
 # MCP_DISPATCH_STANDALONE_FALLBACK.
-STARTUP_GRACE_SECONDS = float(os.environ.get("MCP_DISPATCH_GITSYNC_GRACE") or 60.0)
+STARTUP_GRACE_SECONDS = _float_env("MCP_DISPATCH_GITSYNC_GRACE", 60.0)
 
 # Ungated (service) mode only: how long a failing sync backs off to, so a broken
 # remote — expired token, dead network — is retried patiently instead of being
 # hammered every `interval` seconds for as long as the machine is up.
 MAX_BACKOFF_SECONDS = 60.0
+# ...and the exponent is capped, because `failures` counts consecutive bad ticks
+# forever: `interval * 2**failures` overflows float once failures passes ~1024
+# (about 17h of a broken remote at the cap above), taking the daemon down with an
+# OverflowError. 2**8 already exceeds any sane cap, so clamping costs nothing.
+MAX_BACKOFF_SHIFT = 8
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +96,19 @@ def _config_path() -> Path:
 def _host_lock_path(dispatch_dir: Path) -> Path:
     """One daemon per DISPATCH_DIR — the lock key is the dir, not an agent id."""
     return common.state_dir() / f"gitsync-{common.md5_key(str(dispatch_dir))}.lock"
+
+
+def _backoff_delay(failures: int, interval: float) -> float:
+    """Seconds to sleep after `failures` consecutive failed sync passes.
+
+    Exponential from `interval` up to MAX_BACKOFF_SECONDS, with the exponent
+    clamped: `failures` counts bad ticks for the process's whole life, and an
+    unclamped `2**failures` overflows float past ~1024 — roughly 17h against a
+    remote whose token expired — killing the daemon with an OverflowError.
+    """
+    if failures <= 0:
+        return interval
+    return min(interval * (2 ** min(failures, MAX_BACKOFF_SHIFT)), MAX_BACKOFF_SECONDS)
 
 
 def _presence_gate(cli: bool | None, git: dict) -> bool:
@@ -179,6 +208,22 @@ def cmd_init(argv: list[str]) -> int:
     ap.add_argument("--create", action="store_true", help="gh repo create the slug PRIVATE first")
     ap.add_argument("--repo-dir", default=None, help="clone dest (default ~/.config/.../bus)")
     ap.add_argument("--remote", default="origin", help="git remote name (default origin)")
+    ap.add_argument(
+        "--service",
+        action="store_true",
+        help="also install the systemd user service, so the bridge runs without a "
+        "Claude Code hook. Makes this the ONE command a new host needs.",
+    )
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="passed through to `service install` (e.g. SSH_AUTH_SOCK)",
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true", help="with --service: plan the unit, install nothing"
+    )
     args = ap.parse_args(argv)
 
     repo_dir = Path(os.path.expanduser(args.repo_dir or "~/.config/mcp-dispatch/bus"))
@@ -218,7 +263,18 @@ def cmd_init(argv: list[str]) -> int:
 
     _write_git_config(repo_dir, args.remote)
     print(f"[gitsync] ready. repo_dir={repo_dir} remote={args.remote}")
+    if args.service:
+        # Same process, so `service` reads the config `_write_git_config` just
+        # wrote. Both halves are idempotent (an existing clone is reused, an
+        # existing [git] block is left alone, the unit is regenerated), which makes
+        # the whole command safe to re-run — it is also how you upgrade.
+        print("[gitsync] installing the systemd user service…")
+        forwarded = ["install", *(f"--env={e}" for e in args.env)]
+        if args.dry_run:
+            forwarded.append("--dry-run")
+        return cmd_service(forwarded)
     print("[gitsync] run it with:  dispatch-gitsync   (or enable hooks/dispatch-gitsync-arm.py).")
+    print("[gitsync] not on Claude Code? re-run this with --service to run it as a daemon.")
     return 0
 
 
@@ -468,7 +524,7 @@ def cmd_run(argv: list[str]) -> int:
             # token, no network) isn't retried every 2s for the machine's uptime,
             # then snap back to `interval` the moment a pass succeeds.
             failures = 0 if ok else failures + 1
-            time.sleep(min(interval * (2**failures), MAX_BACKOFF_SECONDS) if failures else interval)
+            time.sleep(_backoff_delay(failures, interval))
     except KeyboardInterrupt:
         return 0
 

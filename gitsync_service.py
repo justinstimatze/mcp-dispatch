@@ -126,7 +126,12 @@ def render_unit(
         "PYTHONUNBUFFERED": "1",
         **(env or {}),
     }
-    env_lines = "\n".join(f"Environment={_esc(k)}={_esc(v)}" for k, v in environment.items())
+    # Each assignment is quoted as a whole. systemd unquotes an Environment= line
+    # into a *list* of assignments split on whitespace, so an unquoted value with a
+    # space (a config at "~/my dispatch/config.toml") silently truncates to the
+    # first word and appends junk — the daemon then resolves a different relay than
+    # the CLI just did. Same class of bug as the ExecStart quoting below.
+    env_lines = "\n".join(f"Environment={_quote_arg(f'{k}={v}')}" for k, v in environment.items())
 
     # Only the three trees the daemon actually writes. Listed even under
     # ProtectSystem=full (which leaves $HOME writable) so tightening to `strict`
@@ -215,18 +220,20 @@ def install(unit_text: str, *, enable: bool = True, dry_run: bool = False) -> li
     it again is exactly how you *upgrade* an existing install — the unit is
     rewritten from current config and the daemon restarted onto it."""
     path = unit_path()
+    if not systemctl_available():
+        # Checked before the dry-run branch too: a dry run exists to tell you what
+        # WILL happen, and reporting a plan that can't run says the opposite.
+        raise ServiceError(
+            "no systemd user session here. Run the daemon under whatever supervisor "
+            "you do have (launchd, supervisord, tmux) with:  "
+            "bin/dispatch-gitsync --no-presence-gate"
+        )
     steps = [f"write {path}"]
     if dry_run:
         return steps + (
             ["systemctl --user daemon-reload", f"enable --now {UNIT_NAME}"] if enable else []
         )
 
-    if not systemctl_available():
-        raise ServiceError(
-            "no systemd user session here. Run the daemon under whatever supervisor "
-            "you do have (launchd, supervisord, tmux) with:  "
-            "bin/dispatch-gitsync --no-presence-gate"
-        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(unit_text)
     path.chmod(0o600)  # may carry an auth token in Environment=
@@ -234,6 +241,12 @@ def install(unit_text: str, *, enable: bool = True, dry_run: bool = False) -> li
     steps.append("systemctl --user daemon-reload")
     if enable:
         _systemctl("enable", UNIT_NAME, check=True)
+        # Clear a latched start limit FIRST. Once a unit trips StartLimitBurst it
+        # stays `failed` and every restart returns "Start request repeated too
+        # quickly" — so re-installing, which is both the upgrade path and the
+        # obvious thing to try when the service is crash-looping, would fail
+        # exactly when it's needed most. No-op on a healthy unit.
+        _systemctl("reset-failed", UNIT_NAME)
         # restart, not start: an upgrade must land the running process on the new unit.
         _systemctl("restart", UNIT_NAME, check=True)
         steps += [f"systemctl --user enable {UNIT_NAME}", f"systemctl --user restart {UNIT_NAME}"]

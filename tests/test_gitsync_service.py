@@ -13,9 +13,11 @@ the grace shrunk via MCP_DISPATCH_GITSYNC_GRACE.
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 import time
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,15 @@ import dispatch_common as common  # noqa: E402
 import gitsync_service as svc  # noqa: E402
 
 GITSYNC = REPO_ROOT / "bin" / "dispatch-gitsync"
+
+
+def _gitsync_module():
+    """Load the extensionless bin script as a module (same idiom as test_tail)."""
+    loader = SourceFileLoader("dispatch_gitsync", str(GITSYNC))
+    spec = importlib.util.spec_from_loader("dispatch_gitsync", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def _unit(**over) -> str:
@@ -58,12 +69,20 @@ def test_unit_runs_the_daemon_ungated():
 def test_config_path_is_baked_in():
     """A user service inherits almost nothing from the login shell, so an ambient
     MCP_DISPATCH_CONFIG would silently resolve a different relay than the CLI did."""
-    assert "Environment=MCP_DISPATCH_CONFIG=/home/a/.config/mcp-dispatch/config.toml" in _unit()
+    assert 'Environment="MCP_DISPATCH_CONFIG=/home/a/.config/mcp-dispatch/config.toml"' in _unit()
+
+
+def test_env_values_with_spaces_survive():
+    """systemd unquotes an Environment= line into a *list* of assignments split on
+    whitespace, so an unquoted path with a space truncates to its first word and
+    the daemon silently resolves a different relay than the CLI just did."""
+    text = _unit(config_path=Path("/home/a/my dispatch/config.toml"))
+    assert 'Environment="MCP_DISPATCH_CONFIG=/home/a/my dispatch/config.toml"' in text
 
 
 def test_extra_env_is_emitted_and_validated():
     text = _unit(env={"SSH_AUTH_SOCK": "/run/user/1000/keyring/ssh"})
-    assert "Environment=SSH_AUTH_SOCK=/run/user/1000/keyring/ssh" in text
+    assert 'Environment="SSH_AUTH_SOCK=/run/user/1000/keyring/ssh"' in text
     assert svc.validate_env(["A=1", "B_2=x=y"]) == {"A": "1", "B_2": "x=y"}
     for bad in ["novalue", "2BAD=x", "has space=x", "A\nB=x"]:
         with pytest.raises(svc.ServiceError):
@@ -255,6 +274,40 @@ def test_cli_flag_overrides_config(tmp_path):
     assert "startup grace" in out
 
 
+# ── failure backoff ──────────────────────────────────────────────────────────
+
+
+def test_backoff_escalates_then_caps():
+    gs = _gitsync_module()
+    assert gs._backoff_delay(0, 2.0) == 2.0  # healthy: plain interval
+    assert gs._backoff_delay(1, 2.0) == 4.0
+    assert gs._backoff_delay(2, 2.0) == 8.0
+    assert gs._backoff_delay(99, 2.0) == gs.MAX_BACKOFF_SECONDS
+
+
+def test_backoff_survives_a_very_long_outage():
+    """The bug this guards: `failures` counts bad ticks for the process's whole
+    life, so an unclamped 2**failures overflows float past ~1024 — about 17h
+    against an expired token — and takes the daemon down with an OverflowError."""
+    gs = _gitsync_module()
+    for failures in (1_024, 10_000, 10**6):
+        assert gs._backoff_delay(failures, 2.0) == gs.MAX_BACKOFF_SECONDS
+
+
+def test_bad_grace_env_does_not_break_the_cli():
+    """Parsing this at import means a typo would traceback `status` and `init`,
+    which never even use the grace."""
+    gs = _gitsync_module()
+    assert gs._float_env("MCP_DISPATCH_GITSYNC_GRACE", 60.0) in (60.0, 0.5)
+    import os as _os
+
+    _os.environ["MCP_DISPATCH_GITSYNC_GRACE"] = "60 seconds"
+    try:
+        assert gs._float_env("MCP_DISPATCH_GITSYNC_GRACE", 60.0) == 60.0
+    finally:
+        _os.environ.pop("MCP_DISPATCH_GITSYNC_GRACE", None)
+
+
 # ── the `service` subcommand ─────────────────────────────────────────────────
 
 
@@ -293,12 +346,56 @@ def test_service_refuses_without_a_clone(tmp_path):
     assert "init" in r.stdout
 
 
+@pytest.mark.skipif(
+    not svc.systemctl_available(), reason="no systemd user session (install refuses, by design)"
+)
 def test_service_dry_run_writes_nothing(tmp_path):
     _, _, cfg = _bus(tmp_path)
     r = _service(cfg, "install", "--dry-run", home=tmp_path)
     assert r.returncode == 0
     assert "would write" in r.stdout
     assert not (tmp_path / ".config" / "systemd").exists()
+
+
+def test_init_service_is_one_command_and_rerunnable(tmp_path):
+    """The whole setup for a host that isn't running Claude Code. Both halves are
+    idempotent, so re-running it is also the upgrade path — the failure this
+    guards is `init` not seeing the [git] config it just wrote."""
+    bus = tmp_path / "bus"
+    bus.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(bus)], check=True)
+    (tmp_path / "messages").mkdir()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'dispatch_dir = "{tmp_path / "messages"}"\n')
+
+    def once():
+        return subprocess.run(
+            # --dry-run so this exercises the plumbing without touching the real
+            # user manager of whatever machine the suite runs on.
+            [sys.executable, str(GITSYNC), "init", str(bus), "--service", "--dry-run"],
+            capture_output=True,
+            text=True,
+            env={"MCP_DISPATCH_CONFIG": str(cfg), "HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        )
+
+    first = once()
+    assert "using existing clone" in first.stdout
+    assert "installing the systemd user service" in first.stdout
+    # The config `init` wrote must be visible to the `service` half in the SAME run.
+    assert "no git clone configured" not in first.stdout
+    assert "[git]" in cfg.read_text()
+
+    second = once()  # idempotent: no clobbered config, no duplicate [git] block
+    assert cfg.read_text().count("[git]") == 1
+    assert "already has a [git] section" in second.stdout
+
+
+def test_dry_run_refuses_without_systemd(tmp_path, monkeypatch):
+    """A dry run exists to say what WILL happen. Reporting a plan that can't run
+    (macOS, a container with no user manager) says the opposite."""
+    monkeypatch.setattr(svc, "systemctl_available", lambda: False)
+    with pytest.raises(svc.ServiceError):
+        svc.install("[Service]\n", dry_run=True)
 
 
 def test_config_untouched_by_service_commands(tmp_path):

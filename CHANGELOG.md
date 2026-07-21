@@ -20,6 +20,10 @@ truth for versions.
   directive that implies a capability drop is emitted — a *user* manager can't
   change the capability bounding set, so those kill the unit at spawn with
   `218/CAPABILITIES` before a line of Python runs.
+- `dispatch-gitsync init <repo> --service` — the whole setup for a host that isn't
+  running Claude Code, in one idempotent command: clone/seed the bus, write the
+  `[git]` config, then install and start the service. Re-running it upgrades in
+  place; `--dry-run` plans it first.
 - `--no-presence-gate` / `[git] presence_gate = false` — run until stopped rather
   than exiting when no agent is live. Ungated, the daemon also waits for a relay
   that doesn't exist yet (a service can start at login before any agent has), waits
