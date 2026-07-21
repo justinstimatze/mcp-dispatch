@@ -111,9 +111,10 @@ class GitBridge:
     def tick(self) -> None:
         """Run one outbound pass, one inbound pass, then refresh the remote roster.
 
-        The inbound pass is skipped while a backoff is in effect (see
-        ``max_fetch_interval``); outbound always runs, so *sending* is never slowed
-        by a quiet bus — only noticing the first message after a lull is.
+        A backed-off tick (see ``max_fetch_interval``) skips BOTH the inbound pass
+        and the roster refresh, since the roster is derived from the lanes a fetch
+        would have updated. Outbound always runs, so *sending* is never slowed by a
+        quiet bus — only noticing the first message after a lull is.
         """
         published = self._outbound()
         if published:

@@ -296,6 +296,21 @@ def test_backoff_survives_a_very_long_outage():
         assert gs._backoff_delay(failures, 2.0) == gs.MAX_BACKOFF_SECONDS
 
 
+def test_bad_timing_config_does_not_kill_the_daemon():
+    """`interval = "fast"` used to raise ValueError before the loop started. Under
+    the new unit that is a crash loop: Restart=always respawns every 5s until the
+    start limit latches the service `failed` for good, and the only clue is a
+    traceback in the journal — i.e. a typo silently kills cross-host comms, the
+    exact failure this whole change exists to remove."""
+    gs = _gitsync_module()
+    assert gs._float_cfg({}, "interval", 2.0) == 2.0  # absent -> default
+    assert gs._float_cfg({"interval": 5}, "interval", 2.0) == 5.0  # int is fine
+    assert gs._float_cfg({"interval": "fast"}, "interval", 2.0) == 2.0
+    assert gs._float_cfg({"max_fetch_interval": "30s"}, "max_fetch_interval", 30.0) == 30.0
+    assert gs._float_cfg({"interval": None}, "interval", 2.0) == 2.0
+    assert gs._float_cfg({"interval": []}, "interval", 2.0) == 2.0  # TypeError path
+
+
 def test_bad_grace_env_does_not_break_the_cli():
     """Parsing this at import means a typo would traceback `status` and `init`,
     which never even use the grace."""

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
+import subprocess  # nosec B404 - argv-only calls to `git`/`systemctl`, never a shell
 import sys
 import time
 from pathlib import Path
@@ -47,6 +47,7 @@ import dispatch_common as common  # noqa: E402
 import dispatch_fs  # noqa: E402
 import gitsync_service  # noqa: E402
 from git_bridge import GitBridge  # noqa: E402
+
 
 def _float_env(name: str, default: float) -> float:
     """Parse a float from the environment, falling back on anything unparseable.
@@ -84,6 +85,29 @@ MAX_BACKOFF_SHIFT = 8
 def _git_section(data: dict) -> dict:
     git = data.get("git")
     return git if isinstance(git, dict) else {}
+
+
+def _float_cfg(git: dict, key: str, default: float) -> float:
+    """A timing value from ``[git]``, tolerating a value that isn't a number.
+
+    Raising here is disproportionate now that the daemon runs under a supervisor:
+    ``interval = "fast"`` would exit(1) before the loop starts, systemd would
+    respawn it every 5s until the start limit latched the unit `failed` for good,
+    and the user's only clue would be a Python traceback in the journal. Warn and
+    carry on with the default instead — a slightly-wrong cadence beats a dead
+    bridge, which is the exact failure mode this whole change exists to remove.
+    """
+    raw = git.get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        print(
+            f"[gitsync] [git].{key} = {raw!r} is not a number — using {default}.",
+            file=sys.stderr,
+        )
+        return default
 
 
 def _config_path() -> Path:
@@ -130,7 +154,10 @@ def _presence_gate(cli: bool | None, git: dict) -> bool:
 
 
 def _run(cmd: list[str]) -> int:
-    return subprocess.run(cmd).returncode
+    # Argument vector, never a shell string, and every caller builds it from a
+    # literal verb list — the operator-supplied repo/slug only ever lands in an
+    # argv slot, so it can't become a second command.
+    return subprocess.run(cmd).returncode  # nosec B603
 
 
 def _looks_like_url(s: str) -> bool:
@@ -139,7 +166,7 @@ def _looks_like_url(s: str) -> bool:
 
 def _has_commits(repo_dir: Path) -> bool:
     return (
-        subprocess.run(
+        subprocess.run(  # nosec B603 B607 - fixed verbs; `git` resolved via PATH like every other git call here
             ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
             capture_output=True,
         ).returncode
@@ -222,7 +249,8 @@ def cmd_init(argv: list[str]) -> int:
         help="passed through to `service install` (e.g. SSH_AUTH_SOCK)",
     )
     ap.add_argument(
-        "--dry-run", action="store_true", help="with --service: plan the unit, install nothing"
+        "--dry-run", action="store_true", help="with --service: plan the unit only — the clone and the [git] config "
+        "are still written for real",
     )
     args = ap.parse_args(argv)
 
@@ -340,9 +368,7 @@ def cmd_service(argv: list[str]) -> int:
             print(unit, end="")
             return 0
 
-        steps = gitsync_service.install(
-            unit, enable=not args.no_enable, dry_run=args.dry_run
-        )
+        steps = gitsync_service.install(unit, enable=not args.no_enable, dry_run=args.dry_run)
     except gitsync_service.ServiceError as e:
         print(f"[gitsync] {e}")
         return 2
@@ -442,7 +468,7 @@ def cmd_run(argv: list[str]) -> int:
     dispatch_dir = common.dispatch_dir(data)
     remote = os.environ.get("MCP_DISPATCH_GIT_REMOTE") or git.get("remote")
     mirror = args.mirror or git.get("mirror") or "remote-only"
-    interval = args.interval if args.interval is not None else float(git.get("interval", 2.0))
+    interval = args.interval if args.interval is not None else _float_cfg(git, "interval", 2.0)
     group_mode = bool(common.flat(data, "group_mode"))
     gated = _presence_gate(args.presence_gate, git)
 
@@ -468,7 +494,7 @@ def cmd_run(argv: list[str]) -> int:
     # fetch cadence decay toward `max_fetch_interval` while the bus is silent; any
     # traffic in either direction snaps it straight back to `interval`. A --once
     # pass and any explicit 0 keep the fetch-every-tick behaviour.
-    max_fetch = float(git.get("max_fetch_interval", 30.0))
+    max_fetch = _float_cfg(git, "max_fetch_interval", 30.0)
     bridge = GitBridge(
         dispatch_dir,
         repo_dir,
@@ -509,7 +535,8 @@ def cmd_run(argv: list[str]) -> int:
 
     print(
         f"[gitsync] mirroring {dispatch_dir} <-> {repo_dir} "
-        f"(remote={remote or 'local'}, mirror={mirror}, every {interval}s, "
+        f"(remote={remote or 'local'}, mirror={mirror}, send every {interval}s, "
+        f"fetch {interval}s–{max_fetch or interval}s, "
         f"lifetime={'presence-gated' if gated else 'until stopped'})"
     )
 

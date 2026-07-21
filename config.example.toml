@@ -86,6 +86,12 @@ default_ttl = 604800  # 7 days
 [git]
 # enabled = true
 #
+# You don't have to write this section by hand — one idempotent command per host
+# clones/seeds the bus, writes these keys, and starts the daemon under systemd:
+#   dispatch-gitsync init git@github.com:you/agent-bus.git --service
+# The --service half matters on any host NOT running Claude Code: the auto-start
+# is a Claude Code SessionStart hook, so without it nothing ever runs the daemon.
+#
 # A working clone of a (private) git repo shared across your hosts. Make the repo
 # once, clone it on each host, and point repo_dir at the clone:
 #   git clone git@github.com:you/agent-bus.git ~/.config/mcp-dispatch/bus

@@ -23,7 +23,8 @@ truth for versions.
 - `dispatch-gitsync init <repo> --service` — the whole setup for a host that isn't
   running Claude Code, in one idempotent command: clone/seed the bus, write the
   `[git]` config, then install and start the service. Re-running it upgrades in
-  place; `--dry-run` plans it first.
+  place. (`--dry-run` covers the service half only — the clone and the `[git]`
+  config are written either way.)
 - `--no-presence-gate` / `[git] presence_gate = false` — run until stopped rather
   than exiting when no agent is live. Ungated, the daemon also waits for a relay
   that doesn't exist yet (a service can start at login before any agent has), waits
@@ -33,8 +34,9 @@ truth for versions.
 ### Changed
 - The daemon no longer `git fetch`es on every pass when the bus is quiet. A fetch
   costs ~170ms of CPU against a real remote while the entire local scan costs
-  ~12ms, so a supervised 24/7 daemon spent essentially all of its ~5% CPU asking a
-  silent remote whether anything had happened. The inbound cadence now decays
+  ~12ms, so a supervised 24/7 daemon spent essentially all of its CPU asking a
+  silent remote whether anything had happened — measured at 6.45% of a core on the
+  installed service, now 1.25%. The inbound cadence now decays
   toward `[git] max_fetch_interval` (default 30s) while nothing moves and snaps
   back to `interval` on any traffic in either direction. Outbound is untouched, so
   sends are as fast as before; only noticing the first message after a lull can be

@@ -16,7 +16,8 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick.
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
-- **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to manage.
+- **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to
+  manage for local comms (cross-host adds one, and installs it for you).
 - **Local-first & per-user** — `0700`/`0600` perms, validated ids, no network by default. See [Security](#security).
 - **Optional cross-host** — An opt-in [git transport](#cross-host-comms-git-transport) reaches agents on other machines through a shared git repo, transparently, without changing how agents call `dispatch()`.
 
@@ -33,6 +34,8 @@ python3 install.py        # sync deps, register the server, wire the hooks
 `install.py` does the whole setup in one shot — it syncs dependencies, registers
 the MCP server with Claude Code (`claude mcp add`), and wires the SessionStart /
 Stop hooks that arm the wake-watcher and keep the cross-host git daemon running.
+Add `--service` to run that daemon under systemd instead, which is what you want
+if anything other than Claude Code talks through the relay.
 It's **idempotent** (re-run any time; it only adds what's missing) and writes a
 backup of `~/.claude/settings.json` before touching it. Preview without writing:
 
@@ -405,9 +408,11 @@ dispatch-gitsync init git@github.com:you/agent-bus.git   # join an existing bus
 ```
 
 ```bash
-dispatch-gitsync            # run the daemon (one per host; holds a host lock)
-dispatch-gitsync --once     # a single sync pass (smoke / cron)
-dispatch-gitsync status     # running? repo, lane count, who's reachable
+dispatch-gitsync                 # run the daemon (one per host; holds a host lock)
+dispatch-gitsync --once          # a single sync pass (smoke / cron)
+dispatch-gitsync --no-presence-gate   # run until stopped, whatever harness you use
+dispatch-gitsync service install # run it under systemd instead of a hook
+dispatch-gitsync status          # running? repo, lane count, service state
 ```
 
 By default the daemon is **presence-gated** — it exits once no agent is live on
@@ -517,16 +522,32 @@ a local inbox nobody bridges, so both sides look like they're talking to a wall.
 Check it:
 
 ```bash
-bin/dispatch-gitsync status     # running? repo, lane count, who's reachable
+bin/dispatch-gitsync status     # running? repo, lane count, service state
 bin/dispatch-gitsync --once     # force one sync pass and print what moved
 ```
 
-The daemon is presence-gated (it exits when no agent is live on the host), so it
-must be **restarted** each time the host goes quiet and comes back. That restart
+**Not running Claude Code on that host?** Then nothing ever started the daemon:
+the auto-start is a Claude Code SessionStart hook, and it doesn't exist in
+openclaw, Hermes, a script or a cron job. By default the daemon is also
+presence-gated — and presence is claimed by the mcp-dispatch *MCP server* — so
+even starting it by hand there gets you a process that exits after ~60s. Both go
+away with [the service](#running-it-outside-claude-code-openclaw-hermes-scripts-cron):
+
+```bash
+bin/dispatch-gitsync init <repo> --service   # or `service install` if already set up
+```
+
+**On Claude Code and it still stalls?** The hook-spawned daemon is presence-gated,
+so it must be restarted each time the host goes quiet and comes back. That restart
 is what the `dispatch-gitsync-arm.py` SessionStart/Stop hook automates — if you
 wired the repo up before `install.py` existed, re-run `python3 install.py` to add
-it, then start a fresh session. Without the hook you'd have to relaunch the daemon
-by hand after every quiet period, which is the usual cause of this.
+it, then start a fresh session. Installing the service instead removes the
+restart-per-quiet-period problem entirely.
+
+**Messages arrive, but slowly?** Expected, and bounded: inbound fetches back off
+toward `[git] max_fetch_interval` (30s) while the bus is silent and snap back to
+`interval` on any traffic, so the *first* message after a lull can lag. Sends are
+never delayed. Set `max_fetch_interval = 0` to fetch on every pass.
 
 ## Security
 

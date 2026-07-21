@@ -4,9 +4,16 @@
 Unlike dispatch-wait (which must be launched by the *model* because only the model
 can register a wake-capable background task), the git-sync daemon doesn't wake
 anyone — it just runs. So this hook can spawn it directly, detached, the moment a
-session starts. The daemon holds a host-level lock (one per DISPATCH_DIR) and is
-presence-gated (exits when the host goes quiet), so spawning on every SessionStart
-is safe: a second spawn finds the lock held and exits immediately.
+session starts. The daemon holds a host-level lock (one per DISPATCH_DIR), so
+spawning on every SessionStart is safe: a second spawn finds the lock held and
+exits immediately — including when the daemon is already running as a systemd
+service, which makes this hook a harmless no-op there. By default it is also
+presence-gated (exits when the host goes quiet) so it can't orphan, though
+`[git] presence_gate = false` opts out of that.
+
+This hook exists only inside Claude Code. A host running any other harness
+(openclaw, Hermes, a script, cron) never fires it and gets no daemon at all —
+those want `dispatch-gitsync service install` instead.
 
 Gated on [git].enabled — does nothing unless cross-host comms are configured (run
 `dispatch-gitsync init <repo>` once to set that up). Opt out entirely with

@@ -5,12 +5,15 @@ Getting dispatch working means three separate bits of config that are easy to
 miss one of: register the MCP server, then wire the SessionStart/Stop hooks that
 (a) arm the wake-watcher and (b) start/restart the cross-host git daemon. Skip
 the hooks and everything *looks* connected but the daemon never (re)starts and
-two sessions end up talking to a wall. This script does all of it, idempotently:
-re-run it as often as you like — it only adds what's missing.
+two sessions end up talking to a wall. Those hooks are Claude-Code-only, so if
+anything else talks through the relay, pass --service to run the daemon under
+systemd instead. This script does all of it, idempotently: re-run it as often as
+you like — it only adds what's missing.
 
     python3 install.py              # sync deps, register server, wire hooks
     python3 install.py --dry-run    # show exactly what would change, touch nothing
     python3 install.py --no-mcp     # hooks only (server already registered)
+    python3 install.py --service    # + run the cross-host bridge under systemd
     python3 install.py --no-sync    # skip `uv sync`
 
 Config it touches:

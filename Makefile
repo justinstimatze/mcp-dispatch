@@ -1,7 +1,7 @@
 .PHONY: install test test-ci lint typecheck security quality
 
 PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_policy.py \
-	dispatch_common.py install.py tests/ \
+	dispatch_common.py gitsync_service.py install.py tests/ \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
 	bin/dispatch-status bin/dispatch-tail bin/dispatch-wait bin/dispatch-gitsync \
 	scripts/
@@ -25,11 +25,20 @@ lint:
 	uv run ruff check $(PY_SOURCES)
 	uv run ruff format --check $(PY_SOURCES)
 
+# gitsync_service.py and bin/dispatch-gitsync are in BOTH lists deliberately: they
+# interpolate config-supplied paths and --env values into a systemd unit and shell
+# out to systemctl, which makes them the most scan-worthy code in the repo. CI runs
+# only `ruff check .` and pytest, so these targets are the only place bandit and
+# mypy ever see anything — a module missing here is a module nobody checks.
+TYPED := server.py dispatch_common.py gitsync_service.py \
+	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
+	bin/dispatch-status bin/dispatch-tail bin/dispatch-wait bin/dispatch-gitsync
+
 typecheck:
-	uv run mypy --scripts-are-modules server.py dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py bin/dispatch-status bin/dispatch-tail bin/dispatch-wait
+	uv run mypy --scripts-are-modules $(TYPED)
 
 security:
-	uv run bandit -q -c pyproject.toml -r server.py dispatch_common.py hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py bin/dispatch-status bin/dispatch-tail bin/dispatch-wait
+	uv run bandit -q -c pyproject.toml -r $(TYPED)
 
 # Full gate: lint + types + security + tests (CI-faithful, identity-stripped).
 quality: lint typecheck security test-ci
