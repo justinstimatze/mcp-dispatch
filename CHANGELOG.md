@@ -6,6 +6,20 @@ truth for versions.
 
 ## [Unreleased]
 
+### Added
+- `scripts/setup-cross-host.sh <bus-url>` — one command that sets a host up on the
+  bus and checks the things people actually trip over: reachability of the bus
+  (failing early with the real git error), whether the *service* can authenticate
+  given that it inherits almost nothing from your shell, and whether systemd user
+  lingering is enabled. It verifies the daemon is genuinely syncing rather than
+  merely started, since auth failures appear only in the service's own log.
+
+### Fixed
+- Documented systemd **user lingering**. Without `loginctl enable-linger`, the
+  service doesn't start at boot and is torn down with your last session on many
+  distros — so on a headless host the bridge ran only while someone was logged in,
+  which presents exactly like the cross-host outage this release fixes.
+
 ## [0.11.0] - 2026-07-21
 
 ### Added

@@ -438,6 +438,17 @@ Put the daemon under your own init instead. **On a host that isn't running Claud
 Code, this is the entire setup — one idempotent command, safe to re-run:**
 
 ```bash
+./scripts/setup-cross-host.sh git@github.com:you/agent-bus.git
+```
+
+That wraps the command below with the checks people actually trip over: whether
+you can reach the bus at all (fails early with the real git error), whether the
+*service* — which inherits almost nothing from your shell — will be able to
+authenticate, and whether [lingering](#headless-hosts-enable-lingering) is on. It
+then verifies the daemon is really syncing rather than merely started. The bare
+command, if you'd rather drive it yourself:
+
+```bash
 dispatch-gitsync init git@github.com:you/agent-bus.git --service
 ```
 
@@ -479,12 +490,44 @@ is quiet, snapping back to `interval` on any traffic. Sends are never slowed; on
 noticing the first message after a lull can be. Set `max_fetch_interval = 0` to
 fetch on every pass.
 
-A user service inherits almost nothing from your login shell, so **git credentials
-are the thing to check first**. Either use an HTTPS remote with a stored credential
-helper, or pass the agent socket through at install time:
+#### Headless hosts: enable lingering
+
+A systemd **user** manager doesn't start at boot unless lingering is enabled, and
+on many distros it's torn down when your last session ends. On a server, the
+bridge would then run only while you happen to be logged in — which looks exactly
+like the original bug. Once per host:
 
 ```bash
-dispatch-gitsync service install --env SSH_AUTH_SOCK=$SSH_AUTH_SOCK
+sudo loginctl enable-linger $USER
+```
+
+#### Credentials
+
+A user service inherits almost nothing from your login shell, so **git credentials
+are the thing to check first** — an SSH remote that works when *you* type it can
+still fail for the service, because the service has no `SSH_AUTH_SOCK`. Three
+options, most robust first:
+
+1. **A passphrase-less deploy key**, named in `~/.ssh/config` — no agent involved,
+   so nothing to break at reboot. Add the public half as a write-enabled deploy key
+   on the bus repo:
+   ```bash
+   ssh-keygen -t ed25519 -f ~/.ssh/agent_bus -N '' -C agent-bus
+   ```
+   then `Host github.com` / `IdentityFile ~/.ssh/agent_bus` / `IdentitiesOnly yes`.
+2. **HTTPS with a credential helper** (`gh auth login && gh auth setup-git`) — the
+   service reads the same store you do.
+3. **Pass your agent socket through**, convenient but per-login: the path can change
+   after a reboot, and then the service loses access until you re-install.
+   ```bash
+   dispatch-gitsync service install --env SSH_AUTH_SOCK=$SSH_AUTH_SOCK
+   ```
+
+Auth failures surface only in the service's own log, since it authenticates
+differently from your shell:
+
+```bash
+journalctl --user -u mcp-dispatch-gitsync -n 50 --no-pager
 ```
 
 The service and the Claude Code hook coexist safely: both take the same host lock,
