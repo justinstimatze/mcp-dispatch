@@ -465,6 +465,14 @@ dispatch-gitsync service uninstall
 journalctl --user -u mcp-dispatch-gitsync -f    # watch it work
 ```
 
+The unit bakes **absolute** paths (the interpreter, this repo, your config), and
+systemd keeps running the process it started. So re-run `service install` after
+moving or renaming the repo, rebuilding the venv, or pulling an update you want the
+daemon to actually be running — a `git pull` alone leaves the old code live. It is
+idempotent, so re-running it is never wrong. Config, by contrast, needs no
+reinstall: a supervised daemon re-reads it while waiting, so enabling the bridge or
+restoring a deleted clone starts it on its own.
+
 Because the service runs whether or not an agent is awake, the bridge backs its
 **inbound** `git fetch` off toward `[git] max_fetch_interval` (30s) while the bus
 is quiet, snapping back to `interval` on any traffic. Sends are never slowed; only
@@ -559,8 +567,13 @@ This is local-host-only IPC; the threat model is other local users on a shared m
 - Agent ids and targets must match `^[a-z0-9][a-z0-9_-]{0,63}$`. They become path
   segments, so anything with separators or traversal sequences (`../…`) is rejected
   rather than allowed to escape the dispatch directory.
-- No network listener, no daemon, no encryption at rest (out of scope for the
-  local-only threat model).
+- No network listener and no encryption at rest (out of scope for the local-only
+  threat model). Purely local operation runs no daemon at all; the optional
+  cross-host bridge is the one long-lived process, and it still listens on nothing.
+- The systemd unit written by `dispatch-gitsync service install` is created `0600`
+  before any content lands, because `--env` can carry credentials. Prefer not to
+  put a token there at all: use an HTTPS remote with a git credential helper, or
+  pass through `SSH_AUTH_SOCK` and keep the key in your agent.
 - The optional [git transport](#cross-host-comms-git-transport) doesn't open a
   listener either — it pushes/pulls a git remote you control. Its confidentiality
   is your repo's (use a **private** repo); message bodies are cleartext in the

@@ -32,6 +32,14 @@ truth for versions.
   to 60s after repeated sync failures instead of hammering a broken remote.
 
 ### Changed
+- A supervised daemon (`--no-presence-gate`) now **waits** instead of exiting when
+  it isn't ready to bridge — `[git].enabled` false, no clone configured, the clone
+  missing, or the relay not created yet. Each of those exited immediately, which
+  under the unit's `Restart=always` is a crash loop that latches the service
+  `failed` after ten tries; recovering then meant noticing a dead unit and running
+  `systemctl` by hand. Config is re-read every pass, so enabling the bridge or
+  restoring a deleted clone starts it with no further intervention. A gated or
+  `--once` run still reports and exits exactly as before.
 - The daemon no longer `git fetch`es on every pass when the bus is quiet. A fetch
   costs ~170ms of CPU against a real remote while the entire local scan costs
   ~12ms, so a supervised 24/7 daemon spent essentially all of its CPU asking a

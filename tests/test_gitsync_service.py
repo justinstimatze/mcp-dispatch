@@ -168,7 +168,7 @@ def _bus(tmp_path: Path) -> tuple[Path, Path, Path]:
     return dispatch_dir, repo_dir, cfg
 
 
-def _launch(cfg: Path, state: Path, *args, grace="0.5"):
+def _launch(cfg: Path, state: Path, *args, grace="0.5", ready_poll="0.3"):
     return subprocess.Popen(
         [sys.executable, str(GITSYNC), "--interval", "0.2", *args],
         stdout=subprocess.PIPE,
@@ -178,6 +178,7 @@ def _launch(cfg: Path, state: Path, *args, grace="0.5"):
             "MCP_DISPATCH_CONFIG": str(cfg),
             "MCP_DISPATCH_STATE_DIR": str(state),
             "MCP_DISPATCH_GITSYNC_GRACE": grace,
+            "MCP_DISPATCH_GITSYNC_READY_POLL": ready_poll,
             "PYTHONUNBUFFERED": "1",  # these tests kill the process; buffered output is lost
             "PATH": "/usr/bin:/bin",
             "HOME": str(cfg.parent),
@@ -228,6 +229,54 @@ def test_ungated_waits_for_the_lock_instead_of_exiting(tmp_path):
     assert "waiting to take over" in out
 
 
+@pytest.mark.parametrize(
+    "mutate,expected",
+    [
+        (lambda t: t.replace("enabled = true", "enabled = false"), "enabled is false"),
+        (lambda t: t.replace("repo_dir", "repo_dir_typo"), "no git clone configured"),
+        (lambda t: t.replace("/bus", "/bus-gone"), "is not a git clone"),
+    ],
+    ids=["bridge-disabled", "no-clone-configured", "clone-missing"],
+)
+def test_supervised_daemon_waits_instead_of_exiting(tmp_path, mutate, expected):
+    """Every "the world isn't ready" condition must WAIT under supervision. Exiting
+    hands systemd's Restart=always a process that dies immediately; ten restarts
+    later the start limit latches the unit `failed` for good, and fixing the config
+    then requires noticing a dead unit and running systemctl by hand. A gated run
+    still reports and leaves — it's transient, and nothing restarts it."""
+    _, _, cfg = _bus(tmp_path)
+    cfg.write_text(mutate(cfg.read_text()))
+    proc = _launch(cfg, tmp_path / "state", "--no-presence-gate")
+    try:
+        time.sleep(2.0)
+        assert proc.poll() is None  # waiting, not dead
+    finally:
+        proc.kill()
+        out, _ = proc.communicate(timeout=10)
+    assert expected in out
+    assert "waiting — config is re-read every pass" in out
+
+
+def test_supervised_daemon_starts_when_the_config_is_fixed(tmp_path):
+    """The point of re-reading: enabling the bridge must take effect on its own,
+    without anyone touching systemctl."""
+    _, _, cfg = _bus(tmp_path)
+    good = cfg.read_text()
+    cfg.write_text(good.replace("enabled = true", "enabled = false"))
+    proc = _launch(cfg, tmp_path / "state", "--no-presence-gate", ready_poll="0.3")
+    try:
+        time.sleep(1.0)
+        assert proc.poll() is None
+        cfg.write_text(good)  # someone runs `dispatch-gitsync init` / edits config
+        time.sleep(2.0)
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        out, _ = proc.communicate(timeout=10)
+    assert "ready — starting the bridge" in out
+    assert "mirroring" in out
+
+
 def test_ungated_waits_for_a_relay_that_does_not_exist_yet(tmp_path):
     """A service starts at login, possibly before any agent has created the relay.
     Exiting there would need a manual restart to ever recover."""
@@ -249,8 +298,9 @@ def test_ungated_waits_for_a_relay_that_does_not_exist_yet(tmp_path):
     finally:
         proc.kill()
         out, _ = proc.communicate(timeout=10)
-    assert "waiting for a relay" in out
-    assert "relay appeared" in out
+    assert "nothing to mirror" in out  # the not-ready reason, reported once
+    assert "waiting — config is re-read every pass" in out
+    assert "ready — starting the bridge" in out  # ...and it noticed on its own
 
 
 def test_config_can_disable_the_gate(tmp_path):

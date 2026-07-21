@@ -74,6 +74,11 @@ MAX_BACKOFF_SECONDS = 60.0
 # OverflowError. 2**8 already exceeds any sane cap, so clamping costs nothing.
 MAX_BACKOFF_SHIFT = 8
 
+# How often a supervised daemon re-checks config while it isn't ready to bridge
+# (bridge disabled, clone missing, relay not created yet). Slow on purpose: this
+# is a "wait for a human to fix something" loop, not a sync cadence.
+READY_POLL_SECONDS = _float_env("MCP_DISPATCH_GITSYNC_READY_POLL", 5.0)
+
 
 # ---------------------------------------------------------------------------
 # Config / path resolution — the shared plumbing (config load, flat lookup,
@@ -133,6 +138,42 @@ def _backoff_delay(failures: int, interval: float) -> float:
     if failures <= 0:
         return interval
     return min(interval * (2 ** min(failures, MAX_BACKOFF_SHIFT)), MAX_BACKOFF_SECONDS)
+
+
+def _resolve(args) -> tuple[dict | None, tuple[str, int] | None]:
+    """Re-read config and resolve everything the daemon needs to start bridging.
+
+    Returns ``(settings, None)`` when ready, or ``(None, (reason, exit_code))``.
+    Deliberately a *function of current config*, not of startup state: a supervised
+    daemon calls it repeatedly while waiting, so enabling the bridge or restoring a
+    deleted clone takes effect without anyone touching systemctl.
+    """
+    data = common.load_config()
+    git = _git_section(data)
+
+    enabled = bool(git.get("enabled")) or bool(os.environ.get("MCP_DISPATCH_GIT_ENABLED"))
+    if not enabled and not (args.once or args.repo_dir):
+        return None, (
+            "[git].enabled is false — not bridging. Run `dispatch-gitsync "
+            "init <repo>` to set it up, or pass --repo-dir to bridge ad hoc.",
+            0,
+        )
+
+    raw = args.repo_dir or os.environ.get("MCP_DISPATCH_GIT_REPO") or git.get("repo_dir")
+    if not raw:
+        return None, ("no git clone configured — run `dispatch-gitsync init <repo>` first.", 2)
+    repo_dir = Path(os.path.expanduser(str(raw)))
+    if not (repo_dir / ".git").exists():
+        return None, (
+            f"{repo_dir} is not a git clone (no .git). Run `dispatch-gitsync init <repo>` first.",
+            2,
+        )
+
+    dispatch_dir = common.dispatch_dir(data)
+    if not dispatch_dir.is_dir():
+        return None, (f"no relay at {dispatch_dir} — nothing to mirror.", 0)
+
+    return {"data": data, "git": git, "repo_dir": repo_dir, "dispatch_dir": dispatch_dir}, None
 
 
 def _presence_gate(cli: bool | None, git: dict) -> bool:
@@ -442,51 +483,41 @@ def cmd_run(argv: list[str]) -> int:
     )
     args = ap.parse_args(argv)
 
-    data = common.load_config()
-    git = _git_section(data)
+    gated = _presence_gate(args.presence_gate, _git_section(common.load_config()))
 
-    enabled = bool(git.get("enabled")) or bool(os.environ.get("MCP_DISPATCH_GIT_ENABLED"))
-    if not enabled and not (args.once or args.repo_dir):
-        print(
-            "[gitsync] [git].enabled is false — not bridging. Run `dispatch-gitsync "
-            "init <repo>` to set it up, or pass --repo-dir to bridge ad hoc."
-        )
-        return 0
+    ready, problem = _resolve(args)
+    if problem:
+        reason, code = problem
+        # A transient run (hook-spawned, or --once) just reports and leaves. A
+        # SUPERVISED one must not: every one of these conditions is "the world
+        # isn't ready yet", and exiting hands systemd's Restart=always a process
+        # that dies immediately — 10 restarts later the start limit latches the
+        # unit `failed` for good. Fixing the config would then require noticing a
+        # dead unit and running systemctl by hand. So wait, re-reading config each
+        # pass, and start bridging the moment it's fixed.
+        if gated or args.once:
+            print(f"[gitsync] {reason}")
+            return code
+        last = None
+        try:
+            while problem:
+                if problem[0] != last:
+                    last = problem[0]
+                    print(f"[gitsync] {last}\n[gitsync] waiting — config is re-read every pass.")
+                time.sleep(READY_POLL_SECONDS)
+                ready, problem = _resolve(args)
+        except KeyboardInterrupt:
+            return 0
+        print("[gitsync] ready — starting the bridge.")
 
-    repo_dir = args.repo_dir or os.environ.get("MCP_DISPATCH_GIT_REPO") or git.get("repo_dir")
-    if not repo_dir:
-        print("[gitsync] no git clone configured — run `dispatch-gitsync init <repo>` first.")
-        return 2
-    repo_dir = Path(os.path.expanduser(str(repo_dir)))
-    if not (repo_dir / ".git").exists():
-        print(
-            f"[gitsync] {repo_dir} is not a git clone (no .git). "
-            "Run `dispatch-gitsync init <repo>` first."
-        )
-        return 2
-
-    dispatch_dir = common.dispatch_dir(data)
+    if ready is None:  # unreachable: the wait loop only exits once _resolve succeeds
+        return 1
+    data, git = ready["data"], ready["git"]
+    dispatch_dir, repo_dir = ready["dispatch_dir"], ready["repo_dir"]
     remote = os.environ.get("MCP_DISPATCH_GIT_REMOTE") or git.get("remote")
     mirror = args.mirror or git.get("mirror") or "remote-only"
     interval = args.interval if args.interval is not None else _float_cfg(git, "interval", 2.0)
     group_mode = bool(common.flat(data, "group_mode"))
-    gated = _presence_gate(args.presence_gate, git)
-
-    if not dispatch_dir.is_dir():
-        # Gated (hook-spawned) runs are transient, so a missing relay just means
-        # "nothing to do yet". A service, though, legitimately starts at login
-        # *before* the first agent has ever created the relay — exiting there would
-        # need a manual restart to ever recover, so it waits instead.
-        if gated or args.once:
-            print(f"[gitsync] no relay at {dispatch_dir} — nothing to mirror.")
-            return 0
-        print(f"[gitsync] waiting for a relay to appear at {dispatch_dir}…")
-        try:
-            while not dispatch_dir.is_dir():
-                time.sleep(max(interval, 1.0))
-        except KeyboardInterrupt:
-            return 0
-        print(f"[gitsync] relay appeared at {dispatch_dir}.")
 
     # Inbound fetch pacing. `git fetch` costs ~170ms of CPU against a real remote
     # while the whole local scan costs ~12ms, so polling it every `interval` for as
