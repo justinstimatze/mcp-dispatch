@@ -6,6 +6,35 @@ truth for versions.
 
 ## [Unreleased]
 
+### Added
+- The cross-host git bridge can run **independently of any agent harness**.
+  `dispatch-gitsync service install` (or `python3 install.py --service`) writes an
+  enabled, restart-on-failure systemd **user** unit; re-running it regenerates the
+  unit from current config and restarts onto it, so it doubles as the upgrade
+  path. `service show` prints the unit, `--dry-run` writes nothing, `uninstall`
+  removes it, and `dispatch-gitsync status` reports its state. Interpolated values
+  are escaped (`%` is a systemd specifier) and control characters refused, so a
+  path or `--env` value can't forge a directive. Sandboxing is deliberately
+  conservative — `PrivateTmp` is omitted when the relay lives under `/var/tmp`
+  (the documented group-mode layout), `UMask` follows `group_mode`, and no
+  directive that implies a capability drop is emitted — a *user* manager can't
+  change the capability bounding set, so those kill the unit at spawn with
+  `218/CAPABILITIES` before a line of Python runs.
+- `--no-presence-gate` / `[git] presence_gate = false` — run until stopped rather
+  than exiting when no agent is live. Ungated, the daemon also waits for a relay
+  that doesn't exist yet (a service can start at login before any agent has), waits
+  to take over the host lock instead of exiting into a restart loop, and backs off
+  to 60s after repeated sync failures instead of hammering a broken remote.
+
+### Fixed
+- Agents on a harness other than Claude Code had no running bridge at all. The only
+  thing that started the daemon was `hooks/dispatch-gitsync-arm.py`, a *Claude
+  Code* SessionStart/Stop hook — so openclaw, Hermes, the TUI, scripts and cron got
+  nothing pushed or fetched and had to run `git pull`/`git push` by hand around
+  every message. Even started by hand it self-terminated after the 60s grace,
+  because presence is only ever claimed by the mcp-dispatch MCP server. Reported by
+  Steven Wu.
+
 ## [0.10.0] - 2026-07-19
 
 ### Fixed

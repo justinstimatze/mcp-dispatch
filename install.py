@@ -174,6 +174,22 @@ def install_hooks(settings_path: Path, dry: bool) -> None:
     print(f"  ✓ updated {settings_path}")
 
 
+def install_service(dry: bool) -> None:
+    """Put the cross-host git bridge under systemd instead of the Claude Code hook.
+
+    The hook only fires inside Claude Code, so agents on any other harness get no
+    daemon at all — and the messages just sit in git. This delegates to
+    `dispatch-gitsync service install`, which owns the unit rendering; re-running
+    it is also the upgrade path."""
+    print("• Installing the cross-host bridge as a systemd user service")
+    cmd = [sys.executable, str(REPO / "bin" / "dispatch-gitsync"), "service", "install"]
+    if dry:
+        cmd.append("--dry-run")
+    if run(cmd, cwd=REPO) != 0:
+        print("  ! service not installed (see above). Cross-host comms will still work")
+        print("    inside Claude Code via the SessionStart hook.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Wire mcp-dispatch into Claude Code (idempotent).",
@@ -182,6 +198,13 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="show changes, write nothing")
     ap.add_argument("--no-sync", action="store_true", help="skip `uv sync`")
     ap.add_argument("--no-mcp", action="store_true", help="skip MCP server registration")
+    ap.add_argument(
+        "--service",
+        action="store_true",
+        help="also run the cross-host git bridge as a systemd user service, so it "
+        "works outside Claude Code (openclaw, Hermes, the TUI, cron). Requires "
+        "`dispatch-gitsync init` first; re-run to upgrade.",
+    )
     ap.add_argument(
         "--settings",
         type=Path,
@@ -200,6 +223,8 @@ def main() -> int:
     if not args.no_mcp:
         register_mcp(args.dry_run)
     install_hooks(args.settings, args.dry_run)
+    if args.service:
+        install_service(args.dry_run)
 
     print("\nDone. Next:")
     print("  • Restart your Claude Code sessions so the new config loads.")
@@ -208,6 +233,10 @@ def main() -> int:
     print("      bin/dispatch-gitsync init --create you/agent-bus   # new private bus")
     print("      bin/dispatch-gitsync init git@github.com:you/agent-bus.git  # join one")
     print("    then the SessionStart hook starts the daemon automatically.")
+    if not args.service:
+        print("  • Using a harness OTHER than Claude Code (openclaw, Hermes, scripts)?")
+        print("    The hook never fires there, so nothing syncs. Run instead:")
+        print("      python3 install.py --service")
     return 0
 
 

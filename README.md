@@ -410,14 +410,62 @@ dispatch-gitsync --once     # a single sync pass (smoke / cron)
 dispatch-gitsync status     # running? repo, lane count, who's reachable
 ```
 
-The daemon is **presence-gated** — it exits once no agent is live on the host, so
-it can't orphan. For hands-free operation, wire `hooks/dispatch-gitsync-arm.py`
-into `SessionStart` (alongside the dispatch-wait arm hook) and it starts the daemon
-automatically whenever `[git].enabled`:
+By default the daemon is **presence-gated** — it exits once no agent is live on
+the host, so a hook-spawned daemon can't orphan. For hands-free operation inside
+Claude Code, wire `hooks/dispatch-gitsync-arm.py` into `SessionStart` (alongside
+the dispatch-wait arm hook) and it starts the daemon automatically whenever
+`[git].enabled`:
 
 ```json
 { "type": "command", "command": "/abs/path/to/hooks/dispatch-gitsync-arm.py" }
 ```
+
+#### Running it outside Claude Code (openclaw, Hermes, scripts, cron)
+
+That hook is a *Claude Code* hook. On any other harness nothing starts the daemon,
+so nothing is pushed or fetched and two agents appear to be **talking to a wall** —
+the symptom is having to run `git pull`/`git push` by hand around every message.
+Presence gating compounds it: presence is claimed by the mcp-dispatch **MCP
+server**, so a hand-started daemon also self-terminates after ~60s if nothing else
+on the host is holding a presence lock.
+
+Put the daemon under your own init instead — one command, harness-agnostic:
+
+```bash
+dispatch-gitsync service install      # systemd user unit, enabled + started
+python3 install.py --service          # ...or as part of the normal installer
+```
+
+That writes `~/.config/systemd/user/mcp-dispatch-gitsync.service` running the
+daemon with `--no-presence-gate`, restarted on failure and started at login.
+Re-running it is also the **upgrade** path: the unit is regenerated from current
+config and the running daemon restarted onto it.
+
+```bash
+dispatch-gitsync service show         # print the unit without installing anything
+dispatch-gitsync service install --dry-run
+dispatch-gitsync service uninstall
+journalctl --user -u mcp-dispatch-gitsync -f    # watch it work
+```
+
+A user service inherits almost nothing from your login shell, so **git credentials
+are the thing to check first**. Either use an HTTPS remote with a stored credential
+helper, or pass the agent socket through at install time:
+
+```bash
+dispatch-gitsync service install --env SSH_AUTH_SOCK=$SSH_AUTH_SOCK
+```
+
+The service and the Claude Code hook coexist safely: both take the same host lock,
+so only one daemon ever mirrors a relay. Without systemd, run the daemon under
+whatever supervisor you do have — the only thing that matters is the flag:
+
+```bash
+dispatch-gitsync --no-presence-gate
+```
+
+or set `presence_gate = false` under `[git]` to make that the default for every
+launcher on the host.
 
 `mirror = "remote-only"` (default) only bridges messages with no live-local
 recipient — same-host chatter stays local and private; `mirror = "all"` makes a

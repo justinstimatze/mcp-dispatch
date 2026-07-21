@@ -98,6 +98,15 @@ default_ttl = 604800  # 7 days
 # Seconds between sync passes.
 # interval = 2.0
 #
+# Exit once no agent on this host holds a presence lock (default true). That gate
+# is what stops a hook-spawned daemon from orphaning — but presence is claimed by
+# the mcp-dispatch MCP *server*, so an agent on another harness (openclaw, Hermes,
+# a plain script, cron) never claims it and the daemon self-terminates after ~60s,
+# leaving both sides talking to a wall. Set false when the daemon is supervised by
+# something that owns its lifetime — which is what `dispatch-gitsync service
+# install` (a systemd user unit) sets up, passing --no-presence-gate explicitly.
+# presence_gate = false
+#
 # What to mirror:
 #   "remote-only" (default) — only bridge a message with no live-local recipient;
 #                             same-host chatter stays local and private.

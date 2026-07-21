@@ -9,16 +9,26 @@ dispatch(). All git knowledge lives here, not in the server.
     dispatch-gitsync                     # run the daemon (one per host)
     dispatch-gitsync --once              # a single sync pass and exit (smoke / cron)
     dispatch-gitsync --mirror all        # full audited replica (vs default remote-only)
+    dispatch-gitsync --no-presence-gate  # run forever, independent of any harness
 
     dispatch-gitsync init <url|slug|path>  # create/clone + seed + write [git] config
     dispatch-gitsync init --create owner/agent-bus   # gh-create a PRIVATE repo first
+    dispatch-gitsync service install       # run it as a systemd user service
     dispatch-gitsync status                # is it running? repo, lanes, who's reachable
 
-The daemon holds a host-level lock (one daemon per DISPATCH_DIR) and is presence-
-gated: it exits once no agent is live on the host, so it can't orphan. A message
-arriving over git is materialized as a normal inbox .json, so it wakes a parked
-session through the same path a local message does. Setup is one `init` per host;
-wire hooks/dispatch-gitsync-arm.py into SessionStart to start it hands-free.
+The daemon holds a host-level lock (one daemon per DISPATCH_DIR). By default it is
+also presence-gated: it exits once no agent is live on the host, so a hook-spawned
+daemon can't orphan. That gate assumes something claims presence — which only the
+mcp-dispatch MCP *server* does. Agents on another harness (openclaw, Hermes, a
+plain script) never do, so for them the daemon self-terminated after a minute and
+messages stopped moving until someone ran git by hand. `--no-presence-gate` (or
+`presence_gate = false`) drops the gate for that case: the daemon then runs until
+stopped, which is what `service install` wires up.
+
+A message arriving over git is materialized as a normal inbox .json, so it wakes a
+parked session through the same path a local message does. Setup is one `init` per
+host; then either `service install` (any harness) or wire
+hooks/dispatch-gitsync-arm.py into SessionStart (Claude Code).
 """
 
 from __future__ import annotations
@@ -34,9 +44,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dispatch_common as common  # noqa: E402
 import dispatch_fs  # noqa: E402
+import gitsync_service  # noqa: E402
 from git_bridge import GitBridge  # noqa: E402
 
-STARTUP_GRACE_SECONDS = 60.0  # exit if no agent ever appears (standalone safety)
+# Exit if no agent ever appears (standalone safety). Env-overridable so the tests
+# don't have to sit through a real minute — same idiom as dispatch-wait's
+# MCP_DISPATCH_STANDALONE_FALLBACK.
+STARTUP_GRACE_SECONDS = float(os.environ.get("MCP_DISPATCH_GITSYNC_GRACE") or 60.0)
+
+# Ungated (service) mode only: how long a failing sync backs off to, so a broken
+# remote — expired token, dead network — is retried patiently instead of being
+# hammered every `interval` seconds for as long as the machine is up.
+MAX_BACKOFF_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +80,19 @@ def _config_path() -> Path:
 def _host_lock_path(dispatch_dir: Path) -> Path:
     """One daemon per DISPATCH_DIR — the lock key is the dir, not an agent id."""
     return common.state_dir() / f"gitsync-{common.md5_key(str(dispatch_dir))}.lock"
+
+
+def _presence_gate(cli: bool | None, git: dict) -> bool:
+    """Should the daemon exit when no agent holds a presence lock? CLI beats env
+    beats config, defaulting to True — the gate is what keeps a *hook-spawned*
+    daemon from orphaning, so only an explicit opt-out drops it."""
+    if cli is not None:
+        return cli
+    env = os.environ.get("MCP_DISPATCH_GIT_PRESENCE_GATE")
+    if env is not None and env.strip():
+        return common.truthy(env)
+    val = git.get("presence_gate")
+    return True if val is None else bool(val)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +222,91 @@ def cmd_init(argv: list[str]) -> int:
     return 0
 
 
+def cmd_service(argv: list[str]) -> int:
+    """Install/remove the systemd user unit — the harness-independent way to run.
+
+    The SessionStart hook only exists inside Claude Code; anything else talking
+    through the relay (openclaw, Hermes, the TUI, a cron job) never starts a daemon
+    and silently stops exchanging messages. This puts the daemon under the user's
+    own init instead, so it runs regardless of which agent runtime is alive.
+    """
+    ap = argparse.ArgumentParser(
+        prog="dispatch-gitsync service",
+        description="Run the bridge as a systemd user service (any harness, no hooks).",
+    )
+    ap.add_argument(
+        "action", nargs="?", default="install", choices=["install", "uninstall", "show"]
+    )
+    ap.add_argument("--dry-run", action="store_true", help="print the plan/unit, write nothing")
+    ap.add_argument("--no-enable", action="store_true", help="write the unit but don't start it")
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra Environment= line (repeatable). A user service inherits almost "
+        "nothing from your shell, so this is where SSH_AUTH_SOCK etc. go.",
+    )
+    args = ap.parse_args(argv)
+
+    try:
+        if args.action == "uninstall":
+            for step in gitsync_service.uninstall(dry_run=args.dry_run):
+                print(f"  {'would ' if args.dry_run else ''}{step}")
+            return 0
+
+        data = common.load_config()
+        git = _git_section(data)
+        repo_dir = os.environ.get("MCP_DISPATCH_GIT_REPO") or git.get("repo_dir")
+        if not repo_dir:
+            print("[gitsync] no git clone configured — run `dispatch-gitsync init <repo>` first.")
+            return 2
+        if not (git.get("enabled") or os.environ.get("MCP_DISPATCH_GIT_ENABLED")):
+            # A service around a disabled bridge would exit immediately and be
+            # restarted forever. Fail loudly here instead of shipping a flapping unit.
+            print("[gitsync] [git].enabled is false — enable it before installing the service.")
+            return 2
+
+        interval = git.get("interval")
+        unit = gitsync_service.render_unit(
+            python=sys.executable,
+            daemon=Path(__file__).resolve(),
+            repo_root=Path(__file__).resolve().parent.parent,
+            config_path=_config_path().expanduser().resolve(),
+            dispatch_dir=common.dispatch_dir(data),
+            repo_dir=Path(os.path.expanduser(str(repo_dir))),
+            state_dir=common.state_dir(),
+            group_mode=bool(common.flat(data, "group_mode")),
+            interval=float(interval) if interval is not None else None,
+            env=gitsync_service.validate_env(args.env),
+        )
+        if args.action == "show":
+            print(unit, end="")
+            return 0
+
+        steps = gitsync_service.install(
+            unit, enable=not args.no_enable, dry_run=args.dry_run
+        )
+    except gitsync_service.ServiceError as e:
+        print(f"[gitsync] {e}")
+        return 2
+    except subprocess.CalledProcessError as e:
+        print(f"[gitsync] systemctl failed: {(e.stderr or '').strip() or e}")
+        return 2
+
+    for step in steps:
+        print(f"  {'would ' if args.dry_run else ''}{step}")
+    if args.dry_run:
+        print("\n(--dry-run: nothing written. `service show` prints the unit itself.)")
+    else:
+        print(
+            "\n[gitsync] the bridge now runs independently of any agent harness.\n"
+            "  logs:   journalctl --user -u mcp-dispatch-gitsync -f\n"
+            "  upgrade: re-run `dispatch-gitsync service install` after changing config"
+        )
+    return 0
+
+
 def cmd_status(argv: list[str]) -> int:
     argparse.ArgumentParser(prog="dispatch-gitsync status").parse_args(argv)
     data = common.load_config()
@@ -204,6 +321,8 @@ def cmd_status(argv: list[str]) -> int:
     print(f"repo_dir:         {repo_dir or '(unset)'}")
     print(f"remote:           {git.get('remote') or '(local-only)'}")
     print(f"mirror:           {git.get('mirror') or 'remote-only'}")
+    for line in gitsync_service.status_lines():
+        print(line)
     if repo_dir and (repo_dir / "lanes").is_dir():
         print(f"DM lanes:         {len(list((repo_dir / 'lanes').glob('*.jsonl')))}")
     if dispatch_dir.is_dir():
@@ -224,6 +343,21 @@ def cmd_run(argv: list[str]) -> int:
         "--mirror", choices=["remote-only", "all"], default=None, help="override mirror mode"
     )
     ap.add_argument("--repo-dir", default=None, help="override the git clone path")
+    gate = ap.add_mutually_exclusive_group()
+    gate.add_argument(
+        "--no-presence-gate",
+        dest="presence_gate",
+        action="store_false",
+        default=None,
+        help="run until stopped instead of exiting when no agent is live (for a service)",
+    )
+    gate.add_argument(
+        "--presence-gate",
+        dest="presence_gate",
+        action="store_true",
+        default=None,
+        help="force the default gated lifetime even if config disables it",
+    )
     args = ap.parse_args(argv)
 
     data = common.load_config()
@@ -250,14 +384,27 @@ def cmd_run(argv: list[str]) -> int:
         return 2
 
     dispatch_dir = common.dispatch_dir(data)
-    if not dispatch_dir.is_dir():
-        print(f"[gitsync] no relay at {dispatch_dir} — nothing to mirror.")
-        return 0
-
     remote = os.environ.get("MCP_DISPATCH_GIT_REMOTE") or git.get("remote")
     mirror = args.mirror or git.get("mirror") or "remote-only"
     interval = args.interval if args.interval is not None else float(git.get("interval", 2.0))
     group_mode = bool(common.flat(data, "group_mode"))
+    gated = _presence_gate(args.presence_gate, git)
+
+    if not dispatch_dir.is_dir():
+        # Gated (hook-spawned) runs are transient, so a missing relay just means
+        # "nothing to do yet". A service, though, legitimately starts at login
+        # *before* the first agent has ever created the relay — exiting there would
+        # need a manual restart to ever recover, so it waits instead.
+        if gated or args.once:
+            print(f"[gitsync] no relay at {dispatch_dir} — nothing to mirror.")
+            return 0
+        print(f"[gitsync] waiting for a relay to appear at {dispatch_dir}…")
+        try:
+            while not dispatch_dir.is_dir():
+                time.sleep(max(interval, 1.0))
+        except KeyboardInterrupt:
+            return 0
+        print(f"[gitsync] relay appeared at {dispatch_dir}.")
 
     bridge = GitBridge(dispatch_dir, repo_dir, remote=remote, mirror=mirror, group_mode=group_mode)
 
@@ -270,36 +417,58 @@ def cmd_run(argv: list[str]) -> int:
         bridge.tick_guarded()
         return 0
 
-    # One daemon per host. A second invocation (e.g. a racing SessionStart hook)
-    # finds the lock held and exits quietly.
-    lock = common.acquire_flock(_host_lock_path(dispatch_dir))
+    # One daemon per host. A gated run (a racing SessionStart hook) finds the lock
+    # held and exits quietly. An ungated run WAITS for it instead: a service and a
+    # hook-spawned daemon coexist on one host, and whichever loses the race must
+    # take over when the other dies rather than exiting into a systemd restart loop.
+    lock_path = _host_lock_path(dispatch_dir)
+    lock = common.acquire_flock(lock_path, attempts=2)
     if lock is None:
-        print(f"[gitsync] a daemon is already mirroring {dispatch_dir}; not starting a second.")
-        return 0
+        if gated:
+            print(f"[gitsync] a daemon is already mirroring {dispatch_dir}; not starting a second.")
+            return 0
+        print(f"[gitsync] another daemon holds {dispatch_dir}; waiting to take over…")
+        try:
+            while lock is None:
+                time.sleep(max(interval, 1.0))
+                lock = common.acquire_flock(lock_path)
+        except KeyboardInterrupt:
+            return 0
+        print("[gitsync] took over the host lock.")
 
     print(
         f"[gitsync] mirroring {dispatch_dir} <-> {repo_dir} "
-        f"(remote={remote or 'local'}, mirror={mirror}, every {interval}s)"
+        f"(remote={remote or 'local'}, mirror={mirror}, every {interval}s, "
+        f"lifetime={'presence-gated' if gated else 'until stopped'})"
     )
 
     # Presence-gated lifetime: exit once the host goes quiet (no live agents), so a
     # backgrounded daemon can't outlive every session and orphan. A startup grace
     # tolerates being launched a beat before the first session's presence appears.
+    # Ungated, none of that applies — the supervisor owns the lifetime.
     seen_live = False
     start = time.monotonic()
+    failures = 0
     try:
         while True:
-            bridge.tick_guarded()
-            live = bool(dispatch_fs.live_agents(dispatch_dir))
-            if live:
-                seen_live = True
-            elif seen_live:
-                print("[gitsync] no live agents on host — exiting (a new session re-arms me).")
-                return 0
-            elif time.monotonic() - start > STARTUP_GRACE_SECONDS:
-                print("[gitsync] no agents appeared within startup grace — exiting.")
-                return 0
-            time.sleep(interval)
+            ok = bridge.tick_guarded()
+            if gated:
+                live = bool(dispatch_fs.live_agents(dispatch_dir))
+                if live:
+                    seen_live = True
+                elif seen_live:
+                    print("[gitsync] no live agents on host — exiting (a new session re-arms me).")
+                    return 0
+                elif time.monotonic() - start > STARTUP_GRACE_SECONDS:
+                    print("[gitsync] no agents appeared within startup grace — exiting.")
+                    return 0
+                time.sleep(interval)
+                continue
+            # Ungated: back off on a run of failures so a broken remote (expired
+            # token, no network) isn't retried every 2s for the machine's uptime,
+            # then snap back to `interval` the moment a pass succeeds.
+            failures = 0 if ok else failures + 1
+            time.sleep(min(interval * (2**failures), MAX_BACKOFF_SECONDS) if failures else interval)
     except KeyboardInterrupt:
         return 0
 
@@ -310,6 +479,8 @@ def main() -> int:
         return cmd_init(argv[1:])
     if argv and argv[0] == "status":
         return cmd_status(argv[1:])
+    if argv and argv[0] == "service":
+        return cmd_service(argv[1:])
     return cmd_run(argv)
 
 
