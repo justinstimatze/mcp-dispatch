@@ -439,8 +439,9 @@ dispatch-gitsync init git@github.com:you/agent-bus.git --service
 It clones (or reuses) the bus, seeds it, writes the `[git]` config, then installs
 and starts the service. Re-running it is also the upgrade path — an existing clone
 is reused, an existing `[git]` block is left alone, and the unit is regenerated
-from current config. Add `--dry-run` to see the plan first. If the bus is already
-configured, just the second half:
+from current config. (`--dry-run` covers only the service half — the clone and the
+`[git]` config are written for real either way.) If the bus is already configured,
+just the second half:
 
 ```bash
 dispatch-gitsync service install      # systemd user unit, enabled + started
@@ -458,6 +459,12 @@ dispatch-gitsync service install --dry-run
 dispatch-gitsync service uninstall
 journalctl --user -u mcp-dispatch-gitsync -f    # watch it work
 ```
+
+Because the service runs whether or not an agent is awake, the bridge backs its
+**inbound** `git fetch` off toward `[git] max_fetch_interval` (30s) while the bus
+is quiet, snapping back to `interval` on any traffic. Sends are never slowed; only
+noticing the first message after a lull can be. Set `max_fetch_interval = 0` to
+fetch on every pass.
 
 A user service inherits almost nothing from your login shell, so **git credentials
 are the thing to check first**. Either use an HTTPS remote with a stored credential

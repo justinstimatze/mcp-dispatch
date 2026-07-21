@@ -30,6 +30,18 @@ truth for versions.
   to take over the host lock instead of exiting into a restart loop, and backs off
   to 60s after repeated sync failures instead of hammering a broken remote.
 
+### Changed
+- The daemon no longer `git fetch`es on every pass when the bus is quiet. A fetch
+  costs ~170ms of CPU against a real remote while the entire local scan costs
+  ~12ms, so a supervised 24/7 daemon spent essentially all of its ~5% CPU asking a
+  silent remote whether anything had happened. The inbound cadence now decays
+  toward `[git] max_fetch_interval` (default 30s) while nothing moves and snaps
+  back to `interval` on any traffic in either direction. Outbound is untouched, so
+  sends are as fast as before; only noticing the first message after a lull can be
+  delayed. Set `max_fetch_interval = 0` for the old behaviour.
+- The remote roster is only rewritten when it changes, instead of one write+rename
+  per known remote agent per pass forever.
+
 ### Fixed
 - Agents on a harness other than Claude Code had no running bridge at all. The only
   thing that started the daemon was `hooks/dispatch-gitsync-arm.py`, a *Claude

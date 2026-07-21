@@ -136,8 +136,13 @@ def render_unit(
     # Only the three trees the daemon actually writes. Listed even under
     # ProtectSystem=full (which leaves $HOME writable) so tightening to `strict`
     # later is a one-word change rather than a rediscovery of these paths.
+    # '-' makes a missing path non-fatal. The daemon deliberately supports starting
+    # before the relay exists (it waits for one), and state_dir may not exist on a
+    # fresh host — without the prefix, some systemd versions fail namespace setup and
+    # crash-loop the unit into its start limit before Python ever runs.
     rw = "\n".join(
-        f"ReadWritePaths={_esc(str(p))}" for p in dict.fromkeys([dispatch_dir, repo_dir, state_dir])
+        f"ReadWritePaths=-{_esc(str(p))}"
+        for p in dict.fromkeys([dispatch_dir, repo_dir, state_dir])
     )
     private_tmp = "yes" if not (_under_tmp(dispatch_dir) or _under_tmp(repo_dir)) else "no"
     umask = "0007" if group_mode else "0077"
@@ -206,12 +211,15 @@ def systemctl_available() -> bool:
     return shutil.which("systemctl") is not None and Path("/run/systemd/system").exists()
 
 
-def _systemctl(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+def _systemctl(
+    *args: str, check: bool = False, timeout: float = 30.0
+) -> subprocess.CompletedProcess:
     return subprocess.run(  # nosec B603 B607 - fixed binary, fixed literal args
         ["systemctl", "--user", *args],
         capture_output=True,
         text=True,
         check=check,
+        timeout=timeout,
     )
 
 
@@ -235,8 +243,12 @@ def install(unit_text: str, *, enable: bool = True, dry_run: bool = False) -> li
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Narrow the mode BEFORE any content lands. `--env` can carry an auth token, and
+    # writing first at the ambient umask (0644 in a 0755 dir) then chmod'ing leaves a
+    # window where any local process can read it.
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)  # existing unit from an earlier, laxer install
     path.write_text(unit_text)
-    path.chmod(0o600)  # may carry an auth token in Environment=
     _systemctl("daemon-reload", check=True)
     steps.append("systemctl --user daemon-reload")
     if enable:
@@ -273,6 +285,11 @@ def status_lines() -> list[str]:
         return ["service unit:     (not installed — `dispatch-gitsync service install`)"]
     if not systemctl_available():
         return [f"service unit:     {path} (no systemd session to query)"]
-    active = _systemctl("is-active", UNIT_NAME).stdout.strip() or "unknown"
-    enabled = _systemctl("is-enabled", UNIT_NAME).stdout.strip() or "unknown"
+    # `status` is the command the README sends you to when comms are broken, so a
+    # wedged user manager must not take the relay report down with it.
+    try:
+        active = _systemctl("is-active", UNIT_NAME, timeout=5).stdout.strip() or "unknown"
+        enabled = _systemctl("is-enabled", UNIT_NAME, timeout=5).stdout.strip() or "unknown"
+    except (subprocess.TimeoutExpired, OSError):
+        return [f"service unit:     {path}", "service state:    (systemctl did not respond)"]
     return [f"service unit:     {path}", f"service state:    {active} / {enabled} at login"]

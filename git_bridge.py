@@ -65,7 +65,22 @@ class GitBridge:
         mirror: str = "remote-only",
         group_mode: bool = False,
         state_dir: str | Path | None = None,
+        poll_interval: float = 2.0,
+        max_fetch_interval: float = 0.0,
     ) -> None:
+        # Inbound pacing. `git fetch` is by far the most expensive thing a tick does
+        # — ~170ms of CPU against a real remote, versus ~12ms for the entire local
+        # scan — so a daemon that runs 24/7 spends essentially all of its CPU asking
+        # a quiet remote whether anything happened. max_fetch_interval > 0 lets the
+        # fetch cadence decay toward that ceiling while the bus stays silent, and
+        # snap back to poll_interval the instant there is traffic in EITHER
+        # direction (a local send makes an inbound reply likely). 0 keeps the old
+        # fetch-every-tick behaviour, which is what tick()'s contract implies and
+        # what --once and the tests want.
+        self._poll_interval = max(0.05, poll_interval)
+        self._max_fetch_interval = max(0.0, max_fetch_interval)
+        self._fetch_every = self._poll_interval
+        self._next_fetch = 0.0  # monotonic deadline; 0 => fetch on the very first tick
         self.dispatch_dir = Path(dispatch_dir)
         self.repo_dir = Path(repo_dir)
         self.remote = remote
@@ -94,10 +109,38 @@ class GitBridge:
     # -- public surface -----------------------------------------------------
 
     def tick(self) -> None:
-        """Run one outbound pass, one inbound pass, then refresh the remote roster."""
-        self._outbound()
-        self._inbound()
+        """Run one outbound pass, one inbound pass, then refresh the remote roster.
+
+        The inbound pass is skipped while a backoff is in effect (see
+        ``max_fetch_interval``); outbound always runs, so *sending* is never slowed
+        by a quiet bus — only noticing the first message after a lull is.
+        """
+        published = self._outbound()
+        if published:
+            self._quicken()  # a send makes a reply likely — listen closely again
+        if not self._fetch_due():
+            return
+        received = self._inbound()
+        if received or published:
+            self._quicken()
+        else:
+            self._slow_down()
         self._write_remote_roster()
+
+    # -- inbound pacing -----------------------------------------------------
+
+    def _fetch_due(self) -> bool:
+        if not self._max_fetch_interval:
+            return True  # pacing disabled: every tick fetches, as before
+        return time.monotonic() >= self._next_fetch
+
+    def _quicken(self) -> None:
+        self._fetch_every = self._poll_interval
+        self._next_fetch = 0.0
+
+    def _slow_down(self) -> None:
+        self._fetch_every = min(self._fetch_every * 2, self._max_fetch_interval)
+        self._next_fetch = time.monotonic() + self._fetch_every
 
     def tick_guarded(self) -> bool:
         """tick() that never raises: a transient git/network error (laptop asleep,
@@ -154,7 +197,8 @@ class GitBridge:
                     continue  # arrived over git — never echo back
                 yield msg
 
-    def _outbound(self) -> None:
+    def _outbound(self) -> int:
+        """Publish new local messages to git. Returns how many were sent."""
         published = 0
         for msg in self._local_messages():
             mid = msg.get("id")
@@ -170,6 +214,7 @@ class GitBridge:
             self._save_ledger()
             if self.remote:
                 self._reader.push()
+        return published
 
     def _publish_one(self, msg: dict) -> bool:
         """Publish a local message to its sender's git lane. Returns True if sent."""
@@ -195,7 +240,9 @@ class GitBridge:
 
     # -- inbound: git lane -> local inbox -----------------------------------
 
-    def _inbound(self) -> None:
+    def _inbound(self) -> int:
+        """Materialize new git records into local inboxes. Returns how many landed."""
+        materialized = 0
         present: dict[str, set[str]] = {}  # recipient -> msg-ids already in its inbox
 
         def known(rcpt: str) -> set[str]:
@@ -214,8 +261,10 @@ class GitBridge:
                 if mid and mid in known(rcpt):
                     continue  # dedup: local original, or already materialized
                 self._materialize(rcpt, env)
+                materialized += 1
                 if mid:
                     known(rcpt).add(mid)
+        return materialized
 
     def _recipients(self, env: Envelope) -> list[str]:
         # Never deliver a record back to its own author (a channel post must not
@@ -291,10 +340,18 @@ class GitBridge:
         roster_dir.mkdir(parents=True, exist_ok=True)
         existing = {p.stem: p for p in roster_dir.glob("*.json")}
         for author, last_seen in current.items():
-            dispatch_fs.atomic_write(
-                roster_dir / f"{author}.json",
-                {"agent_id": author, "via": "git", "last_seen": last_seen},
-            )
+            path = roster_dir / f"{author}.json"
+            record = {"agent_id": author, "via": "git", "last_seen": last_seen}
+            # Only write on change. The roster is derived from lane *existence*, so
+            # in the steady state every entry is byte-identical to what's already on
+            # disk — rewriting them unconditionally meant one write+rename per known
+            # remote agent per tick, forever, for no observable difference.
+            try:
+                if json.loads(path.read_text()) == record:
+                    continue
+            except (OSError, json.JSONDecodeError):
+                pass
+            dispatch_fs.atomic_write(path, record)
         for stale in set(existing) - set(current):  # self-pruning each pass
             try:
                 existing[stale].unlink()

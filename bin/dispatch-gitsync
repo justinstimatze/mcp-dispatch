@@ -462,7 +462,22 @@ def cmd_run(argv: list[str]) -> int:
             return 0
         print(f"[gitsync] relay appeared at {dispatch_dir}.")
 
-    bridge = GitBridge(dispatch_dir, repo_dir, remote=remote, mirror=mirror, group_mode=group_mode)
+    # Inbound fetch pacing. `git fetch` costs ~170ms of CPU against a real remote
+    # while the whole local scan costs ~12ms, so polling it every `interval` for as
+    # long as the machine is up is where all of a 24/7 daemon's CPU goes. Let the
+    # fetch cadence decay toward `max_fetch_interval` while the bus is silent; any
+    # traffic in either direction snaps it straight back to `interval`. A --once
+    # pass and any explicit 0 keep the fetch-every-tick behaviour.
+    max_fetch = float(git.get("max_fetch_interval", 30.0))
+    bridge = GitBridge(
+        dispatch_dir,
+        repo_dir,
+        remote=remote,
+        mirror=mirror,
+        group_mode=group_mode,
+        poll_interval=interval,
+        max_fetch_interval=0.0 if args.once else max_fetch,
+    )
 
     # Startup catch-up: if a prior run committed lane records but couldn't push
     # (a network/auth outage froze the remote), flush them now so a restart alone

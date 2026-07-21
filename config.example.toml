@@ -98,6 +98,15 @@ default_ttl = 604800  # 7 days
 # Seconds between sync passes.
 # interval = 2.0
 #
+# Ceiling for the INBOUND fetch cadence when the bus is quiet (default 30s; set 0
+# to fetch every pass). `git fetch` costs ~170ms of CPU against a real remote while
+# the entire local scan costs ~12ms, so a daemon supervised 24/7 would otherwise
+# spend all its CPU asking a silent remote whether anything happened. Outbound is
+# unaffected — sends always go at `interval` — and any traffic in either direction
+# snaps the fetch cadence straight back to `interval`. The only cost is that the
+# first message arriving after a long lull can take up to this long to be noticed.
+# max_fetch_interval = 30.0
+#
 # Exit once no agent on this host holds a presence lock (default true). That gate
 # is what stops a hook-spawned daemon from orphaning — but presence is claimed by
 # the mcp-dispatch MCP *server*, so an agent on another harness (openclaw, Hermes,

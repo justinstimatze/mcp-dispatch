@@ -118,10 +118,12 @@ def test_umask_follows_group_mode():
 
 
 def test_writable_paths_cover_every_tree_the_daemon_writes():
+    """Each is '-' prefixed: the daemon supports starting before the relay exists,
+    and a fatal missing ReadWritePaths would crash-loop it before Python runs."""
     text = _unit()
     for p in ("/home/a/.config/mcp-dispatch/messages", "/home/a/.config/mcp-dispatch/bus"):
-        assert f"ReadWritePaths={p}" in text
-    assert "ReadWritePaths=/home/a/.cache/mcp-dispatch" in text
+        assert f"ReadWritePaths=-{p}" in text
+    assert "ReadWritePaths=-/home/a/.cache/mcp-dispatch" in text
 
 
 def test_no_capability_implying_directives():

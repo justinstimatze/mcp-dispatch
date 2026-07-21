@@ -327,3 +327,82 @@ def test_broadcast_not_bridged(hosts):
     hosts.b.tick()
     assert _inbox_files(hosts.dir_b, "bob") == []
     assert not (hosts.repo_a / "lanes" / "alice.jsonl").exists()
+
+
+# ── inbound fetch pacing ─────────────────────────────────────────────────────
+
+
+def test_fetch_backs_off_on_a_silent_bus(tmp_path, monkeypatch):
+    """`git fetch` is ~170ms of CPU against a real remote while the whole local
+    scan is ~12ms, so a 24/7 daemon polling every 2s spends all its CPU asking a
+    quiet remote whether anything happened. The cadence must decay while silent."""
+    dd = tmp_path / "messages"
+    dd.mkdir()
+    repo = tmp_path / "bus"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    b = GitBridge(dd, repo, poll_interval=2.0, max_fetch_interval=30.0)
+
+    fetches = []
+    monkeypatch.setattr(b, "_inbound", lambda: (fetches.append(1), 0)[1])
+    monkeypatch.setattr(b, "_outbound", lambda: 0)
+    monkeypatch.setattr(b, "_write_remote_roster", lambda: None)
+
+    b.tick()  # first tick always fetches (nothing known yet)
+    assert len(fetches) == 1
+    b.tick()  # ...then the backoff holds it off
+    assert len(fetches) == 1
+    assert b._fetch_every == 4.0  # 2 -> 4, doubling toward the ceiling
+
+
+def test_backoff_ceiling_is_respected(tmp_path):
+    dd = tmp_path / "messages"
+    dd.mkdir()
+    repo = tmp_path / "bus"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    b = GitBridge(dd, repo, poll_interval=2.0, max_fetch_interval=30.0)
+    for _ in range(20):
+        b._slow_down()
+    assert b._fetch_every == 30.0
+
+
+def test_traffic_snaps_the_cadence_back(tmp_path, monkeypatch):
+    """A local send makes an inbound reply likely, so it must not have to wait out
+    a 30s backoff — otherwise a conversation resuming after a lull stalls."""
+    dd = tmp_path / "messages"
+    dd.mkdir()
+    repo = tmp_path / "bus"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    b = GitBridge(dd, repo, poll_interval=2.0, max_fetch_interval=30.0)
+    monkeypatch.setattr(b, "_write_remote_roster", lambda: None)
+    monkeypatch.setattr(b, "_inbound", lambda: 0)
+
+    monkeypatch.setattr(b, "_outbound", lambda: 0)
+    for _ in range(5):
+        b.tick()
+    assert b._fetch_every > 2.0  # decayed while silent
+
+    monkeypatch.setattr(b, "_outbound", lambda: 1)  # someone sent something
+    b.tick()
+    assert b._fetch_every == 2.0
+    assert b._next_fetch == 0.0  # and the next tick fetches immediately
+
+
+def test_pacing_disabled_by_default(tmp_path, monkeypatch):
+    """tick()'s contract is 'one outbound pass, one inbound pass'. --once and the
+    rest of the suite depend on that, so pacing stays opt-in."""
+    dd = tmp_path / "messages"
+    dd.mkdir()
+    repo = tmp_path / "bus"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    b = GitBridge(dd, repo)
+    fetches = []
+    monkeypatch.setattr(b, "_inbound", lambda: (fetches.append(1), 0)[1])
+    monkeypatch.setattr(b, "_outbound", lambda: 0)
+    monkeypatch.setattr(b, "_write_remote_roster", lambda: None)
+    for _ in range(4):
+        b.tick()
+    assert len(fetches) == 4
