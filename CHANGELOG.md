@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-21
+
 ### Added
 - `scripts/setup-cross-host.sh <bus-url>` — one command that sets a host up on the
   bus and checks the things people actually trip over: reachability of the bus
@@ -18,7 +20,8 @@ truth for versions.
 - Documented systemd **user lingering**. Without `loginctl enable-linger`, the
   service doesn't start at boot and is torn down with your last session on many
   distros — so on a headless host the bridge ran only while someone was logged in,
-  which presents exactly like the cross-host outage this release fixes.
+  which presents identically to the cross-host outage 0.11.0 set out to fix. The
+  service could be installed, enabled and correct, and still not be running.
 
 ## [0.11.0] - 2026-07-21
 
@@ -228,7 +231,8 @@ truth for versions.
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.8.1...v0.9.0
