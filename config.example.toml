@@ -167,12 +167,24 @@ Available targets: {agent_list}.
 # against ours by the kernel. Nothing on the network can reach it.
 # socket = "~/.config/mcp-dispatch/irc.sock"
 
-# Optional TCP. Loopback is served in the clear; a non-loopback address needs
-# BOTH allow_remote and TLS, and is refused otherwise.
-# listen = "127.0.0.1:6667"
+# Optional TCP. EVERY TCP listener must be encrypted, loopback included —
+# cleartext on lo is not private, and the token is equivalent to read/write on
+# the whole relay. Generate a certificate with `dispatch-ircd --init-tls`.
+# listen = "127.0.0.1:6697"
+# tls_cert = "~/.config/mcp-dispatch/irc-cert.pem"
+# tls_key = "~/.config/mcp-dispatch/irc-key.pem"
+
+# The TLS version floor: "1.3" (default) or "1.2" for a client too old to speak
+# it. Nothing below 1.2 is reachable through this knob.
+# tls_min_version = "1.3"
+
+# Mutual TLS: require a client certificate signed by this CA. An ADDITIONAL gate
+# — the token is still required. A certificate never replaces it.
+# tls_client_ca = ""
+
+# The separate axis: exposure. Required to bind a non-loopback address, and it
+# buys exposure only — never cleartext.
 # allow_remote = false
-# tls_cert = ""
-# tls_key = ""
 
 # The shared secret, required on every transport including the unix socket.
 # Generate it with `dispatch-ircd --init-token`; it must be 0600 and >= 32 chars.

@@ -16,7 +16,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Durable nicks** — the id behind the pid (`publicai`, not `publicai-1767991`) is registered and never reaped, so a teammate stays discoverable and addressable while offline. A DM to a nick reaches its live sessions, or waits for the next one. See [durable identity](#durable-identity-nicks-that-outlive-a-session).
 - **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick.
-- **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, and a hard refusal to serve a public address in the clear. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
+- **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, TLS required on every TCP listener (loopback included), and a hard refusal to serve a public address at all without asking. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to
@@ -439,9 +439,17 @@ enabled = true    # there is deliberately no command-line flag for this
 By default it binds a `0600` unix socket and nothing else — no port, no network.
 The kernel checks the connecting process's uid (`SO_PEERCRED`, unforgeable, and
 enforced even if the token leaks); a token is required on every transport
-including that socket; wrong tokens are counted and then banned; nothing at all
-is served before authentication; and a non-loopback bind is refused without
-*both* `allow_remote` and TLS. Read [docs/irc-gateway.md](docs/irc-gateway.md)
+including that socket; wrong tokens are counted and then banned; and nothing at
+all is served before authentication.
+
+If you do want TCP, **it must be TLS** — at every address, loopback included,
+since cleartext on `lo` still exposes the token to anything that can capture it.
+`dispatch-ircd --init-tls` generates a certificate and prints the SHA-256
+fingerprint to pin (also printed on every start). TLS 1.3 is the floor;
+`tls_client_ca` adds mutual TLS on top of, never instead of, the token. Exposure
+is a separate axis: a non-loopback bind additionally needs `allow_remote`.
+
+Read [docs/irc-gateway.md](docs/irc-gateway.md)
 before enabling it — the token is equivalent to read/write access to every agent
 conversation on the host.
 
@@ -725,8 +733,9 @@ This is local-host-only IPC; the threat model is other local users on a shared m
   which is the only component here that accepts a connection. It is off unless
   the config file enables it, binds a `0600` unix socket rather than a port by
   default, checks the peer's uid with the kernel, requires a token on every
-  transport, and refuses a non-loopback bind without both `allow_remote` and
-  TLS. Enabling it moves you to a different threat model — the token is
+  transport, requires TLS on every TCP listener (loopback included), and refuses
+  a non-loopback bind without `allow_remote`. Enabling it moves you to a
+  different threat model — the token is
   equivalent to read/write access to every conversation on the relay. See
   [docs/irc-gateway.md](docs/irc-gateway.md).
 - The systemd unit written by `dispatch-gitsync service install` is created `0600`

@@ -19,6 +19,7 @@ transport, and it refuses outright to serve a public address in the clear.
 
 ```bash
 bin/dispatch-ircd --init-token     # generate the shared secret (0600), once
+bin/dispatch-ircd --init-tls       # ...and a certificate, if you want TCP
 ```
 
 Then turn it on — there is deliberately no flag that does this:
@@ -37,14 +38,30 @@ bin/dispatch-ircd                  # run
 Connect over the unix socket (no network involved at all):
 
 ```bash
-# WeeChat
+# WeeChat, over the unix socket — no TLS involved, and none needed
 /server add dispatch unix:///home/you/.config/mcp-dispatch/irc.sock
 /set irc.server.dispatch.password <token>
 /connect dispatch
-
-# irssi and most others want TCP — add `listen = "127.0.0.1:6667"` to [irc]
-/connect -network dispatch 127.0.0.1 6667 <token>
 ```
+
+For clients that only speak TCP, add a listener — which **must** be TLS:
+
+```toml
+[irc]
+listen   = "127.0.0.1:6697"
+tls_cert = "~/.config/mcp-dispatch/irc-cert.pem"
+tls_key  = "~/.config/mcp-dispatch/irc-key.pem"
+```
+
+```bash
+/connect -tls -tls_cert_fp <fingerprint> dispatch 127.0.0.1 6697 <token>
+```
+
+`--init-tls` and every startup print the certificate's SHA-256 fingerprint. A
+self-signed certificate is trusted by **pinning**, not by a CA, so put that
+fingerprint in your client (`tls_cert_fp` in irssi, `ssl_fingerprint` in
+WeeChat) rather than turning verification off. Pinning is the stronger of the
+two anyway — it notices a swapped certificate, which a public CA would not.
 
 The token goes in the server-password field, or as the SASL PLAIN password if
 your client prefers that (`sasl` is advertised; only PLAIN is supported).
@@ -145,12 +162,29 @@ only negotiate capabilities, present a token, and set a nick. `JOIN`, `PRIVMSG`,
 `NAMES`, `WHO` and `LIST` all answer `451` — no roster, no channel list, no
 traffic, not even the shape of the relay.
 
-**A public bind is refused twice over.** Binding a non-loopback address needs
-`allow_remote = true`; a non-loopback address *without TLS* is refused even
-then, because the token and every message body would be readable on the path.
-A wildcard bind (`0.0.0.0`, `::`, `:6667`) counts as public — that is the case
-most likely to be typed by accident, so it fails the check rather than sliding
-through it.
+**Every TCP listener is encrypted — loopback included.** There is no cleartext
+TCP mode at any address. Loopback traffic is not private: anything on the host
+that can capture `lo` reads the token, and the token is equivalent to read/write
+on every conversation on the relay. TLS 1.3 is the default floor; `1.2` exists
+for a client too old to speak it, and nothing below that is reachable through
+the knob. The unix socket is the supported way to have an unencrypted
+transport, which is exactly why it is the default.
+
+**Exposure is a separate axis from encryption.** Binding a non-loopback address
+additionally needs `allow_remote = true`. TLS does not make a public bind
+automatic and `allow_remote` never buys cleartext — the two refusals are
+independent. A wildcard bind (`0.0.0.0`, `::`, `:6697`) counts as public; that
+is the case most likely to be typed by accident, so it fails the check rather
+than sliding through it.
+
+**Mutual TLS, if you want it.** Set `tls_client_ca` and clients must present a
+certificate signed by that CA (`RequireAndVerifyClientCert`). It is an
+*additional* gate: the token is still required. The conventional IRC move is to
+let a certificate stand in for the password (SASL EXTERNAL / CertFP), and we
+deliberately don't — that is a second authentication path with its own bugs,
+and requiring both costs a client nothing it isn't already configured for. An
+unreadable or unusable CA file fails at startup rather than silently leaving
+mTLS off.
 
 **Nicks are relay-safe.** A nick becomes a path segment on the relay, so it must
 match `^[a-z0-9][a-z0-9_-]{0,63}$` — the same rule the Python server enforces.
@@ -173,12 +207,17 @@ presence, so a crashed gateway's lock is released by the kernel.
 ### What it does not protect against
 
 - **A leaked token on a TCP listener.** Peer credentials only exist on the unix
-  socket. If you enable TCP, the token is the only thing between a local process
-  (or, with `allow_remote`, the network) and every conversation on the relay.
-  Prefer the socket.
-- **A bouncer you don't control.** Handing your token to a hosted ZNC means
-  handing that host your agents' traffic. Run the bouncer on the same machine,
-  or on one you own.
+  socket. TLS protects the token in transit but nothing protects it once copied;
+  on TCP it is the only thing between a local process (or, with `allow_remote`,
+  the network) and every conversation on the relay. Prefer the socket, and reach
+  for `tls_client_ca` if you can't.
+- **A bouncer you don't control.** A bouncer is a second holder of your token
+  and a second copy of your scrollback, so it inherits the whole threat model.
+  Connect it to the gateway over the unix socket if it runs on the same host, or
+  over TLS with the fingerprint pinned if it doesn't — and do not point it at a
+  hosted ZNC, which means handing that operator your agents' traffic in
+  readable form. `soju` on the same machine, over the socket, is the shape that
+  keeps the guarantees above intact.
 - **Anything at rest.** Messages are cleartext on disk, as they always were.
 - **A compromised account.** The gateway runs as you and reads what you can read.
 
@@ -192,8 +231,10 @@ under `[irc]`. The ones worth knowing:
 | `enabled` | `false` | the master switch; no flag equivalent |
 | `socket` | `~/.config/mcp-dispatch/irc.sock` | unix transport, `0600`, uid-checked |
 | `listen` | *(unset)* | optional TCP `host:port` |
-| `allow_remote` | `false` | required for a non-loopback bind |
-| `tls_cert` / `tls_key` | *(unset)* | required for a non-loopback bind |
+| `tls_cert` / `tls_key` | *(unset)* | **required for any TCP listener** |
+| `tls_min_version` | `1.3` | version floor; `1.2` for an old client |
+| `tls_client_ca` | *(unset)* | mutual TLS — an extra gate, not a token replacement |
+| `allow_remote` | `false` | required for a non-loopback bind (exposure only) |
 | `token_file` | `~/.config/mcp-dispatch/irc-token` | must be `0600`, ≥32 chars |
 | `max_conns` | `8` | concurrent clients |
 | `auth_timeout` | `10` | seconds to authenticate before disconnect |

@@ -9,6 +9,7 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
@@ -16,6 +17,41 @@ import (
 	"path/filepath"
 	"syscall"
 )
+
+// tlsConfig builds the server's TLS settings: the key pair, the version floor,
+// and — when a client CA is configured — mutual TLS.
+//
+// Mutual TLS is an *additional* gate here, never a replacement for the token.
+// Letting a certificate stand in for the password (IRC's SASL EXTERNAL) is the
+// conventional move, and it is a second authentication path with its own bugs;
+// requiring both costs a client nothing it isn't already configured for.
+func tlsConfig(c Config) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(c.TLSCert, c.TLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("tls: %w", err)
+	}
+	minVer, err := tlsMinVersion(c.TLSMinVersion)
+	if err != nil {
+		return nil, err
+	}
+	tc := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   minVer,
+	}
+	if c.TLSClientCA != "" {
+		pem, err := os.ReadFile(c.TLSClientCA) //nolint:gosec // operator-configured path
+		if err != nil {
+			return nil, fmt.Errorf("tls_client_ca: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("tls_client_ca: %s contains no usable certificate", c.TLSClientCA)
+		}
+		tc.ClientCAs = pool
+		tc.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return tc, nil
+}
 
 // listeners builds every configured transport. The caller closes them.
 func listeners(c Config) ([]net.Listener, error) {
@@ -46,21 +82,23 @@ func listeners(c Config) ([]net.Listener, error) {
 		if !isLoopback(c.Listen) {
 			scope = "REMOTE"
 		}
-		if c.TLSCert != "" && c.TLSKey != "" {
-			cert, err := tls.LoadX509KeyPair(c.TLSCert, c.TLSKey)
-			if err != nil {
-				_ = l.Close()
-				closeAll()
-				return nil, fmt.Errorf("tls: %w", err)
-			}
-			l = tls.NewListener(l, &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				MinVersion:   tls.VersionTLS12,
-			})
-			log.Printf("irc: listening on tcp %s (%s, TLS)", c.Listen, scope)
-		} else {
-			log.Printf("irc: listening on tcp %s (%s, CLEARTEXT — token and message "+
-				"bodies are readable by anything on the path)", c.Listen, scope)
+		tc, err := tlsConfig(c)
+		if err != nil {
+			_ = l.Close()
+			closeAll()
+			return nil, err
+		}
+		l = tls.NewListener(l, tc)
+		mutual := ""
+		if c.TLSClientCA != "" {
+			mutual = ", mutual (client certs required)"
+		}
+		log.Printf("irc: listening on tcp %s (%s, TLS %s+%s)", c.Listen, scope,
+			c.TLSMinVersion, mutual)
+		if fp, err := fingerprintFile(c.TLSCert); err == nil {
+			// Printed every start, not just on generation: a self-signed cert is
+			// trusted by pinning, and a pin you can't re-check is not a pin.
+			log.Printf("irc: certificate SHA-256 %s", fp)
 		}
 		out = append(out, l)
 	}

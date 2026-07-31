@@ -11,6 +11,7 @@ package main
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -37,12 +38,20 @@ type Config struct {
 	Socket string `toml:"socket"`
 	Listen string `toml:"listen"`
 
-	// AllowRemote is the second key required to bind a non-loopback address.
-	// TLS is the third — a non-loopback bind in cleartext is refused even
-	// with this set, because the relay's traffic is a team's codebase talk.
+	// AllowRemote is the extra key required to bind a *non-loopback* address.
+	// TLS is not on that axis: every TCP listener needs it, loopback included.
 	AllowRemote bool   `toml:"allow_remote"`
 	TLSCert     string `toml:"tls_cert"`
 	TLSKey      string `toml:"tls_key"`
+
+	// TLSMinVersion is "1.3" (default) or "1.2". 1.3 is the floor a new
+	// deployment should be on; 1.2 exists for an IRC client too old to speak it.
+	TLSMinVersion string `toml:"tls_min_version"`
+
+	// TLSClientCA turns on mutual TLS: clients must present a certificate
+	// signed by this CA. An *additional* gate, never a replacement for the
+	// token — see Validate and docs/irc-gateway.md.
+	TLSClientCA string `toml:"tls_client_ca"`
 
 	TokenFile string `toml:"token_file"`
 	Nick      string `toml:"nick"`
@@ -94,6 +103,10 @@ func LoadConfig() Config {
 	c.TokenFile = relay.ExpandUser(c.TokenFile)
 	c.TLSCert = relay.ExpandUser(c.TLSCert)
 	c.TLSKey = relay.ExpandUser(c.TLSKey)
+	c.TLSClientCA = relay.ExpandUser(c.TLSClientCA)
+	if c.TLSMinVersion == "" {
+		c.TLSMinVersion = "1.3"
+	}
 
 	if c.MaxConns <= 0 {
 		c.MaxConns = 8
@@ -168,24 +181,44 @@ func (c Config) Validate() error {
 		if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 			return fmt.Errorf("[irc] listen = %q is not host:port: %w", c.Listen, err)
 		}
-		hasTLS := c.TLSCert != "" && c.TLSKey != ""
-		if !isLoopback(c.Listen) {
-			if !c.AllowRemote {
-				return fmt.Errorf("[irc] listen = %q is not a loopback address\n"+
-					"→ refusing to serve the relay to the network. Bind 127.0.0.1 instead,\n"+
-					"  or set [irc] allow_remote = true AND configure tls_cert/tls_key.", c.Listen)
-			}
-			if !hasTLS {
-				return fmt.Errorf("[irc] listen = %q is remote and has no TLS\n"+
-					"→ refusing: message bodies are cleartext on the wire and the auth token\n"+
-					"  would be too. Set tls_cert and tls_key. allow_remote alone is not enough.", c.Listen)
-			}
-		}
 		if (c.TLSCert == "") != (c.TLSKey == "") {
 			return fmt.Errorf("[irc] tls_cert and tls_key must be set together")
 		}
+		// Every TCP listener is encrypted — loopback included. Cleartext on lo
+		// is not private: the token and every message body are readable by
+		// anything on the host that can capture on the loopback interface, and
+		// the token is equivalent to read/write on the whole relay. A unix
+		// socket is the way to get an unencrypted transport, and it is the
+		// default precisely so that needing this is the exception.
+		if c.TLSCert == "" {
+			return fmt.Errorf("[irc] listen = %q has no TLS\n"+
+				"→ refusing: every TCP listener must be encrypted, loopback included.\n"+
+				"  Generate a certificate:  dispatch-ircd --init-tls\n"+
+				"  Or drop `listen` and use the unix socket, which needs no TLS at all.", c.Listen)
+		}
+		if _, err := tlsMinVersion(c.TLSMinVersion); err != nil {
+			return err
+		}
+		if !isLoopback(c.Listen) && !c.AllowRemote {
+			return fmt.Errorf("[irc] listen = %q is not a loopback address\n"+
+				"→ refusing to serve the relay to the network. Bind 127.0.0.1 instead,\n"+
+				"  or set [irc] allow_remote = true if you really mean to.", c.Listen)
+		}
 	}
 	return nil
+}
+
+// tlsMinVersion maps the config string to a Go constant. The floor is 1.2:
+// everything below it has been broken in public for years, so there is no
+// version of this knob that turns them back on.
+func tlsMinVersion(s string) (uint16, error) {
+	switch s {
+	case "", "1.3":
+		return tls.VersionTLS13, nil
+	case "1.2":
+		return tls.VersionTLS12, nil
+	}
+	return 0, fmt.Errorf("[irc] tls_min_version = %q — valid values are \"1.3\" (default) and \"1.2\"", s)
 }
 
 // ReadToken loads the shared secret and refuses anything that would make it a

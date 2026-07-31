@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -53,7 +54,9 @@ func main() {
 		gitRepo     = flag.String("git-repo", "", "git-bus clone dir (default: config [git].repo_dir)")
 		noGit       = flag.Bool("no-git", false, "local inboxes only — don't read the cross-host git bus")
 		initToken   = flag.Bool("init-token", false, "generate the auth token and exit")
-		force       = flag.Bool("force", false, "with --init-token, replace an existing token")
+		initTLS     = flag.Bool("init-tls", false, "generate a self-signed TLS certificate and exit")
+		tlsHosts    = flag.String("tls-hosts", "", "with --init-tls: extra hostnames/IPs for the certificate (comma separated)")
+		force       = flag.Bool("force", false, "with --init-token/--init-tls, replace what exists")
 		check       = flag.Bool("check", false, "validate configuration and exit")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
@@ -86,6 +89,27 @@ func main() {
 		return
 	}
 
+	if *initTLS {
+		certPath, keyPath := cfg.TLSCert, cfg.TLSKey
+		if certPath == "" {
+			certPath = relay.ExpandUser("~/.config/mcp-dispatch/irc-cert.pem")
+		}
+		if keyPath == "" {
+			keyPath = relay.ExpandUser("~/.config/mcp-dispatch/irc-key.pem")
+		}
+		fp, err := WriteSelfSignedCert(certPath, keyPath, strings.Split(*tlsHosts, ","), *force)
+		if err != nil {
+			fatal("%v", err)
+		}
+		fmt.Printf("wrote %s\n      %s (0600)\n\n", certPath, keyPath)
+		fmt.Printf("  SHA-256  %s\n\n", fp)
+		fmt.Println("Point the config at them, then pin that fingerprint in your client —")
+		fmt.Println("a self-signed certificate is trusted by pinning, not by a CA:")
+		fmt.Printf("\n    [irc]\n    listen = \"127.0.0.1:6697\"\n    tls_cert = \"%s\"\n    tls_key = \"%s\"\n",
+			certPath, keyPath)
+		return
+	}
+
 	if err := cfg.Validate(); err != nil {
 		fatal("%v", err)
 	}
@@ -115,6 +139,14 @@ func main() {
 		fmt.Printf("  git bus      %s\n", orNone(repoLabel(repo, readGit)))
 		fmt.Printf("  unix socket  %s\n", orNone(cfg.Socket))
 		fmt.Printf("  tcp listen   %s\n", orNone(tcpLabel(cfg)))
+		if cfg.TLSCert != "" {
+			fp, err := fingerprintFile(cfg.TLSCert)
+			if err != nil {
+				fatal("tls_cert: %v", err)
+			}
+			fmt.Printf("  tls cert     %s\n", cfg.TLSCert)
+			fmt.Printf("  fingerprint  %s\n", fp)
+		}
 		fmt.Printf("  token        %s (%d bytes)\n", cfg.TokenFile, len(token))
 		fmt.Printf("  max conns    %d\n", cfg.MaxConns)
 		return
@@ -210,13 +242,11 @@ func tcpLabel(c Config) string {
 	if c.Listen == "" {
 		return ""
 	}
-	s := c.Listen
-	if c.TLSCert != "" {
-		s += " (TLS)"
-	} else {
-		s += " (cleartext, loopback only)"
+	s := c.Listen + " (TLS " + c.TLSMinVersion + "+"
+	if c.TLSClientCA != "" {
+		s += ", mutual"
 	}
-	return s
+	return s + ")"
 }
 
 func orNone(s string) string {

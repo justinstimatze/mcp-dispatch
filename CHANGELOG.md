@@ -6,6 +6,31 @@ truth for versions.
 
 ## [Unreleased]
 
+### Security
+- **TLS is required on every TCP listener the IRC gateway binds — loopback
+  included.** There is no cleartext TCP mode at any address any more. Cleartext
+  on `lo` is not private: anything on the host that can capture the loopback
+  interface reads the auth token, which is equivalent to read/write on every
+  conversation on the relay. The unix socket remains the supported unencrypted
+  transport (kernel-mediated, `0600`, uid-checked) and remains the default, so
+  needing this is the exception.
+- `dispatch-ircd --init-tls` generates a self-signed ECDSA P-256 certificate
+  covering localhost, the loopback addresses and this host's name (plus
+  `--tls-hosts`), writes the key `0600`, and prints the SHA-256 fingerprint —
+  also printed on every start, since a self-signed certificate is trusted by
+  pinning and a pin you can't re-check is not a pin.
+- `tls_min_version` defaults to **1.3**, with `1.2` available for a client too
+  old to speak it. Nothing below 1.2 is reachable through the knob, and an
+  invalid value fails validation rather than falling back silently.
+- `tls_client_ca` adds mutual TLS (`RequireAndVerifyClientCert`). Deliberately
+  an *additional* gate: unlike the conventional IRC CertFP/SASL EXTERNAL move, a
+  certificate never replaces the token — that would be a second authentication
+  path with its own bugs, and requiring both costs a configured client nothing.
+  An unusable CA file fails at startup instead of silently disabling mTLS.
+- Encryption and exposure are now independent axes. `allow_remote` is still
+  required for a non-loopback bind and buys exposure only, never cleartext; TLS
+  does not make a public bind automatic.
+
 ### Added
 - **Tasks** — a `task(action, ...)` tool for claimable work items (`create`,
   `claim`, `done`, `list`), stored under `{dispatch_dir}/.tasks/`. Claiming is

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -30,8 +32,11 @@ func TestGatewayIsOffUntilExplicitlyEnabled(t *testing.T) {
 }
 
 func TestRefusesNonLoopbackWithoutAllowRemote(t *testing.T) {
+	// TLS is satisfied here so the *address* axis is what is under test — the
+	// two refusals are independent, and encryption does not imply exposure.
 	for _, addr := range []string{"0.0.0.0:6667", ":6667", "[::]:6667", "10.0.0.5:6667"} {
-		c := Config{Enabled: true, Listen: addr}
+		c := Config{Enabled: true, Listen: addr, TLSCert: "/c.pem", TLSKey: "/k.pem",
+			TLSMinVersion: "1.3"}
 		err := c.Validate()
 		if err == nil {
 			t.Fatalf("%s: binding the network must be refused by default", addr)
@@ -42,13 +47,12 @@ func TestRefusesNonLoopbackWithoutAllowRemote(t *testing.T) {
 	}
 }
 
-func TestRefusesRemoteInCleartextEvenWhenAllowed(t *testing.T) {
-	// allow_remote alone is deliberately not enough — the token would cross the
-	// wire in the clear along with every message body.
-	c := Config{Enabled: true, Listen: "10.0.0.5:6667", AllowRemote: true}
+func TestRefusesCleartextEvenWhenRemoteIsAllowed(t *testing.T) {
+	// allow_remote is about exposure, not encryption: it never buys cleartext.
+	c := Config{Enabled: true, Listen: "10.0.0.5:6667", AllowRemote: true, TLSMinVersion: "1.3"}
 	err := c.Validate()
 	if err == nil {
-		t.Fatal("a remote cleartext bind must be refused even with allow_remote")
+		t.Fatal("a cleartext bind must be refused even with allow_remote")
 	}
 	if !strings.Contains(err.Error(), "TLS") {
 		t.Fatalf("refusal should name TLS: %v", err)
@@ -56,11 +60,13 @@ func TestRefusesRemoteInCleartextEvenWhenAllowed(t *testing.T) {
 }
 
 func TestAcceptsLoopbackAndRemoteWithTLS(t *testing.T) {
-	if err := (Config{Enabled: true, Listen: "127.0.0.1:6667"}).Validate(); err != nil {
-		t.Fatalf("loopback should be allowed: %v", err)
+	lo := Config{Enabled: true, Listen: "127.0.0.1:6697",
+		TLSCert: "/c.pem", TLSKey: "/k.pem", TLSMinVersion: "1.3"}
+	if err := lo.Validate(); err != nil {
+		t.Fatalf("loopback with TLS should be allowed: %v", err)
 	}
 	ok := Config{Enabled: true, Listen: "10.0.0.5:6697", AllowRemote: true,
-		TLSCert: "/c.pem", TLSKey: "/k.pem"}
+		TLSCert: "/c.pem", TLSKey: "/k.pem", TLSMinVersion: "1.3"}
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("remote+TLS+allow_remote should be allowed: %v", err)
 	}
@@ -660,4 +666,294 @@ func TestServiceReportsAnEmptyBoard(t *testing.T) {
 	c.login(h.token, "justin")
 	c.sendf("PRIVMSG %s :tasks", serviceNick)
 	c.expect("no tasks")
+}
+
+// ---------------------------------------------------------------------------
+// Lockdown: transport encryption
+// ---------------------------------------------------------------------------
+
+func TestEveryTCPListenerMustBeEncrypted(t *testing.T) {
+	// Loopback included. Cleartext on lo is not private: anything on the host
+	// that can capture the loopback interface sees the token, which is
+	// equivalent to read/write on the whole relay.
+	for _, addr := range []string{"127.0.0.1:6667", "localhost:6667", "[::1]:6667"} {
+		err := Config{Enabled: true, Listen: addr, TLSMinVersion: "1.3"}.Validate()
+		if err == nil {
+			t.Fatalf("%s: a cleartext TCP listener must be refused", addr)
+		}
+		if !strings.Contains(err.Error(), "--init-tls") {
+			t.Fatalf("%s: the refusal should say how to get a certificate: %v", addr, err)
+		}
+	}
+}
+
+func TestUnixSocketNeedsNoTLS(t *testing.T) {
+	// The exception, and the reason the default transport is a socket: there is
+	// no network path to encrypt, and the kernel already answers who the peer is.
+	if err := (Config{Enabled: true, Socket: "/tmp/x.sock", TLSMinVersion: "1.3"}).Validate(); err != nil {
+		t.Fatalf("a unix socket should not require TLS: %v", err)
+	}
+}
+
+func TestTLSKeyPairMustBeComplete(t *testing.T) {
+	c := Config{Enabled: true, Listen: "127.0.0.1:6697", TLSCert: "/c.pem", TLSMinVersion: "1.3"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("a cert without a key must be refused")
+	}
+}
+
+func TestTLSMinVersionFloorIs12(t *testing.T) {
+	if v, _ := tlsMinVersion(""); v != tls.VersionTLS13 {
+		t.Fatal("the default floor should be TLS 1.3")
+	}
+	if v, _ := tlsMinVersion("1.3"); v != tls.VersionTLS13 {
+		t.Fatal("1.3")
+	}
+	if v, _ := tlsMinVersion("1.2"); v != tls.VersionTLS12 {
+		t.Fatal("1.2 is allowed for an old client")
+	}
+	// Nothing below 1.2 is reachable through this knob.
+	for _, bad := range []string{"1.1", "1.0", "ssl3", "none", "0"} {
+		if _, err := tlsMinVersion(bad); err == nil {
+			t.Fatalf("tls_min_version = %q must be refused", bad)
+		}
+	}
+	c := Config{Enabled: true, Listen: "127.0.0.1:6697", TLSCert: "/c.pem", TLSKey: "/k.pem",
+		TLSMinVersion: "1.1"}
+	if err := c.Validate(); err == nil {
+		t.Fatal("a bad tls_min_version must fail validation, not fall back silently")
+	}
+}
+
+func TestRemoteStillNeedsAllowRemote(t *testing.T) {
+	c := Config{Enabled: true, Listen: "10.0.0.5:6697", TLSCert: "/c.pem", TLSKey: "/k.pem",
+		TLSMinVersion: "1.3"}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "allow_remote") {
+		t.Fatalf("TLS does not make a public bind automatic: %v", err)
+	}
+}
+
+func TestSelfSignedCertIsUsableAndKeyIsOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+
+	fp, err := WriteSelfSignedCert(certPath, keyPath, []string{"192.0.2.7", "irc.example"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fp) != 95 { // 32 bytes as AA:BB:...
+		t.Fatalf("fingerprint looks wrong: %q", fp)
+	}
+	fi, _ := os.Stat(keyPath)
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("private key is %04o, want 0600", fi.Mode().Perm())
+	}
+	if _, err := WriteSelfSignedCert(certPath, keyPath, nil, false); err == nil {
+		t.Fatal("must not silently replace an existing key pair")
+	}
+
+	// It loads as a real key pair, and covers the hosts you'd actually bind.
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("generated pair does not load: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaf.VerifyHostname("localhost"); err != nil {
+		t.Fatalf("cert should cover localhost: %v", err)
+	}
+	if err := leaf.VerifyHostname("192.0.2.7"); err != nil {
+		t.Fatalf("--tls-hosts entries should be covered: %v", err)
+	}
+	if leaf.NotAfter.Before(time.Now().Add(300 * 24 * time.Hour)) {
+		t.Fatal("certificate expires too soon to be useful")
+	}
+
+	// The fingerprint the operator pins is the one the file actually has.
+	fromFile, err := fingerprintFile(certPath)
+	if err != nil || fromFile != fp {
+		t.Fatalf("fingerprint mismatch: %q vs %q (%v)", fromFile, fp, err)
+	}
+}
+
+func TestEndToEndOverTLS(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if _, err := WriteSelfSignedCert(certPath, keyPath, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		Enabled: true, Listen: "127.0.0.1:0",
+		TLSCert: certPath, TLSKey: keyPath, TLSMinVersion: "1.3",
+		MaxConns: 4, AuthTimeout: 5, IdleTimeout: 30, History: 50,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a TLS loopback listener should validate: %v", err)
+	}
+	tc, err := tlsConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc.MinVersion != tls.VersionTLS13 {
+		t.Fatal("server should refuse anything below TLS 1.3 by default")
+	}
+
+	relayDir := t.TempDir()
+	token := strings.Repeat("t", 64)
+	h := newHub(relayDir, "", false, 20*time.Millisecond, 50)
+	lim := newLimiter(3, time.Minute)
+	done := make(chan struct{})
+	go h.run(done)
+
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := tls.NewListener(raw, tc)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go newSession(h, cfg, []byte(token), lim, conn).serve()
+		}
+	}()
+	t.Cleanup(func() { close(done); l.Close() })
+
+	// A client that pins the certificate — no CA involved, which is the point.
+	pool := x509.NewCertPool()
+	pem, _ := os.ReadFile(certPath)
+	pool.AppendCertsFromPEM(pem)
+	conn, err := tls.Dial("tcp", l.Addr().String(), &tls.Config{
+		RootCAs: pool, ServerName: "localhost", MinVersion: tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("pinned TLS dial failed: %v", err)
+	}
+	defer conn.Close()
+	c := &client{t: t, conn: conn, r: bufio.NewReader(conn)}
+	c.login(token, "justin")
+	c.expect("End of /MOTD")
+
+	if st := conn.ConnectionState(); st.Version != tls.VersionTLS13 {
+		t.Fatalf("negotiated TLS 0x%x, want 1.3", st.Version)
+	}
+}
+
+func TestPlaintextClientCannotTalkToATLSListener(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if _, err := WriteSelfSignedCert(certPath, keyPath, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	tc, err := tlsConfig(Config{TLSCert: certPath, TLSKey: keyPath, TLSMinVersion: "1.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := net.Listen("tcp", "127.0.0.1:0")
+	l := tls.NewListener(raw, tc)
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
+		if err == nil {
+			_ = conn.(*tls.Conn).Handshake()
+			conn.Close()
+		}
+	}()
+
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Sending the token in the clear must not get a session — the handshake
+	// never happens, so nothing downstream ever sees these bytes.
+	fmt.Fprintf(conn, "PASS %s\r\nNICK justin\r\nUSER j 0 * :j\r\n", strings.Repeat("t", 64))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	if n, err := conn.Read(buf); err == nil && strings.Contains(string(buf[:n]), "001") {
+		t.Fatal("a cleartext client must never be registered")
+	}
+}
+
+func TestMutualTLSRequiresAClientCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if _, err := WriteSelfSignedCert(certPath, keyPath, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	// Self-signed, so the server cert doubles as its own CA for this test.
+	tc, err := tlsConfig(Config{
+		TLSCert: certPath, TLSKey: keyPath, TLSMinVersion: "1.3", TLSClientCA: certPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc.ClientAuth != tls.RequireAndVerifyClientCert {
+		t.Fatal("tls_client_ca must require AND verify the client certificate")
+	}
+	if tc.ClientCAs == nil {
+		t.Fatal("the client CA pool should be populated")
+	}
+
+	raw, _ := net.Listen("tcp", "127.0.0.1:0")
+	l := tls.NewListener(raw, tc)
+	defer l.Close()
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_ = conn.(*tls.Conn).Handshake()
+				conn.Close()
+			}()
+		}
+	}()
+
+	pool := x509.NewCertPool()
+	pem, _ := os.ReadFile(certPath)
+	pool.AppendCertsFromPEM(pem)
+	conn, err := tls.Dial("tcp", l.Addr().String(), &tls.Config{
+		RootCAs: pool, ServerName: "localhost", MinVersion: tls.VersionTLS13,
+	})
+	if err == nil {
+		// Under TLS 1.3 the client's handshake completes before the server has
+		// looked at (the absence of) its certificate, so the rejection lands on
+		// the first read rather than on Dial.
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = conn.Write([]byte("PING x\r\n"))
+		buf := make([]byte, 32)
+		_, err = conn.Read(buf)
+	}
+	if err == nil {
+		t.Fatal("a client with no certificate must be rejected under mutual TLS")
+	}
+}
+
+func TestBadClientCAIsRefusedAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if _, err := WriteSelfSignedCert(certPath, keyPath, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	junk := filepath.Join(dir, "junk.pem")
+	writeFile(t, junk, "not a certificate", 0o600)
+
+	if _, err := tlsConfig(Config{
+		TLSCert: certPath, TLSKey: keyPath, TLSMinVersion: "1.3", TLSClientCA: junk,
+	}); err == nil {
+		t.Fatal("an unusable client CA must fail loudly at startup, not silently disable mTLS")
+	}
 }
