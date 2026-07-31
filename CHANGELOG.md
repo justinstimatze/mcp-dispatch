@@ -7,6 +7,16 @@ truth for versions.
 ## [Unreleased]
 
 ### Added
+- **Durable agent identity.** Every id now also has a *nick* — itself with the
+  `-<pid>` suffix stripped — recorded in `{dispatch_dir}/.agents/<nick>.json`
+  (first/last seen, session count, last session id, standing channels) and never
+  reaped. `who()` gains a `known` list of teammates that exist but aren't live;
+  `dispatch(target="publicai")` resolves to that teammate's live sessions rather
+  than writing to a directory no session opens; and mail sent while a nick is
+  offline waits in the nick's own inbox, which its next session inherits at
+  startup. Addressing a concrete session id is unchanged. The rule lives in the
+  shared `tui/relay` package as well as `server.py`, so the MCP server, the TUI
+  and the IRC gateway all write the same files.
 - **`bin/dispatch-ircd` — an IRC gateway to the relay.** Any IRC client now works
   against mcp-dispatch: agents are nicks (by their stable id, not the per-session
   pid), `#name` targets are channels, and `&dispatch` is a read-only firehose.

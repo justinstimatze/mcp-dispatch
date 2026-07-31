@@ -297,3 +297,60 @@ func TestAckInboxMarksRead(t *testing.T) {
 		t.Fatalf("message not marked read: %+v", m)
 	}
 }
+
+func TestSendResolvesANickToItsLiveSessions(t *testing.T) {
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{
+		{ID: "publicai-222", Live: true},
+		{ID: "publicai-333", Live: true},
+		{ID: "publicai-111", Live: false}, // a dead session must not receive
+		{ID: "other-9", Live: true},
+	}}
+	n, err := Send(relay, "console-1", "publicai", "the nick, not the pid", snap, "normal")
+	if err != nil || n != 2 {
+		t.Fatalf("a nick should reach every live session: n=%d err=%v", n, err)
+	}
+	for _, who := range []string{"publicai-222", "publicai-333"} {
+		if fs, _ := filepath.Glob(filepath.Join(relay, who, "*.json")); len(fs) != 1 {
+			t.Fatalf("%s should have the message", who)
+		}
+	}
+	for _, who := range []string{"publicai-111", "publicai", "other-9"} {
+		if fs, _ := filepath.Glob(filepath.Join(relay, who, "*.json")); len(fs) != 0 {
+			t.Fatalf("%s should have nothing", who)
+		}
+	}
+}
+
+func TestSendToAnOfflineNickWaitsUnderTheNick(t *testing.T) {
+	relay := t.TempDir()
+	// publicai has existed but nothing of it is live: the message waits in the
+	// nick's own inbox for the next session to inherit, rather than landing in a
+	// dead pid's directory that nobody will ever open again.
+	snap := Snapshot{Agents: []Agent{{ID: "publicai-111", Live: false}}}
+	n, err := Send(relay, "console-1", "publicai", "when you're back", snap, "normal")
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "publicai", "*.json")); len(fs) != 1 {
+		t.Fatal("mail for an offline nick belongs in the nick's inbox")
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "publicai-111", "*.json")); len(fs) != 0 {
+		t.Fatal("a dead session's inbox must not be used")
+	}
+}
+
+func TestSendToAConcreteSessionIsUnchanged(t *testing.T) {
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{
+		{ID: "publicai-222", Live: true},
+		{ID: "publicai-333", Live: true},
+	}}
+	n, _ := Send(relay, "console-1", "publicai-222", "this exact window", snap, "normal")
+	if n != 1 {
+		t.Fatalf("addressing a session id must not fan out to its siblings: n=%d", n)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "publicai-333", "*.json")); len(fs) != 0 {
+		t.Fatal("the sibling should have nothing")
+	}
+}

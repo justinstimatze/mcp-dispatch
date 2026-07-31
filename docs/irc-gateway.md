@@ -57,7 +57,7 @@ your client prefers that (`sasl` is advertised; only PLAIN is supported).
 | `#eng` | the relay channel `#eng` |
 | `&dispatch` | every message crossing the relay, read-only |
 | `PRIVMSG #eng :…` | `dispatch(target="#eng")` — fans out to live subscribers |
-| `PRIVMSG alice :…` | a DM, resolved to alice's live session if she has one |
+| `PRIVMSG alice :…` | a DM to the nick — see [durable identity](../README.md#durable-identity-nicks-that-outlive-a-session) |
 | `NAMES` / `WHO` / `LIST` | the presence roster and known channels |
 | `/msg dispatch …` | ack, who, replay, urgent — see below |
 
@@ -95,6 +95,11 @@ The practical consequence: you can read everything and send anything, but you
 are not addressable as an agent. A DM to your nick still works — it lands in an
 inbox directory named after your nick and the gateway delivers it — but nothing
 on the relay knows you are there until you speak.
+
+Sending follows the relay's [durable identity](../README.md#durable-identity-nicks-that-outlive-a-session)
+rule, which the gateway does not reimplement: `/msg publicai` reaches every live
+session of that teammate, or waits in the nick's inbox for its next one if none
+is running. `/msg publicai-1767991` addresses that one window and never fans out.
 
 Presence semantics stay owned by the MCP server alone. That is deliberate:
 duplicating the flock protocol in a second implementation is exactly how two

@@ -201,9 +201,12 @@ def _setup_dirs() -> None:
     DISPATCH_DIR.mkdir(parents=True, exist_ok=True)
     presence = DISPATCH_DIR / ".presence"
     presence.mkdir(exist_ok=True)
+    agents = DISPATCH_DIR / ".agents"
+    agents.mkdir(exist_ok=True)
     # Explicit chmod in case the dirs predate this server's umask.
     _enforce_dir_mode(DISPATCH_DIR)
     _enforce_dir_mode(presence)
+    _enforce_dir_mode(agents)
     for aid in AGENT_IDS:
         (DISPATCH_DIR / aid).mkdir(exist_ok=True)
 
@@ -334,6 +337,7 @@ def _claim_id() -> str:
                 f"Agent ID '{explicit}' is already held by a live process. "
                 "Stop that instance or choose a different MCP_DISPATCH_AGENT_ID."
             )
+        _register_agent(explicit)
         return explicit
 
     if DYNAMIC_MODE:
@@ -345,6 +349,7 @@ def _claim_id() -> str:
     # Auto-claim: first slot whose presence lock we can acquire.
     for aid in AGENT_IDS:
         if _try_lock_presence(presence_dir / f"{aid}.json", aid):
+            _register_agent(aid)
             return aid
 
     raise RuntimeError(
@@ -355,6 +360,9 @@ def _claim_id() -> str:
 
 def _release_id(agent_id: str) -> None:
     global _PRESENCE_HANDLE
+    # Stamp the registry before dropping the lock: once the flock is gone the
+    # nick reads as offline, and `last_seen` is the only thing that says when.
+    _touch_agent(agent_id)
     # Just drop the lock; don't unlink. A lingering presence file with no lock is
     # already "dead" to who()/channels, the next claimer of this id reclaims it
     # (truncate + rewrite), and _reap_dead_presence GCs it at startup. Unlinking
@@ -365,6 +373,136 @@ def _release_id(agent_id: str) -> None:
         except OSError:
             pass
         _PRESENCE_HANDLE = None
+
+
+# ---------------------------------------------------------------------------
+# Durable identity (the .agents registry)
+# ---------------------------------------------------------------------------
+#
+# Presence answers "who is live right now" and evaporates when a session exits.
+# That is the right answer for fan-out and the wrong one for *identity*: with
+# `<project>-<pid>` ids, every restart is a new stranger, an agent that isn't
+# running cannot be discovered, and a DM sent to a project while it is offline
+# lands in a directory nobody will ever open.
+#
+# The registry is the durable half. One record per *nick* — the id with its pid
+# suffix stripped, so `publicai-1767991` and `publicai-3580621` are two sessions
+# of one teammate named `publicai`. It is never reaped: a nick you have talked
+# to once stays addressable forever, online or not.
+
+_PID_SUFFIX_RE = re.compile(r"^(?P<nick>.+)-\d+$")
+
+
+def _durable_nick(agent_id: str) -> str:
+    """The stable identity behind a session id: `publicai-1767991` → `publicai`.
+
+    An id with no pid suffix (a roster id, or an explicit MCP_DISPATCH_AGENT_ID)
+    is already durable and passes through unchanged.
+    """
+    m = _PID_SUFFIX_RE.match(agent_id)
+    return m.group("nick") if m else agent_id
+
+
+def _agent_record_path(nick: str) -> Path:
+    return DISPATCH_DIR / ".agents" / f"{nick}.json"
+
+
+def _register_agent(agent_id: str) -> dict:
+    """Upsert this session's nick in the registry. Returns the record.
+
+    Called once per claim. `first_seen` survives; everything else reflects the
+    session that just started, so `last_session_id` is what a sender resolves a
+    nick to while it is live.
+    """
+    nick = _durable_nick(agent_id)
+    if not _ID_RE.match(nick):
+        return {}
+    path = _agent_record_path(nick)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        rec = json.loads(path.read_text())
+        if not isinstance(rec, dict):
+            rec = {}
+    except (json.JSONDecodeError, OSError):
+        rec = {}
+    rec.setdefault("nick", nick)
+    rec.setdefault("first_seen", now)
+    rec.setdefault("sessions", 0)
+    rec["sessions"] = int(rec.get("sessions") or 0) + 1
+    rec["last_seen"] = now
+    rec["last_session_id"] = agent_id
+    try:
+        _atomic_write(path, rec)
+    except OSError:
+        pass
+    return rec
+
+
+def _touch_agent(agent_id: str, **fields: object) -> None:
+    """Update this nick's record in place (last_seen, plus anything passed).
+
+    Best-effort: the registry is a convenience, never a correctness dependency,
+    so a failure here must not take a session down.
+    """
+    nick = _durable_nick(agent_id)
+    if not _ID_RE.match(nick):
+        return
+    path = _agent_record_path(nick)
+    try:
+        rec = json.loads(path.read_text())
+        if not isinstance(rec, dict):
+            return
+    except (json.JSONDecodeError, OSError):
+        return
+    rec["last_seen"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rec.update(fields)
+    try:
+        _atomic_write(path, rec)
+    except OSError:
+        pass
+
+
+def _known_agents() -> list[dict]:
+    """Every nick the registry has ever seen, most recently active first."""
+    out: list[dict] = []
+    reg = DISPATCH_DIR / ".agents"
+    if not reg.is_dir():
+        return out
+    for f in sorted(reg.glob("*.json")):
+        try:
+            rec = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(rec, dict) and _ID_RE.match(str(rec.get("nick", ""))):
+            out.append(rec)
+    out.sort(key=lambda r: str(r.get("last_seen", "")), reverse=True)
+    return out
+
+
+def _live_sessions_of(nick: str) -> list[str]:
+    """Live agent ids whose durable nick is `nick`, in sorted order."""
+    return sorted(aid for aid in _live_agents() if _durable_nick(aid) == nick)
+
+
+def _resolve_recipients(target: str) -> list[str]:
+    """Map a DM target to the inbox ids it should actually be written to.
+
+    Three cases, in order:
+
+      - the target is itself a live session id → deliver to it, unchanged;
+      - the target is a *nick* with live sessions → deliver to all of them,
+        because addressing `publicai` means addressing that teammate, and
+        picking one of its sessions arbitrarily is how a message reaches the
+        window nobody is watching. `queued_to` reports exactly where it went;
+      - nothing live → deliver to the nick's own inbox and leave it there. It
+        is not lost: the next session of that nick inherits it on startup
+        (see _inherit_orphan_inbox). This is what makes an offline teammate
+        addressable at all.
+    """
+    if target in _live_agents():
+        return [target]
+    live = _live_sessions_of(target)
+    return live if live else [target]
 
 
 _presence_is_live = dispatch_fs.presence_is_live
@@ -420,9 +558,13 @@ def _reap_empty_inboxes() -> int:
     """
     if AGENT_IDS:
         return 0
+    # A registered nick is a durable identity, not clutter: its inbox is the
+    # drop box for mail addressed to it while offline, so it outlives its
+    # sessions even when momentarily empty.
+    known = {str(r.get("nick")) for r in _known_agents()}
     removed = 0
     for d in DISPATCH_DIR.iterdir():
-        if not d.is_dir() or d.name.startswith("."):
+        if not d.is_dir() or d.name.startswith(".") or d.name in known:
             continue
         try:
             if not any(d.iterdir()):  # truly empty — no messages, no .tmp
@@ -459,11 +601,16 @@ def _inherit_orphan_inbox(agent_id: str) -> int:
     m = re.match(r"^(?P<base>.+)-\d+$", agent_id)
     if not m:
         return 0
-    sibling = re.compile(rf"^{re.escape(m.group('base'))}-\d+$")
+    base = m.group("base")
+    sibling = re.compile(rf"^{re.escape(base)}-\d+$")
     mine = DISPATCH_DIR / agent_id
     moved = 0
     for d in sorted(DISPATCH_DIR.iterdir()):
-        if not d.is_dir() or d.name == agent_id or not sibling.match(d.name):
+        if not d.is_dir() or d.name == agent_id:
+            continue
+        # A dead sibling session, or the nick's own inbox — where a DM addressed
+        # to `publicai` waited because no session of it was live at the time.
+        if not (sibling.match(d.name) or d.name == base):
             continue
         pf = DISPATCH_DIR / ".presence" / f"{d.name}.json"
         if pf.exists() and _presence_is_live(pf):
@@ -640,8 +787,13 @@ def _send(
             _deliver_one(target)
     else:
         _validate_target(to)
-        _deliver_one(to)
-        delivered = [to]
+        # A nick is not an inbox: `publicai` names a teammate whose live sessions
+        # are `publicai-<pid>`. Resolve it, so addressing the teammate reaches the
+        # session actually running — and, when none is, waits in the nick's inbox
+        # for the next one to inherit instead of rotting in a dead pid's.
+        delivered = _resolve_recipients(to)
+        for target in delivered:
+            _deliver_one(target)
 
     result: dict = dict(msg)
     # `queued_to`, not `delivered_to`: this is the set of inboxes written, i.e.
@@ -683,6 +835,9 @@ def _set_subscription(channel: str, subscribed: bool) -> list[str]:
         channels.discard(channel)
     _PRESENCE_DATA["channels"] = sorted(channels)
     _write_presence()
+    # Mirror into the durable record: presence evaporates with the session, so
+    # this is what lets who() report the rooms an offline nick was standing in.
+    _touch_agent(AGENT_ID, channels=_PRESENCE_DATA["channels"])
     return _PRESENCE_DATA["channels"]
 
 
@@ -1092,6 +1247,16 @@ def who_tool() -> dict:
                 continue  # a live local session wins over a git roster entry
             remote.append(data)
 
+    # Durable identities with nothing live behind them right now. Addressable
+    # anyway: a DM waits in the nick's inbox and its next session inherits it.
+    live_nicks = {_durable_nick(str(a)) for a in local_ids if a}
+    remote_ids = {r.get("agent_id") for r in remote}
+    known = [
+        rec
+        for rec in _known_agents()
+        if rec.get("nick") not in live_nicks and rec.get("nick") not in remote_ids
+    ]
+
     result = {
         "self": AGENT_ID,
         "agents": agents,
@@ -1100,6 +1265,9 @@ def who_tool() -> dict:
     if remote:
         result["remote"] = remote
         result["remote_count"] = len(remote)
+    if known:
+        result["known"] = known
+        result["known_count"] = len(known)
     return result
 
 

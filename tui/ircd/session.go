@@ -786,7 +786,7 @@ func (s *session) handlePrivmsg(params []string, notice bool) {
 	case strings.HasPrefix(target, "&"):
 		s.numeric("403", "%s :No such channel", target)
 	default:
-		s.relaySend(s.hub.resolveTarget(strings.ToLower(target)), text, "normal")
+		s.relaySend(strings.ToLower(target), text, "normal")
 	}
 }
 
@@ -880,9 +880,6 @@ func (s *session) service(text string) {
 			return
 		}
 		target := strings.ToLower(fields[1])
-		if !strings.HasPrefix(target, "#") {
-			target = s.hub.resolveTarget(target)
-		}
 		body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), fields[0]))
 		body = strings.TrimSpace(strings.TrimPrefix(body, fields[1]))
 		s.relaySend(target, body, "urgent")

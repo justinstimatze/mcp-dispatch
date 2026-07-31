@@ -444,6 +444,35 @@ type outMessage struct {
 	State     string `json:"state"`
 }
 
+// resolveRecipients maps a DM target to the inboxes it should be written to,
+// mirroring server._resolve_recipients exactly — both sides write the same files,
+// so a disagreement here is a message delivered to a directory nobody reads.
+//
+//   - a live session id → itself;
+//   - a nick with live sessions ("publicai", whose sessions are publicai-<pid>)
+//     → all of them, because addressing the teammate must not land in whichever
+//     window happens to be unwatched;
+//   - nothing live → the nick's own inbox, where its next session inherits it.
+func resolveRecipients(target string, snap Snapshot) []string {
+	var live []string
+	for _, a := range snap.Agents {
+		if !a.Live || !ValidID(a.ID) {
+			continue
+		}
+		if a.ID == target {
+			return []string{target} // a concrete session id addresses itself
+		}
+		if Project(a.ID) == target {
+			live = append(live, a.ID)
+		}
+	}
+	if len(live) > 0 {
+		sort.Strings(live)
+		return live
+	}
+	return []string{target}
+}
+
 // Send delivers a message from `from` to `target` (an agent id, "#channel", or
 // "all"), replicating server._send's fan-out from the current snapshot: "all" →
 // every live agent, "#chan" → its live subscribers, both excluding the sender.
@@ -475,7 +504,7 @@ func Send(relay, from, target, content string, snap Snapshot, priority string) (
 		if !ValidID(target) {
 			return 0, fmt.Errorf("invalid target %q", target)
 		}
-		targets = []string{target}
+		targets = resolveRecipients(target, snap)
 	}
 	if priority == "" {
 		priority = "normal"

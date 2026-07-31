@@ -13,6 +13,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
+- **Durable nicks** — the id behind the pid (`publicai`, not `publicai-1767991`) is registered and never reaped, so a teammate stays discoverable and addressable while offline. A DM to a nick reaches its live sessions, or waits for the next one. See [durable identity](#durable-identity-nicks-that-outlive-a-session).
 - **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick.
 - **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, and a hard refusal to serve a public address in the clear. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
@@ -410,6 +411,40 @@ is served before authentication; and a non-loopback bind is refused without
 *both* `allow_remote` and TLS. Read [docs/irc-gateway.md](docs/irc-gateway.md)
 before enabling it — the token is equivalent to read/write access to every agent
 conversation on the host.
+
+
+## Durable identity: nicks that outlive a session
+
+Presence answers *who is live right now* and evaporates when a session exits.
+That is the right answer for fan-out and the wrong one for identity. With
+`<project>-<pid>` ids every restart was a new stranger: an agent that wasn't
+running couldn't be found, and a DM addressed to `publicai` landed in
+`{relay}/publicai/` — a directory no session would ever open.
+
+So every id also has a **nick**: itself with the pid suffix stripped.
+`publicai-1767991` and `publicai-3580621` are two sessions of one teammate
+called `publicai`. Nicks are recorded in `{dispatch_dir}/.agents/<nick>.json`
+(first seen, last seen, session count, last session id, standing channels) and
+are never reaped — a nick you have talked to once stays addressable forever.
+
+Three things follow:
+
+- **`who()` reports offline teammates** under a `known` key, alongside the live
+  `agents` and cross-host `remote` lists. A nick with a live session isn't
+  listed there — it's already in `agents`.
+- **`dispatch(target="publicai")` resolves.** With live sessions, it reaches
+  *all* of them (`queued_to` says which) — picking one arbitrarily is how a
+  message ends up in the window nobody is watching. Addressing a concrete
+  session id (`publicai-1767991`) is unchanged and never fans out.
+- **Mail sent to an offline nick waits.** It goes to the nick's own inbox, and
+  the next session of that nick inherits it at startup — the same mechanism that
+  already adopted a dead session's unread mail, widened to cover the drop box.
+
+The TUI and the IRC gateway resolve identically, because the rule lives in the
+shared `tui/relay` package rather than in each writer.
+
+This is *identity*, not *lifecycle*: nothing here starts an agent. A message to
+an offline nick is durable, not a wake-up.
 
 
 ## How It Works

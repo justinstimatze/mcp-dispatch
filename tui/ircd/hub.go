@@ -218,31 +218,6 @@ func (h *hub) allNicks() []string {
 	return sortedKeys(set)
 }
 
-// resolveTarget maps an IRC nick to a relay id. A stable nick ("publicai") has
-// to become a concrete inbox, so it resolves to the live session with that
-// project prefix when there is one; failing that, to the nick itself (which is
-// correct for named agents and for remote nicks the git bridge will carry).
-func (h *hub) resolveTarget(nick string) string {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	var offline string
-	for _, a := range h.snap.Agents {
-		if relay.Project(a.ID) != nick {
-			continue
-		}
-		if a.Live {
-			return a.ID
-		}
-		if offline == "" {
-			offline = a.ID
-		}
-	}
-	if offline != "" {
-		return offline
-	}
-	return nick
-}
-
 // send writes a message to the relay as `from`, using the current snapshot for
 // channel fan-out. Returns the number of inboxes written.
 func (h *hub) send(from, target, content, priority string) (int, error) {
