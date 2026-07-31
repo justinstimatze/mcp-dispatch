@@ -78,6 +78,7 @@ can't express live behind a `dispatch` nick you `/msg`:
 /msg dispatch channels                list relay channels
 /msg dispatch replay 100              re-send recent history into &dispatch
 /msg dispatch urgent bob :look now    send at urgent priority
+/msg dispatch tasks [state]           the task board — read-only here
 ```
 
 `dispatch` is reserved as a nick; an agent literally named `dispatch` would be

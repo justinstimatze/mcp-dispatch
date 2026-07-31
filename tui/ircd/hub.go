@@ -226,6 +226,12 @@ func (h *hub) send(from, target, content, priority string) (int, error) {
 
 func (h *hub) ack(nick string) (int, error) { return relay.AckInbox(h.relayDir, nick) }
 
+// tasks reads the task store. The gateway is read-only here on purpose:
+// creating and claiming are the MCP server's job (claiming in particular is an
+// O_EXCL race that must have exactly one implementation), so a human watching
+// from an IRC client can see the board without becoming a second writer to it.
+func (h *hub) tasks() []relay.Task { return relay.LoadTasks(h.relayDir) }
+
 func sortedKeys(set map[string]bool) []string {
 	out := make([]string, 0, len(set))
 	for k := range set {

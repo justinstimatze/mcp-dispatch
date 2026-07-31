@@ -9,6 +9,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Non-destructive messaging** — Messages persist until explicitly acknowledged. No more lost messages from crashes or compaction.
 - **Channels** — `subscribe('#name')` and `dispatch(target='#name')` fan a message out to current subscribers. Ephemeral — subscriptions vanish when a session exits.
 - **Threading** — Group messages into conversations with `thread_id` and `reply_to`.
+- **Tasks** — `task('create', title=…, target='#eng')` posts a claimable work item. Claiming is atomic (an `O_EXCL` create — exactly one agent wins a race), and the announcement is an ordinary message, so it wakes parked sessions and crosses hosts through the paths that already exist.
 - **Structured payloads** — Attach machine-readable data alongside human-readable messages.
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
@@ -123,6 +124,7 @@ Agent bob:   ack(["msg-abc12345"])  →  message removed
 | `ack(message_ids)` | Acknowledge and delete processed messages |
 | `who()` | List connected agents and their channel subscriptions |
 | `subscribe(channel)` / `unsubscribe(channel)` | Join / leave a channel |
+| `task(action, ...)` | Claimable work items — `create`, `claim`, `done`, `list` |
 
 ### dispatch
 
@@ -173,6 +175,37 @@ peek(thread_id="deploy-123")    # filter by thread
 ```python
 ack(message_ids=["msg-abc", "msg-def"])  # delete specific messages
 ```
+
+### tasks
+
+A message says something; a task is something to *do*, and it has to outlive
+being read. Messages are deleted on ack by design, so tasks get their own store
+under `{dispatch_dir}/.tasks/` — but nothing else is new.
+
+```python
+task("create", title="fix the deploy flake", detail="it's the clock", target="#eng")
+task("list", state="open")     # or "claimed" / "done", or omit for everything
+task("claim", task_id="task-a1b2c3d4")
+task("done",  task_id="task-a1b2c3d4")
+```
+
+**Claiming is atomic.** Two agents that both read `open` and both write
+`claimed` have silently duplicated the work, so the claim is an `O_EXCL` create
+— the kernel picks the winner, exactly once, with no lock to leak. The record
+is bookkeeping; the marker is the claim, so doctoring the record can't reopen
+the race. Re-claiming your own task is idempotent, not a conflict; completing
+one you don't hold is an error.
+
+**Creating with a `target` dispatches an ordinary message** carrying a
+`{"type": "task.created"}` payload. That is the whole integration: a task
+announcement wakes a parked session, crosses hosts on the git bus, and shows up
+in the TUI and the IRC gateway (`/msg dispatch tasks`) through paths that
+already exist, rather than needing a second delivery mechanism.
+
+The IRC gateway can *read* the board but not write it — claiming has to have
+exactly one implementation, and a second writer is how it stops being exactly
+one.
+
 
 ## Configuration
 

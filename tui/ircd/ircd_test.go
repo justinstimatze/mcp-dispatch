@@ -624,3 +624,40 @@ func errStr(err error) string {
 	}
 	return err.Error()
 }
+
+func TestServiceShowsTheTaskBoard(t *testing.T) {
+	h := startGateway(t)
+	tasksDir := filepath.Join(h.relayDir, ".tasks")
+	if err := os.MkdirAll(tasksDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tk := range []relay.Task{
+		{ID: "task-aaa11111", Title: "fix the flake", State: "open", CreatedAt: "2026-01-01T00:00:00Z"},
+		{ID: "task-bbb22222", Title: "ship it", State: "claimed", ClaimedBy: "alice", CreatedAt: "2026-01-02T00:00:00Z"},
+	} {
+		data, _ := json.Marshal(tk)
+		if err := os.WriteFile(filepath.Join(tasksDir, tk.ID+".json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :tasks", serviceNick)
+	c.expect("fix the flake")
+	c.expect("ship it")
+
+	c.sendf("PRIVMSG %s :tasks claimed", serviceNick)
+	line := c.expect("task-bbb22222")
+	if !strings.Contains(line, "alice") {
+		t.Fatalf("a claimed task should name its holder: %q", line)
+	}
+}
+
+func TestServiceReportsAnEmptyBoard(t *testing.T) {
+	h := startGateway(t)
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :tasks", serviceNick)
+	c.expect("no tasks")
+}

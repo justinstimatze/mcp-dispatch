@@ -825,6 +825,7 @@ func (s *session) service(text string) {
 			"replay [n]               re-send the last n messages into " + firehose,
 			"urgent <target> <text>   send at urgent priority",
 			"channels                 list relay channels",
+			"tasks [state]            the task board (open / claimed / done)",
 		} {
 			s.notice("%s", l)
 		}
@@ -862,6 +863,26 @@ func (s *session) service(text string) {
 			return
 		}
 		s.notice("#%s", strings.Join(chans, " #"))
+	case "tasks":
+		want := ""
+		if len(fields) > 1 {
+			want = strings.ToLower(fields[1])
+		}
+		var shown int
+		for _, tk := range s.hub.tasks() {
+			if want != "" && tk.State != want {
+				continue
+			}
+			who := tk.ClaimedBy
+			if who == "" {
+				who = "-"
+			}
+			s.notice("%-14s %-8s %-16s %s", tk.ID, tk.State, who, tk.Title)
+			shown++
+		}
+		if shown == 0 {
+			s.notice("no tasks%s", map[bool]string{true: "", false: " in state " + want}[want == ""])
+		}
 	case "replay":
 		n := s.cfg.History
 		if len(fields) > 1 {

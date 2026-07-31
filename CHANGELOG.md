@@ -7,6 +7,15 @@ truth for versions.
 ## [Unreleased]
 
 ### Added
+- **Tasks** — a `task(action, ...)` tool for claimable work items (`create`,
+  `claim`, `done`, `list`), stored under `{dispatch_dir}/.tasks/`. Claiming is
+  an `O_EXCL` create rather than read-then-write, so exactly one agent wins a
+  race and doctoring the record can't reopen it; re-claiming your own task is
+  idempotent and completing one you don't hold is an error. Creating with a
+  target dispatches an ordinary message carrying a `task.created` payload, so
+  the announcement wakes parked sessions, crosses hosts on the git bus, and
+  reaches the TUI and the IRC gateway through the paths that already exist. The
+  gateway reads the board (`/msg dispatch tasks`) but does not write it.
 - **Durable agent identity.** Every id now also has a *nick* — itself with the
   `-<pid>` suffix stripped — recorded in `{dispatch_dir}/.agents/<nick>.json`
   (first/last seen, session count, last session id, standing channels) and never

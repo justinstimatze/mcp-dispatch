@@ -842,6 +842,126 @@ def _set_subscription(channel: str, subscribed: bool) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Tasks (claimable work items over the same substrate)
+# ---------------------------------------------------------------------------
+#
+# A message says something; a task is something to *do*, and it has to outlive
+# being read. Messages are deleted on ack by design, so tasks get their own
+# store — but nothing else is new: creating one dispatches an ordinary message,
+# so a task announcement wakes a parked session, crosses hosts on the git bus,
+# and shows up in the TUI and the IRC gateway through the paths that already
+# exist.
+#
+# The only genuinely hard part is claiming. Two agents that both read "open"
+# and both write "claimed" have duplicated the work, so the claim is an O_EXCL
+# create — the kernel picks the winner, exactly once, without a lock to leak.
+
+_TASK_STATES = ("open", "claimed", "done")
+
+
+def _tasks_dir() -> Path:
+    d = DISPATCH_DIR / ".tasks"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def _task_path(task_id: str) -> Path:
+    _validate_id(task_id, "task_id")
+    return _tasks_dir() / f"{task_id}.json"
+
+
+def _read_task(task_id: str) -> dict:
+    try:
+        rec = json.loads(_task_path(task_id).read_text())
+    except (json.JSONDecodeError, OSError):
+        raise ValueError(f"No such task '{task_id}'.") from None
+    if not isinstance(rec, dict):
+        raise ValueError(f"Task '{task_id}' is unreadable.")
+    return rec
+
+
+def _create_task(creator: str, title: str, detail: str, target: str | None) -> dict:
+    title = title.strip()
+    if not title:
+        raise ValueError("A task needs a title.")
+    if len(title) > 200:
+        raise ValueError(f"Title too long ({len(title)} chars, max 200).")
+    task_id = f"task-{uuid.uuid4().hex[:8]}"
+    rec = {
+        "id": task_id,
+        "title": title,
+        "detail": detail or "",
+        "created_by": creator,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "state": "open",
+        "claimed_by": None,
+        "claimed_at": None,
+        "done_at": None,
+        "target": target,
+    }
+    _atomic_write(_task_path(task_id), rec)
+    return rec
+
+
+def _claim_task(task_id: str, agent_id: str) -> dict:
+    """Claim a task. The O_EXCL marker is the claim; the record merely records it.
+
+    Doing it the other way round — read state, then write "claimed" — is a race
+    two agents lose together, each believing it owns the work.
+    """
+    rec = _read_task(task_id)
+    if rec.get("state") == "done":
+        raise ValueError(f"Task '{task_id}' is already done.")
+    marker = _tasks_dir() / f"{task_id}.claim"
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            holder = marker.read_text().strip()
+        except OSError:
+            holder = "another agent"
+        if holder == agent_id:
+            return rec  # idempotent: re-claiming your own task is not an error
+        raise ValueError(f"Task '{task_id}' is already claimed by '{holder}'.") from None
+    with os.fdopen(fd, "w") as fh:
+        fh.write(agent_id)
+    rec["state"] = "claimed"
+    rec["claimed_by"] = agent_id
+    rec["claimed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _atomic_write(_task_path(task_id), rec)
+    return rec
+
+
+def _complete_task(task_id: str, agent_id: str) -> dict:
+    rec = _read_task(task_id)
+    holder = rec.get("claimed_by")
+    if holder and holder != agent_id:
+        raise ValueError(f"Task '{task_id}' is claimed by '{holder}', not you.")
+    rec["state"] = "done"
+    rec["done_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not holder:
+        rec["claimed_by"] = agent_id
+    _atomic_write(_task_path(task_id), rec)
+    return rec
+
+
+def _list_tasks(state: str | None = None) -> list[dict]:
+    out: list[dict] = []
+    d = DISPATCH_DIR / ".tasks"
+    if not d.is_dir():
+        return out
+    for f in sorted(d.glob("task-*.json")):
+        try:
+            rec = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(rec, dict) and (state is None or rec.get("state") == state):
+            out.append(rec)
+    out.sort(key=lambda r: str(r.get("created_at", "")))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Piggyback delivery (non-destructive)
 # ---------------------------------------------------------------------------
 
@@ -1269,6 +1389,65 @@ def who_tool() -> dict:
         result["known"] = known
         result["known_count"] = len(known)
     return result
+
+
+@mcp.tool(
+    name="task",
+    description=(
+        "Claimable work items. Actions: 'create' (title, optional detail and "
+        "target to announce it to), 'claim' (task_id — atomic, exactly one "
+        "agent wins), 'done' (task_id), 'list' (optional state: open/claimed/"
+        "done). Unlike a message, a task survives being read: use it when work "
+        "needs an owner, not just an audience."
+    ),
+)
+def task_tool(
+    action: str,
+    title: str = "",
+    task_id: str = "",
+    detail: str = "",
+    target: str = "",
+    state: str = "",
+) -> dict:
+    """Create, claim, complete or list tasks.
+
+    'create' also dispatches an ordinary message when a target is given, so the
+    announcement rides every path that already exists — waking a parked session,
+    crossing hosts on the git bus, showing up in the TUI and the IRC gateway —
+    instead of needing a second delivery mechanism.
+    """
+    act = action.strip().lower()
+
+    if act == "create":
+        rec = _create_task(AGENT_ID, title, detail, target or None)
+        announced: list[str] = []
+        if target:
+            note = f"[task {rec['id']}] {rec['title']}"
+            if detail:
+                note += f"\n{detail}"
+            sent = _send(
+                AGENT_ID,
+                target,
+                note,
+                payload={"type": "task.created", "task": rec},
+            )
+            announced = sent.get("queued_to", [])
+        return _with_pending({"task": rec, "announced_to": announced})
+
+    if act == "claim":
+        return _with_pending({"task": _claim_task(task_id, AGENT_ID)})
+
+    if act == "done":
+        return _with_pending({"task": _complete_task(task_id, AGENT_ID)})
+
+    if act == "list":
+        want = state.strip().lower() or None
+        if want is not None and want not in _TASK_STATES:
+            raise ValueError(f"Unknown state '{state}'. Valid: {', '.join(_TASK_STATES)}.")
+        tasks = _list_tasks(want)
+        return _with_pending({"tasks": tasks, "count": len(tasks)})
+
+    raise ValueError(f"Unknown action '{action}'. Valid: create, claim, done, list.")
 
 
 @mcp.tool(
