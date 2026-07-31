@@ -14,6 +14,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick.
+- **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, and a hard refusal to serve a public address in the clear. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to
@@ -372,6 +373,45 @@ atomic write); a DM to a remote nick is bridged by the gitsync daemon like any
 other. You send as your `--nick` (a lightweight console identity — it does not
 hold presence, so agents don't see it as an always-on session).
 
+### dispatch-ircd — an IRC gateway to the relay
+
+The TUI is one client. `bin/dispatch-ircd` is a small IRC server in front of the
+same relay, which gets you *every* client: irssi, WeeChat, Halloy, the mobile
+ones — and with a bouncer (soju, ZNC) in front, scrollback and push
+notifications to a phone. That is reach bought without shipping a line of UI.
+
+```bash
+bin/dispatch-ircd --init-token   # generate the shared secret (0600), once
+bin/dispatch-ircd --check        # validate the config, print what would be served
+bin/dispatch-ircd                # run
+```
+
+Agents are nicks (by their **stable** id — `publicai`, not `publicai-1767991`),
+`#name` targets are channels, and `&dispatch` is a read-only firehose of
+everything crossing the bus. What IRC has no verb for lives behind a service
+nick: `/msg dispatch ack`, `who`, `replay`, `channels`, `urgent <target> <text>`.
+
+Like the TUI it is an observer and a sender — it does **not** claim presence, so
+agents never see your IRC client as a live session and `who()` won't list you.
+
+**It is the one thing here that accepts a connection**, so it is off until you
+say otherwise, and it stays narrow when you do:
+
+```toml
+[irc]
+enabled = true    # there is deliberately no command-line flag for this
+```
+
+By default it binds a `0600` unix socket and nothing else — no port, no network.
+The kernel checks the connecting process's uid (`SO_PEERCRED`, unforgeable, and
+enforced even if the token leaks); a token is required on every transport
+including that socket; wrong tokens are counted and then banned; nothing at all
+is served before authentication; and a non-loopback bind is refused without
+*both* `allow_remote` and TLS. Read [docs/irc-gateway.md](docs/irc-gateway.md)
+before enabling it — the token is equivalent to read/write access to every agent
+conversation on the host.
+
+
 ## How It Works
 
 - Each agent gets an inbox directory (`{dispatch_dir}/{agent_name}/`)
@@ -613,6 +653,14 @@ This is local-host-only IPC; the threat model is other local users on a shared m
 - No network listener and no encryption at rest (out of scope for the local-only
   threat model). Purely local operation runs no daemon at all; the optional
   cross-host bridge is the one long-lived process, and it still listens on nothing.
+- The one exception is the opt-in [IRC gateway](#dispatch-ircd--an-irc-gateway-to-the-relay),
+  which is the only component here that accepts a connection. It is off unless
+  the config file enables it, binds a `0600` unix socket rather than a port by
+  default, checks the peer's uid with the kernel, requires a token on every
+  transport, and refuses a non-loopback bind without both `allow_remote` and
+  TLS. Enabling it moves you to a different threat model — the token is
+  equivalent to read/write access to every conversation on the relay. See
+  [docs/irc-gateway.md](docs/irc-gateway.md).
 - The systemd unit written by `dispatch-gitsync service install` is created `0600`
   before any content lands, because `--env` can carry credentials. Prefer not to
   put a token there at all: use an HTTPS remote with a git credential helper, or

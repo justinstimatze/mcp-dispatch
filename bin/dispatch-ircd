@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# mcp-dispatch IRC gateway launcher — same shim as bin/dispatch-tui: builds the
+# Go source in tui/ on first run (or when a source file changed) and execs it.
+#
+#   bin/dispatch-ircd --init-token    # generate the shared secret, once
+#   bin/dispatch-ircd --check         # validate the config and exit
+#   bin/dispatch-ircd                 # run (needs [irc] enabled = true)
+#
+# The gateway is off unless the config file enables it — there is deliberately
+# no flag that turns it on. See docs/irc-gateway.md.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TUI_DIR="$REPO_DIR/tui"
+BIN="$TUI_DIR/dispatch-ircd"
+
+# Rebuild if the binary is missing or any Go source is newer than it. Recursive:
+# the gateway shares tui/relay/ with the TUI, so a change there matters here too.
+needs_build=0
+if [[ ! -x "$BIN" ]]; then
+  needs_build=1
+else
+  while IFS= read -r src; do
+    [[ "$src" -nt "$BIN" ]] && { needs_build=1; break; }
+  done < <(find "$TUI_DIR" -name '*.go' ! -name '*_test.go' -type f)
+fi
+
+if [[ "$needs_build" -eq 1 ]]; then
+  echo "dispatch-ircd: building…" >&2
+  make -C "$TUI_DIR" build-ircd >&2
+fi
+
+exec "$BIN" "$@"

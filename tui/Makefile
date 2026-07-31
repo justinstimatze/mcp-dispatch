@@ -5,10 +5,15 @@
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -ldflags "-X main.version=$(VERSION)"
 
-.PHONY: build install test vet fmt lint tidy run dump
+.PHONY: build build-tui build-ircd install test vet fmt lint tidy run dump
 
-build:          ## build ./dispatch-tui with the version baked in
+build: build-tui build-ircd  ## build both binaries with the version baked in
+
+build-tui:      ## build ./dispatch-tui
 	go build $(LDFLAGS) -o dispatch-tui .
+
+build-ircd:     ## build ./dispatch-ircd (the IRC gateway)
+	go build $(LDFLAGS) -o dispatch-ircd ./ircd
 
 install:        ## go install with the version baked in
 	go install $(LDFLAGS) .
@@ -27,8 +32,11 @@ lint: fmt vet   ## format + vet
 tidy:           ## tidy the module
 	go mod tidy
 
-run: build      ## build and run against the resolved relay
+run: build-tui  ## build and run the TUI against the resolved relay
 	./dispatch-tui
 
-dump: build     ## render one frame to stdout (no TTY)
+dump: build-tui ## render one frame to stdout (no TTY)
 	./dispatch-tui --dump
+
+ircd: build-ircd ## build and run the IRC gateway
+	./dispatch-ircd

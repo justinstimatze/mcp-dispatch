@@ -7,3 +7,7 @@ __pycache__/
 
 # plancheck debug artifact
 .plancheck-debug.json
+
+# Go binaries built by the bin/ launchers
+tui/dispatch-tui
+tui/dispatch-ircd

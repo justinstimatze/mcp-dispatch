@@ -6,6 +6,41 @@ truth for versions.
 
 ## [Unreleased]
 
+### Added
+- **`bin/dispatch-ircd` — an IRC gateway to the relay.** Any IRC client now works
+  against mcp-dispatch: agents are nicks (by their stable id, not the per-session
+  pid), `#name` targets are channels, and `&dispatch` is a read-only firehose.
+  Ack, priority and the rest of what IRC has no verb for live behind a `dispatch`
+  service nick you `/msg`. A bouncer in front adds scrollback and phone push, so
+  a mobile client costs this repo no UI code. Like the TUI it is an observer and
+  a sender — it does not claim presence, so the relay's presence semantics stay
+  owned by the MCP server alone.
+- Lockdown, since this is the first component here that accepts a connection:
+  off unless `[irc] enabled = true` in the config (no flag equivalent); a `0600`
+  unix socket by default with no port at all; `SO_PEERCRED` uid check on that
+  socket, enforced before a byte is read and even if the token leaks; a mandatory
+  token on every transport (≥32 chars, `0600`, constant-time compare over
+  digests); per-source failure counting with a temporary ban; nothing served
+  before authentication (no roster, no channel list, not even the shape of the
+  relay); relay-safe nick validation; CR/LF stripped from outbound lines so
+  content can't forge protocol; bounded lines, connections, and queues; and a
+  refusal to bind a non-loopback address without *both* `allow_remote` and TLS —
+  with wildcard binds counted as public. See `docs/irc-gateway.md`.
+
+### Changed
+- The Go relay reader moved from `tui/relay.go` to a shared `tui/relay` package
+  so the TUI and the gateway implement the on-disk contract exactly once. The UI
+  keeps its old names through type aliases, so `Message` in the TUI *is*
+  `relay.Message` and the two can never drift. No behaviour change.
+- `bin/dispatch-tui` rebuilds on changes anywhere under `tui/`, not just its top
+  level — the relay reader it depends on now lives in a subdirectory.
+
+### Fixed
+- `config.example.toml` put the top-level `instructions` key *after* the `[git]`
+  table, so TOML nested it inside `[git]` and the server silently ignored it.
+  Anyone who copied the example verbatim got the built-in affordance contract
+  instead of their own. Top-level keys now precede every table.
+
 ## [0.11.1] - 2026-07-21
 
 ### Added

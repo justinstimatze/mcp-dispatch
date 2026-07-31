@@ -14,19 +14,20 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TUI_DIR="$REPO_DIR/tui"
 BIN="$TUI_DIR/dispatch-tui"
 
-# Rebuild if the binary is missing or any Go source is newer than it.
+# Rebuild if the binary is missing or any Go source is newer than it. Recursive:
+# the relay reader lives in tui/relay/ and is shared with the IRC gateway.
 needs_build=0
 if [[ ! -x "$BIN" ]]; then
   needs_build=1
 else
   while IFS= read -r src; do
     [[ "$src" -nt "$BIN" ]] && { needs_build=1; break; }
-  done < <(find "$TUI_DIR" -maxdepth 1 -name '*.go' ! -name '*_test.go' -type f)
+  done < <(find "$TUI_DIR" -name '*.go' ! -name '*_test.go' -type f)
 fi
 
 if [[ "$needs_build" -eq 1 ]]; then
   echo "dispatch-tui: building…" >&2
-  make -C "$TUI_DIR" build >&2
+  make -C "$TUI_DIR" build-tui >&2
 fi
 
 exec "$BIN" "$@"
