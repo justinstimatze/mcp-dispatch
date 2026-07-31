@@ -290,7 +290,9 @@ def cmd_init(argv: list[str]) -> int:
         help="passed through to `service install` (e.g. SSH_AUTH_SOCK)",
     )
     ap.add_argument(
-        "--dry-run", action="store_true", help="with --service: plan the unit only — the clone and the [git] config "
+        "--dry-run",
+        action="store_true",
+        help="with --service: plan the unit only — the clone and the [git] config "
         "are still written for real",
     )
     args = ap.parse_args(argv)

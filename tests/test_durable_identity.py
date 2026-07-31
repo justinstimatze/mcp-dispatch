@@ -151,8 +151,7 @@ def test_dm_to_a_nick_reaches_every_live_session(server_factory):
     try:
         result = s._send("alpha", "publicai", "both windows")
         assert sorted(result["queued_to"]) == ["publicai-222", "publicai-333"], (
-            "picking one session arbitrarily is how a message reaches the window "
-            "nobody is watching"
+            "picking one session arbitrarily is how a message reaches the window nobody is watching"
         )
     finally:
         a.close()
