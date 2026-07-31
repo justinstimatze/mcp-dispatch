@@ -1,10 +1,14 @@
-// relay.go — the read-only view of the dispatch relay, with no TUI dependency.
+// Package relay is the Go view of the dispatch relay, with no UI dependency.
 //
-// Everything here is pure disk-reading so it can be unit-tested without a
-// terminal: resolve the relay + git-bus paths (env → config → default, matching
-// the Python tools), scan local inboxes and the git lanes into a merged
-// deduped message list, and read presence/roster to know who is reachable.
-package main
+// Everything here is pure disk work so it can be unit-tested without a terminal
+// or a listener: resolve the relay + git-bus paths (env → config → default,
+// matching the Python tools), scan local inboxes and the git lanes into a merged
+// deduped message list, read presence/roster to know who is reachable, and write
+// a message the same way a session would.
+//
+// It is shared by both Go binaries — dispatch-tui (a client) and dispatch-ircd
+// (a gateway) — so the on-disk contract is implemented exactly once.
+package relay
 
 import (
 	"crypto/rand"
@@ -28,7 +32,7 @@ import (
 // separators or traversal — the write path validates against this.
 var idRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
-func validID(s string) bool { return idRe.MatchString(s) }
+func ValidID(s string) bool { return idRe.MatchString(s) }
 
 // pidSuffixRe strips the trailing "-<pid>" the launcher appends per session.
 var pidSuffixRe = regexp.MustCompile(`-[0-9]+$`)
@@ -38,7 +42,7 @@ var pidSuffixRe = regexp.MustCompile(`-[0-9]+$`)
 // ephemeral connection while the project is the persistent "nick" — grouping by
 // project is what makes a live session show the conversation its past sessions
 // had. Channels ("#x") and "all" pass through unchanged.
-func project(id string) string {
+func Project(id string) string {
 	if id == "" || id == "all" || strings.HasPrefix(id, "#") {
 		return id
 	}
@@ -57,7 +61,7 @@ type Message struct {
 	MustRead  bool   `json:"must_read"`
 	State     string `json:"state"`
 	Via       string `json:"_via"` // "git" when it arrived over the bus
-	sortMS    int64  // chronological order key (not serialized)
+	SortMS    int64  `json:"-"`    // chronological order key (not serialized)
 }
 
 // Remote reports whether the message arrived from another host over git.
@@ -84,7 +88,7 @@ type Snapshot struct {
 // Path resolution (env → config → default), mirroring the Python tools.
 // ---------------------------------------------------------------------------
 
-type fileConfig struct {
+type Config struct {
 	DispatchDir string `toml:"dispatch_dir"`
 	Dispatch    struct {
 		DispatchDir string `toml:"dispatch_dir"`
@@ -94,7 +98,7 @@ type fileConfig struct {
 	} `toml:"git"`
 }
 
-func expandUser(p string) string {
+func ExpandUser(p string) string {
 	if p == "~" || strings.HasPrefix(p, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
 			return filepath.Join(home, strings.TrimPrefix(p, "~"))
@@ -103,39 +107,39 @@ func expandUser(p string) string {
 	return p
 }
 
-func loadConfig() fileConfig {
+func LoadConfig() Config {
 	path := os.Getenv("MCP_DISPATCH_CONFIG")
 	if path == "" {
-		path = expandUser("~/.config/mcp-dispatch/config.toml")
+		path = ExpandUser("~/.config/mcp-dispatch/config.toml")
 	}
-	var cfg fileConfig
+	var cfg Config
 	if _, err := toml.DecodeFile(path, &cfg); err != nil {
-		return fileConfig{} // absent/unreadable → empty, callers fall back
+		return Config{} // absent/unreadable → empty, callers fall back
 	}
 	return cfg
 }
 
 // RelayDir resolves the dispatch dir: env override, then config (top-level key
 // winning over the [dispatch] table), then the default.
-func RelayDir(cfg fileConfig) string {
+func RelayDir(cfg Config) string {
 	if v := os.Getenv("MCP_DISPATCH_DIR"); v != "" {
-		return expandUser(v)
+		return ExpandUser(v)
 	}
 	if v := os.Getenv("DISPATCH_DIR"); v != "" {
-		return expandUser(v)
+		return ExpandUser(v)
 	}
 	if cfg.DispatchDir != "" {
-		return expandUser(cfg.DispatchDir)
+		return ExpandUser(cfg.DispatchDir)
 	}
 	if cfg.Dispatch.DispatchDir != "" {
-		return expandUser(cfg.Dispatch.DispatchDir)
+		return ExpandUser(cfg.Dispatch.DispatchDir)
 	}
-	return expandUser("~/.config/mcp-dispatch/messages")
+	return ExpandUser("~/.config/mcp-dispatch/messages")
 }
 
 // GitRepoDir resolves the git-bus clone if cross-host comms are configured,
 // else "". Read-only: the TUI only scans lane files, never fetches.
-func GitRepoDir(cfg fileConfig) string {
+func GitRepoDir(cfg Config) string {
 	repo := os.Getenv("MCP_DISPATCH_GIT_REPO")
 	if repo == "" {
 		repo = cfg.Git.RepoDir
@@ -143,7 +147,7 @@ func GitRepoDir(cfg fileConfig) string {
 	if repo == "" {
 		return ""
 	}
-	repo = expandUser(repo)
+	repo = ExpandUser(repo)
 	if fi, err := os.Stat(repo); err != nil || !fi.IsDir() {
 		return ""
 	}
@@ -226,7 +230,7 @@ func scanInbox(relay string) []Message {
 			if json.Unmarshal(data, &m) != nil {
 				continue
 			}
-			m.sortMS = filenameMS(f.Name(), m)
+			m.SortMS = filenameMS(f.Name(), m)
 			out = append(out, m)
 		}
 	}
@@ -273,7 +277,7 @@ func scanGit(repo string) []Message {
 				continue
 			}
 			m.Via = "git"
-			m.sortMS = isoToMS(m.Timestamp)
+			m.SortMS = isoToMS(m.Timestamp)
 			out = append(out, m)
 		}
 	}
@@ -297,8 +301,8 @@ func mergeMessages(inbox, git []Message) []Message {
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].sortMS != out[j].sortMS {
-			return out[i].sortMS < out[j].sortMS
+		if out[i].SortMS != out[j].SortMS {
+			return out[i].SortMS < out[j].SortMS
 		}
 		return out[i].ID < out[j].ID
 	})
@@ -332,7 +336,7 @@ func roster(relay, repo string) []Agent {
 			// presence file is group-writable in group_mode, so a crafted agent_id
 			// (traversal, separators) must never reach filepath.Join. Mirrors the
 			// server's own ID_RE guard.
-			if json.Unmarshal(data, &p) != nil || !validID(p.AgentID) {
+			if json.Unmarshal(data, &p) != nil || !ValidID(p.AgentID) {
 				continue
 			}
 			if !flockHeld(pf) {
@@ -353,7 +357,7 @@ func roster(relay, repo string) []Agent {
 				continue
 			}
 			var r remoteFile
-			if json.Unmarshal(data, &r) != nil || !validID(r.AgentID) {
+			if json.Unmarshal(data, &r) != nil || !ValidID(r.AgentID) {
 				continue
 			}
 			if _, isLive := live[r.AgentID]; isLive {
@@ -446,29 +450,29 @@ type outMessage struct {
 // A DM to a remote-only nick is written to its local inbox and the gitsync
 // daemon bridges it. Returns the number of inboxes written.
 func Send(relay, from, target, content string, snap Snapshot, priority string) (int, error) {
-	if !validID(from) {
+	if !ValidID(from) {
 		return 0, fmt.Errorf("invalid nick %q", from)
 	}
 	var targets []string
 	switch {
 	case target == "all":
 		for _, a := range snap.Agents {
-			if a.Live && a.ID != from && validID(a.ID) {
+			if a.Live && a.ID != from && ValidID(a.ID) {
 				targets = append(targets, a.ID)
 			}
 		}
 	case strings.HasPrefix(target, "#"):
 		ch := target[1:]
-		if !validID(ch) {
+		if !ValidID(ch) {
 			return 0, fmt.Errorf("invalid channel %q", target)
 		}
 		for _, a := range snap.Agents {
-			if a.Live && a.ID != from && validID(a.ID) && contains(a.Channels, ch) {
+			if a.Live && a.ID != from && ValidID(a.ID) && contains(a.Channels, ch) {
 				targets = append(targets, a.ID)
 			}
 		}
 	default:
-		if !validID(target) {
+		if !ValidID(target) {
 			return 0, fmt.Errorf("invalid target %q", target)
 		}
 		targets = []string{target}
@@ -496,7 +500,7 @@ func Send(relay, from, target, content string, snap Snapshot, priority string) (
 // read_at), mirroring server.ack. Only the console's OWN inbox — no session owns
 // it, so this can't race another writer. Returns the number acked.
 func AckInbox(relay, nick string) (int, error) {
-	if !validID(nick) {
+	if !ValidID(nick) {
 		return 0, fmt.Errorf("invalid nick %q", nick)
 	}
 	files, err := filepath.Glob(filepath.Join(relay, nick, "*.json"))

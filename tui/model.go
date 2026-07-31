@@ -195,8 +195,8 @@ func (m *model) accumulate(msgs []Message) {
 		return
 	}
 	sort.SliceStable(m.transcript, func(i, j int) bool {
-		if m.transcript[i].sortMS != m.transcript[j].sortMS {
-			return m.transcript[i].sortMS < m.transcript[j].sortMS
+		if m.transcript[i].SortMS != m.transcript[j].SortMS {
+			return m.transcript[i].SortMS < m.transcript[j].SortMS
 		}
 		return m.transcript[i].ID < m.transcript[j].ID
 	})
@@ -338,7 +338,10 @@ func (m model) currentTarget() target {
 	return target{kind: targetAll}
 }
 
-func (msg Message) matches(t target) bool {
+// matches reports whether a message belongs in the feed under filter t. A plain
+// function rather than a method: Message is an alias for relay.Message, and a
+// method can only be declared in the type's own package.
+func matches(msg Message, t target) bool {
 	switch t.kind {
 	case targetAll:
 		return true
@@ -359,7 +362,7 @@ func (m *model) refreshFeed() {
 		if t.kind == targetPastHeader { // the group header shows all offline chatter
 			return m.offline[project(msg.From)] || m.offline[project(msg.To)]
 		}
-		return msg.matches(t)
+		return matches(msg, t)
 	}
 	var b strings.Builder
 	shown := 0
