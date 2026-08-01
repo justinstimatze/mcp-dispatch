@@ -13,7 +13,8 @@ It also, for the first time, makes mcp-dispatch accept a connection. Read
 [Security](#security) before enabling it. The short version: it is off unless
 you turn it on in the config file, it speaks over a `0600` unix socket by
 default, the kernel checks the peer's uid, a token is required on every
-transport, and it refuses outright to serve a public address in the clear.
+transport, TLS is required on every TCP listener it binds — loopback included —
+and reaching a public address takes a second, separate key.
 
 ## Quick start
 

@@ -6,6 +6,21 @@ truth for versions.
 
 ## [Unreleased]
 
+### Upgrading an existing relay
+
+Nothing to migrate — the new state is created on demand — but three things
+change under a running install:
+
+- **Restart your sessions.** The `task` tool is new, and an MCP server's tool
+  list is read at session start.
+- **Two directories appear** in the relay: `.agents/` (the durable nick
+  registry) and `.tasks/`. Both are created on demand and are owner-only.
+- **`dispatch(target="<nick>")` resolves now.** Sending to `publicai` used to
+  write literally to `{relay}/publicai/`, which no `publicai-<pid>` session ever
+  read; it now reaches that teammate's live sessions, or waits in the nick's
+  inbox for the next one. Addressing a concrete session id is unchanged. This is
+  the fix, but it *is* a behaviour change to an existing call.
+
 ### Security
 - **TLS is required on every TCP listener the IRC gateway binds — loopback
   included.** There is no cleartext TCP mode at any address any more. Cleartext

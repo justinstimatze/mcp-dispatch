@@ -8,12 +8,13 @@
 //
 // It is off unless the config says otherwise, speaks over a 0600 unix socket by
 // default, checks the peer's uid with the kernel, requires a token on every
-// transport, and refuses to serve a public address in the clear. See
-// docs/irc-gateway.md.
+// transport, requires TLS on every TCP listener (loopback included), and will
+// not bind a public address unless asked twice. See docs/irc-gateway.md.
 //
 //	dispatch-ircd --init-token   # generate the shared secret, once
-//	dispatch-ircd                # run (needs [irc] enabled = true)
+//	dispatch-ircd --init-tls     # ...and a certificate, if you want TCP
 //	dispatch-ircd --check        # validate config and exit
+//	dispatch-ircd                # run (needs [irc] enabled = true)
 package main
 
 import (

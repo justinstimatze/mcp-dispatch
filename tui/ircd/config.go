@@ -5,7 +5,8 @@
 // treats every widening of exposure as something you must ask for *explicitly*
 // and in writing. Nothing here has a convenient default: the gateway is off
 // until enabled in the config file, speaks over a 0600 unix socket unless told
-// otherwise, and refuses outright to bind a public address in the clear.
+// otherwise, encrypts every TCP listener it does bind, and will not reach a
+// public address without a second, separate key.
 package main
 
 import (
