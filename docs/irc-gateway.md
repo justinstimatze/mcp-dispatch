@@ -45,13 +45,17 @@ Connect over the unix socket (no network involved at all):
 /connect dispatch
 ```
 
-For clients that only speak TCP, add a listener — which **must** be TLS:
+For clients that only speak TCP, add a listener — which **must** be TLS. Name
+the `socket` explicitly at the same time: the socket default applies only while
+`listen` is unset, so adding TCP alone takes away the transport this document
+otherwise tells you to prefer.
 
 ```toml
 [irc]
 listen   = "127.0.0.1:6697"
 tls_cert = "~/.config/mcp-dispatch/irc-cert.pem"
 tls_key  = "~/.config/mcp-dispatch/irc-key.pem"
+socket   = "~/.config/mcp-dispatch/irc.sock"   # else TCP is the ONLY transport
 ```
 
 ```bash
@@ -211,28 +215,61 @@ curl -fsSL "https://github.com/squidowl/halloy/releases/download/$v/halloy-$v-x8
   | tar -xzf - -C ~/.local
 ```
 
+**Take the tarball, not a snap or flatpak.** A confined build cannot read
+`~/.config` at all: the snap `home` interface only covers *non-hidden* paths
+under `$HOME`, and the Halloy snap does not plug `home` in the first place. So
+it can reach neither the certificate nor the token, and its
+`password-manager-service` plug ships unconnected, so the keyring is out too.
+Working around that means keeping a copy of the certificate inside the snap's
+own directory — which goes stale the day you reissue the certificate and then
+fails as a verification error that says nothing about the copy. Unconfined means
+one path and no copies.
+
 ```toml
 # ~/.config/halloy/config.toml
 [servers.dispatch]
-server    = "localhost"          # must match a SAN on the certificate
-port      = 6697
-use_tls   = true
-root_cert_path = "~/.config/mcp-dispatch/irc-cert.pem"
-nickname  = "you"
+server   = "localhost"           # must match a SAN on the certificate
+port     = 6697
+use_tls  = true
+root_cert_path = "/home/you/.config/mcp-dispatch/irc-cert.pem"
+nickname = "you"
+channels = ["&dispatch"]
 
 [servers.dispatch.sasl.plain]
-username = "you"
-password_keyring = true          # the token lives in the system keyring
+username                      = "you"
+password_file                 = "/home/you/.config/mcp-dispatch/irc-token"
+password_file_first_line_only = true
 ```
 
-Note `password_keyring`: the token is read/write on every conversation on this
-host, and this is the one client path that keeps it out of a plaintext config
-file. Put it in the keyring under the entry Halloy names and it never touches
-disk in the clear.
+Both paths are absolute on purpose. Every `~/…` elsewhere on this page is an
+*mcp-dispatch* config key, and those expand — Halloy's do not. It resolves a
+relative path against its own config directory, so a literal `~/…` becomes
+`~/.config/halloy/~/…` and the file is simply not found.
+
+Note `password_file`. The token is read/write on every conversation on this
+host, so the goal is to never have a second copy of it — and the gateway already
+keeps the authoritative one at `0600`. Pointing the client straight at that file
+beats both a literal `password` in the config and `password_keyring`: nothing is
+duplicated, nothing to re-sync when you rotate the token, and no dependency on a
+keyring daemon being present and unlocked.
+
+`password_file_first_line_only` is not optional. `--init-token` writes a
+trailing newline, and without this the newline is sent as part of the password
+and authentication fails — with a wrong-token error, for a token that is right.
 
 `server` has to match a name the certificate covers — `localhost`, this host's
 name, or an address in `--tls-hosts`. Pointing it at `127.0.0.1` when the SAN
 says `localhost` fails verification, correctly.
+
+To check the two halves independently before blaming the client:
+
+```bash
+# 1. does the certificate validate as its own anchor, for this hostname?
+openssl s_client -connect localhost:6697 -CAfile ~/.config/mcp-dispatch/irc-cert.pem \
+  -verify_return_error -verify_hostname localhost </dev/null | grep 'Verify return code'
+```
+
+A `0 (ok)` there means TLS is fine and anything still broken is auth.
 
 ## Security
 
@@ -345,8 +382,8 @@ under `[irc]`. The ones worth knowing:
 | key | default | what it does |
 |---|---|---|
 | `enabled` | `false` | the master switch; no flag equivalent |
-| `socket` | `~/.config/mcp-dispatch/irc.sock` | unix transport, `0600`, uid-checked |
-| `listen` | *(unset)* | optional TCP `host:port` |
+| `socket` | `~/.config/mcp-dispatch/irc.sock`, **but only while `listen` is unset** | unix transport, `0600`, uid-checked |
+| `listen` | *(unset)* | optional TCP `host:port` — setting it drops the socket default |
 | `tls_cert` / `tls_key` | *(unset)* | **required for any TCP listener** |
 | `tls_min_version` | `1.3` | version floor; `1.2` for an old client |
 | `tls_client_ca` | *(unset)* | mutual TLS — an extra gate, not a token replacement |

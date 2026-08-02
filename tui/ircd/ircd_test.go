@@ -69,6 +69,23 @@ func TestCheckDistinguishesUnreadBusFromAbsentOne(t *testing.T) {
 	}
 }
 
+// The socket default applies only when `listen` is unset, so adding a TCP
+// listener drops it. --check must say why rather than print "(none)", which
+// reads as "you didn't configure one".
+func TestCheckExplainsWhyTheSocketIsUnbound(t *testing.T) {
+	if got := socketLabel(loadConfigFrom(t, "[irc]\nenabled = true\n")); got == "" {
+		t.Error("no listener configured: the socket should default to a path")
+	}
+	got := socketLabel(loadConfigFrom(t, "[irc]\nenabled = true\nlisten = \"127.0.0.1:6697\"\n"))
+	if !strings.Contains(got, "listen") {
+		t.Errorf("listen set, socket unset: got %q, want the reason it is unbound", got)
+	}
+	both := loadConfigFrom(t, "[irc]\nenabled = true\nlisten = \"127.0.0.1:6697\"\nsocket = \"/x.sock\"\n")
+	if got := socketLabel(both); got != "/x.sock" {
+		t.Errorf("both set: got %q, want the socket path", got)
+	}
+}
+
 func loadConfigFrom(t *testing.T, body string) Config {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")

@@ -145,7 +145,7 @@ func main() {
 		fmt.Println("configuration OK")
 		fmt.Printf("  relay        %s\n", relayDir)
 		fmt.Printf("  git bus      %s\n", orNone(repoLabel(repo, readGit)))
-		fmt.Printf("  unix socket  %s\n", orNone(cfg.Socket))
+		fmt.Printf("  unix socket  %s\n", orNone(socketLabel(cfg)))
 		fmt.Printf("  tcp listen   %s\n", orNone(tcpLabel(cfg)))
 		if cfg.TLSCert != "" {
 			fp, err := fingerprintFile(cfg.TLSCert)
@@ -322,6 +322,19 @@ func repoLabel(repo string, readGit bool) string {
 		return repo + "  ← configured but NOT read (read_git = false, or --no-git)"
 	}
 	return repo
+}
+
+// socketLabel describes the unix transport for --check. The socket default
+// applies only when no TCP listener is configured, so adding `listen` silently
+// takes the socket away — from a reader who has just been told, twice, that the
+// socket is the transport to prefer. Say it, rather than printing "(none)" and
+// letting them find out when a client that only speaks unix can't connect.
+func socketLabel(c Config) string {
+	if c.Socket == "" && c.Listen != "" {
+		return "not bound — listen is set, which overrides the socket default " +
+			"(set socket explicitly to have both)"
+	}
+	return c.Socket
 }
 
 func tcpLabel(c Config) string {

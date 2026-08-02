@@ -74,6 +74,21 @@ change under a running install:
   docs now say to check your client rather than assume, and give the one-liner
   that proves which side is at fault.
 
+- **`--check` explains an unbound unix socket instead of printing `(none)`.**
+  The socket default applies only while `listen` is unset, so adding a TCP
+  listener silently takes the socket away — from a reader the same document has
+  just told, twice, to prefer the socket and to run a bouncer over it. The
+  config table documented the default flatly, with no mention of the condition.
+  Both now say so, and the quick start sets `socket` alongside `listen`.
+- **GUI client guidance is corrected to `password_file`.** It recommended
+  `password_keyring`; pointing the client at the gateway's own `0600` token file
+  is strictly better — no second copy of a credential that is read/write on the
+  whole relay, nothing to re-sync on rotation, no keyring daemon to depend on.
+  Documents `password_file_first_line_only`, without which `--init-token`'s
+  trailing newline is sent as part of the password and auth fails with a
+  wrong-token error for a token that is right. Also warns off snap and flatpak
+  builds: a confined client cannot read `~/.config` at all.
+
 ### Removed
 - **`bin/dispatch-tail`.** Its own docstring described it as watching messages
   "scroll by like IRC", and `&dispatch` on the gateway is now literally that.
