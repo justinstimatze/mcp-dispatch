@@ -390,17 +390,10 @@ def _release_id(agent_id: str) -> None:
 # of one teammate named `publicai`. It is never reaped: a nick you have talked
 # to once stays addressable forever, online or not.
 
-_PID_SUFFIX_RE = re.compile(r"^(?P<nick>.+)-\d+$")
-
-
-def _durable_nick(agent_id: str) -> str:
-    """The stable identity behind a session id: `publicai-1767991` → `publicai`.
-
-    An id with no pid suffix (a roster id, or an explicit MCP_DISPATCH_AGENT_ID)
-    is already durable and passes through unchanged.
-    """
-    m = _PID_SUFFIX_RE.match(agent_id)
-    return m.group("nick") if m else agent_id
+# Shared with the lifecycle supervisor, which has to answer "which teammate is
+# this inbox for?" without importing server.py (that would claim an agent id and
+# start threads). Same rule, one implementation — see dispatch_fs.
+_durable_nick = dispatch_fs.durable_nick
 
 
 def _agent_record_path(nick: str) -> Path:
@@ -649,17 +642,7 @@ _atomic_write = dispatch_fs.atomic_write
 _parse_timestamp = dispatch_fs.parse_timestamp
 
 
-def _is_expired(msg: dict) -> bool:
-    """Check if a message has expired based on TTL."""
-    ttl = msg.get("ttl")
-    if not ttl or ttl <= 0:
-        return False
-    if msg.get("must_read", False):
-        return False
-    sent_at = _parse_timestamp(msg.get("timestamp", ""))
-    if sent_at <= 0:
-        return False
-    return time.time() > sent_at + ttl
+_is_expired = dispatch_fs.is_expired
 
 
 def _cleanup_expired(agent_id: str) -> int:

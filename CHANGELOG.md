@@ -22,6 +22,38 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Added
+- **Lifecycle supervisor (`bin/dispatch-supervise`).** Durable nicks made an
+  offline teammate addressable; nothing made one answer. A DM to `publicai` sat
+  in its inbox until a human happened to open that project. The supervisor
+  watches for mail waiting on a nick with no live session and starts that nick's
+  runtime — `service install` puts it under systemd, `check` validates the
+  allowlist, `status` reports who is configured, live and waiting, `--dry-run`
+  shows what it would start.
+
+  The trigger is not a new rule: it is exactly the mail a successor session
+  *would inherit* (the nick's own inbox plus any dead session inbox of that
+  nick), so the supervisor fires precisely when there is something to find, and
+  a successful start clears the trigger by itself. A test asserts that agreement
+  differentially against the real inheritance path rather than restating its
+  rules, because a copy of a rule is a copy that can drift.
+
+  An inbound message causing a process to run is remote-triggered execution, and
+  over the git bus those messages come from other machines. So what runs comes
+  only from an operator-written allowlist: a nick with no
+  `[supervisor.agents.<nick>]` block is never started whatever it is sent (there
+  is no wildcard, and `enabled = true` alone supervises nothing), `command` is
+  argv rather than a shell string, `command[0]` must be absolute so a service's
+  minimal `PATH` cannot decide which binary a bare name means, and nothing from
+  a message reaches argv, cwd or env — the supervisor reads messages only to
+  count them. A test plants a message full of shell metacharacters and asserts
+  none of it appears in the child's argv or environment.
+
+  Rate limits bound the damage independently of any of that being correct: a
+  per-nick cooldown, a starts-per-hour ceiling, a concurrency cap, and a breaker
+  that parks a nick after repeated failures. The ceiling exists for a specific
+  loop — a runtime that starts, dies without reading its mail, and would
+  otherwise be restarted forever, each start "succeeding" and so never tripping
+  the failure counter. Off unless `[supervisor] enabled = true`.
 - **IRC gateway polish.** Three IRCv3 capabilities, implemented rather than
   merely advertised: `server-time` (each message shows the time it crossed the
   relay — without it a JOIN replay is fifty messages that all look like they
@@ -126,6 +158,14 @@ change under a running install:
   `&dispatch` for a scrolling one, and `bin/dispatch-status` for a snapshot.
 
 ### Changed
+- **Internal: three rules that had two homes now have one.** `durable_nick` and
+  the TTL-expiry predicate moved from `server.py` into `dispatch_fs` (which
+  exists precisely so a second process can share the on-disk contract without
+  importing a module that claims an agent id at import), and the systemd unit
+  machinery — escaping, the 0600 write, reload/enable/restart, status — moved
+  from `gitsync_service.py` into `systemd_user.py`. The supervisor needs all
+  four; copying them would have meant a second implementation of code whose only
+  job is being careful with untrusted input. No behaviour change.
 - **A bare `/msg dispatch ack` no longer acknowledges your entire inbox.** It
   prints usage instead. Acking is destructive — the MCP server deletes an acked
   message — and that is not a sensible default for a command you might type to

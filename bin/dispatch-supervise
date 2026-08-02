@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Start an agent's runtime when mail is waiting for it and nobody is home.
+
+Durable nicks made an offline teammate addressable — a DM to `publicai` waits in
+its inbox and the next session inherits it. This daemon is what makes that next
+session happen, instead of the mail waiting until a human opens a window.
+
+    dispatch-supervise                  # run the daemon (one per host)
+    dispatch-supervise --once           # a single pass and exit (smoke / cron)
+    dispatch-supervise --dry-run        # report what it WOULD start, start nothing
+    dispatch-supervise check            # validate the allowlist before trusting it
+    dispatch-supervise status           # who is configured, live, and waiting
+    dispatch-supervise service install  # run it as a systemd user service
+
+An inbound message causing a process to run is remote-triggered execution, so
+what runs comes only from an operator-written allowlist in the config:
+
+    [supervisor]
+    enabled = true
+
+    [supervisor.agents.publicai]
+    command = ["/home/you/bin/start-publicai"]   # argv, never a shell string
+    cwd = "/home/you/code/publicai"
+
+A nick with no block is never started, whatever it is sent, and nothing from a
+message reaches argv, cwd or env. Run `check` before enabling: it resolves every
+command, and refuses a config file others can write. See supervisor.py for the
+full rationale and README "Lifecycle: starting an agent that has mail".
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+# supervisor.py, dispatch_common.py and friends live at the repo root (parent of bin/).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
+import supervisor  # noqa: E402
+import supervisor_service  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# How often the not-yet-ready loop re-reads config while waiting to start.
+READY_POLL_SECONDS = 5.0
+
+
+def _config_path() -> Path:
+    raw = os.environ.get("MCP_DISPATCH_CONFIG") or "~/.config/mcp-dispatch/config.toml"
+    return Path(os.path.expanduser(raw))
+
+
+def _host_lock_path(dispatch_dir: Path) -> Path:
+    return common.state_dir() / f"supervise-{common.md5_key(str(dispatch_dir))}.lock"
+
+
+def _load() -> tuple[Path, supervisor.SupervisorConfig | None, str]:
+    """(relay dir, config, problem). ``config`` is None exactly when problem is set."""
+    cfg_data = common.load_config()
+    relay = common.dispatch_dir(cfg_data)
+    try:
+        cfg = supervisor.load(cfg_data)
+    except supervisor.ConfigError as e:
+        return relay, None, str(e)
+    if not cfg.enabled:
+        return relay, None, "[supervisor] enabled is false — nothing to supervise."
+    if not cfg.agents:
+        return relay, None, "[supervisor] has no agents — add a [supervisor.agents.<nick>] block."
+    return relay, cfg, ""
+
+
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+
+
+def cmd_check(argv: list[str]) -> int:
+    argparse.ArgumentParser(
+        prog="dispatch-supervise check",
+        description="Validate the supervisor allowlist without starting anything.",
+    ).parse_args(argv)
+
+    relay, cfg, problem = _load()
+    print(f"config:  {_config_path()}")
+    print(f"relay:   {relay}")
+
+    warn = supervisor.config_permission_warning(_config_path())
+    if warn:
+        print(f"  ✗ {warn}")
+
+    if cfg is None:
+        print(f"  ✗ {problem}")
+        return 1
+
+    print(f"agents:  {len(cfg.agents)} allowlisted")
+    # A nick the relay has never seen is usually a typo in the section header —
+    # the entry is valid, it just can never match a real teammate.
+    known = {p.stem for p in (relay / ".agents").glob("*.json")} if relay.is_dir() else set()
+    bad = bool(warn)
+    for nick, spec in cfg.agents.items():
+        problems = supervisor.check_spec(spec)
+        mark = "✗" if problems else "✓"
+        print(f"  {mark} {nick}: {' '.join(spec.command)}")
+        for p in problems:
+            print(f"      ✗ {p}")
+        if not problems and nick not in known:
+            print(
+                f"      ! no nick '{nick}' in the registry yet — it will only ever fire "
+                "once some session has used that id (check the spelling)"
+            )
+        bad = bad or bool(problems)
+
+    if bad:
+        print("\nNot ready. Fix the ✗ lines above.")
+        return 1
+    print("\nOK. Start it with:  dispatch-supervise service install")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+
+def cmd_status(argv: list[str]) -> int:
+    argparse.ArgumentParser(prog="dispatch-supervise status").parse_args(argv)
+
+    relay, cfg, problem = _load()
+    print(f"relay:            {relay}")
+    if cfg is None:
+        print(f"supervisor:       {problem}")
+    else:
+        print(f"supervisor:       enabled, {len(cfg.agents)} agent(s) allowlisted")
+        print(f"log dir:          {cfg.log_dir}")
+
+    lock = _host_lock_path(relay)
+    running = common.flock_held(lock)
+    print(f"daemon:           {'running' if running else 'not running'}  ({lock})")
+
+    if cfg is not None and relay.is_dir():
+        for nick, spec in cfg.agents.items():
+            live = supervisor.is_live(relay, nick)
+            mail = supervisor.waiting_mail(relay, nick)
+            problems = supervisor.check_spec(spec)
+            state = "live" if live else f"offline, {mail} waiting"
+            note = f"  ✗ {problems[0]}" if problems else ""
+            print(f"  {nick:<20} {state}{note}")
+
+    for line in supervisor_service.status_lines():
+        print(line)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# service
+# ---------------------------------------------------------------------------
+
+
+def cmd_service(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dispatch-supervise service",
+        description="Run the supervisor as a systemd user service.",
+    )
+    ap.add_argument("action", choices=["install", "uninstall", "show"])
+    ap.add_argument("--dry-run", action="store_true", help="plan only, write nothing")
+    ap.add_argument("--no-enable", action="store_true", help="write the unit but don't start it")
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra Environment= line (repeatable). A user service inherits almost "
+        "nothing from your shell, and the agent you start inherits this environment.",
+    )
+    args = ap.parse_args(argv)
+
+    if args.action == "uninstall":
+        for step in supervisor_service.uninstall(dry_run=args.dry_run):
+            print(f"  {step}")
+        return 0
+
+    relay, cfg, problem = _load()
+    if cfg is None:
+        # A service around a disabled or invalid allowlist would start, find
+        # nothing to do, and sit there looking healthy. Refuse instead.
+        print(f"[supervise] {problem}")
+        return 1
+    # Never install a unit whose allowlist doesn't resolve: the failure would
+    # otherwise first surface as a parked nick in a log nobody is reading.
+    broken = {n: supervisor.check_spec(s) for n, s in cfg.agents.items()}
+    broken = {n: p for n, p in broken.items() if p}
+    if broken:
+        for nick, problems in broken.items():
+            print(f"[supervise] {nick}: {'; '.join(problems)}")
+        print("[supervise] fix these (dispatch-supervise check) before installing the service.")
+        return 1
+
+    try:
+        unit = supervisor_service.render_unit(
+            python=sys.executable,
+            daemon=Path(__file__).resolve(),
+            repo_root=REPO_ROOT,
+            config_path=_config_path(),
+            dispatch_dir=relay,
+            state_dir=common.state_dir(),
+            log_dir=cfg.log_dir,
+            interval=cfg.interval,
+            env=supervisor_service.validate_env(args.env),
+        )
+        if args.action == "show":
+            print(unit, end="")
+            return 0
+        steps = supervisor_service.install(unit, enable=not args.no_enable, dry_run=args.dry_run)
+    except supervisor_service.ServiceError as e:
+        print(f"[supervise] {e}")
+        return 1
+
+    for step in steps:
+        print(f"  {step}")
+    if args.dry_run:
+        print("\n(--dry-run: nothing written. `service show` prints the unit itself.)")
+    else:
+        print(
+            f"\n  watch it:  journalctl --user -u {supervisor_service.UNIT_NAME} -f\n"
+            "  upgrade:   re-run `dispatch-supervise service install` after changing config"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+
+def cmd_run(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dispatch-supervise",
+        description="Start an allowlisted agent when mail is waiting and it is offline.",
+    )
+    ap.add_argument("--interval", type=float, default=None, help="seconds between passes")
+    ap.add_argument("--once", action="store_true", help="run a single pass and exit")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be started without starting it",
+    )
+    args = ap.parse_args(argv)
+
+    relay, cfg, problem = _load()
+    if cfg is None:
+        # --once and --dry-run are transient: report and leave. A supervised run
+        # must NOT exit — every one of these conditions is "the config isn't ready
+        # yet", and dying immediately hands systemd's Restart=always a process that
+        # trips its start limit and latches the unit `failed` for good. Wait,
+        # re-reading config, and start the moment it's fixed.
+        if args.once or args.dry_run:
+            print(f"[supervise] {problem}")
+            return 1
+        last = ""
+        try:
+            while cfg is None:
+                if problem != last:
+                    last = problem
+                    print(f"[supervise] {problem}")
+                    print("[supervise] waiting — config is re-read every pass.")
+                time.sleep(READY_POLL_SECONDS)
+                relay, cfg, problem = _load()
+        except KeyboardInterrupt:
+            return 0
+        print("[supervise] config is ready.")
+
+    warn = supervisor.config_permission_warning(_config_path())
+    if warn:
+        print(f"[supervise] WARNING: {warn}")
+
+    interval = args.interval if args.interval is not None else cfg.interval
+    sup = supervisor.Supervisor(relay, cfg, dry_run=args.dry_run)
+
+    if args.once or args.dry_run:
+        for d in sup.tick():
+            print(d.line())
+        return 0
+
+    # One supervisor per relay. Two would race to start the same nick, and both
+    # would win — the cooldown is per-process state, not a lock.
+    lock = common.acquire_flock(_host_lock_path(relay), attempts=2)
+    if lock is None:
+        print(f"[supervise] a supervisor is already watching {relay}; not starting a second.")
+        return 0
+
+    print(
+        f"[supervise] watching {relay} for {len(cfg.agents)} agent(s) "
+        f"every {interval}s — {', '.join(sorted(cfg.agents))}"
+    )
+    print(
+        f"[supervise] limits: {cfg.cooldown:.0f}s cooldown, "
+        f"{cfg.max_starts_per_hour}/hour, {cfg.max_concurrent_starts} concurrent, "
+        f"park after {cfg.max_failures} consecutive failures"
+    )
+    try:
+        while True:
+            sup.tick()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "check":
+        return cmd_check(argv[1:])
+    if argv and argv[0] == "status":
+        return cmd_status(argv[1:])
+    if argv and argv[0] == "service":
+        return cmd_service(argv[1:])
+    return cmd_run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

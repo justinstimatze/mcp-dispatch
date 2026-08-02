@@ -52,7 +52,6 @@ via the ack() tool.
 from __future__ import annotations
 
 import argparse
-import calendar
 import json
 import os
 import re
@@ -60,9 +59,10 @@ import sys
 import time
 from pathlib import Path
 
-# notify_policy.py and dispatch_common.py live at the repo root (parent of bin/).
+# notify_policy.py, dispatch_fs.py and dispatch_common.py live at the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
 from notify_policy import should_notify  # noqa: E402
 
 # When launched standalone (no live server holding the agent's presence), there's
@@ -122,15 +122,9 @@ def _my_channels(dispatch_dir: Path, agent_id: str) -> list[str]:
     return [c for c in chans if isinstance(c, str)]
 
 
-def _expired(msg: dict) -> bool:
-    ttl = msg.get("ttl")
-    if not ttl or ttl <= 0 or msg.get("must_read"):
-        return False
-    try:
-        sent = calendar.timegm(time.strptime(msg.get("timestamp", ""), "%Y-%m-%dT%H:%M:%SZ"))
-    except (ValueError, TypeError):
-        return False
-    return time.time() > sent + ttl
+# The TTL rule lives in dispatch_fs, beside the rest of the on-disk contract, so
+# the waiter, the server and the supervisor can't disagree about what has expired.
+_expired = dispatch_fs.is_expired
 
 
 def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]:

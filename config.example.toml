@@ -204,3 +204,54 @@ Available targets: {agent_list}.
 # interval = 1.0
 # history = 50
 # read_git = true
+
+# ---------------------------------------------------------------------------
+# [supervisor] — the lifecycle supervisor (dispatch-supervise). OFF by default.
+#
+# Starts an agent's runtime when mail is waiting for it and no session of that
+# nick is live. That makes an inbound message cause a process to run, and
+# messages arrive from other agents on this host and — over the git bus — from
+# other machines. So the command is an ALLOWLIST, written here by you:
+#
+#   * a nick with no [supervisor.agents.<nick>] block is never started, whatever
+#     it is sent. There is no wildcard;
+#   * `command` is argv, never a shell string, and nothing from a message ever
+#     reaches argv, cwd or env;
+#   * the limits below bound spawns no matter how much mail arrives.
+#
+# Run `dispatch-supervise check` before enabling: it resolves every command and
+# refuses a config file other accounts can write. See README "Lifecycle".
+# ---------------------------------------------------------------------------
+[supervisor]
+# The master switch. Enabling it with no agents block supervises nothing —
+# there is deliberately no "supervise everything" setting.
+# enabled = false
+
+# Poll seconds, and how long a started runtime has to claim its presence lock
+# before the attempt is counted a failure. Not claiming presence is not fatal to
+# the process — the supervisor stops waiting on it, it does not kill it.
+# interval = 5.0
+# start_timeout = 120.0
+
+# The spawn limits, in the order they bite. cooldown is the minimum gap between
+# two starts of one nick; max_starts_per_hour is the ceiling that bounds a
+# runtime which starts, dies without reading its mail, and would otherwise be
+# restarted forever; max_concurrent_starts caps how many nicks may be starting
+# at once; after max_failures consecutive failures a nick is parked until the
+# supervisor is restarted.
+# cooldown = 60.0
+# max_starts_per_hour = 12
+# max_concurrent_starts = 2
+# max_failures = 5
+
+# Where each agent's stdout/stderr goes, as <nick>.log, rotated once past 1 MiB.
+# This is the first place to look when a start fails.
+# log_dir = "~/.cache/mcp-dispatch/supervisor"
+
+# One block per startable nick. The section name IS the nick — the durable id
+# with its pid suffix stripped, the thing `who()` lists under `known`.
+#
+# [supervisor.agents.publicai]
+# command = ["/home/you/bin/start-publicai"]   # argv list; command[0] absolute
+# cwd = "/home/you/code/publicai"              # optional
+# env = { SOME_KEY = "value" }                 # optional, overlays the daemon's

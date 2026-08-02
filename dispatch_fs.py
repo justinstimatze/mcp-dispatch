@@ -30,6 +30,9 @@ from typing import Any
 # \Z (not $) anchors the absolute end — $ would also match before a trailing newline.
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
 
+# A dynamic-mode id is `<nick>-<pid>`. The nick is the durable half.
+PID_SUFFIX_RE = re.compile(r"^(?P<nick>.+)-\d+$")
+
 
 def validate_id(value: str, kind: str = "agent id") -> str:
     """Ensure an id is a single safe path segment. Raises ValueError otherwise."""
@@ -84,6 +87,17 @@ def message_filename(from_id: str) -> str:
     return f"{ts}-{from_id}-{uuid.uuid4().hex[:8]}.json"
 
 
+def is_expired(msg: dict) -> bool:
+    """True if ``msg``'s TTL has elapsed. ``must_read`` never expires."""
+    ttl = msg.get("ttl")
+    if not ttl or ttl <= 0 or msg.get("must_read", False):
+        return False
+    sent_at = parse_timestamp(msg.get("timestamp", ""))
+    if sent_at <= 0:
+        return False
+    return time.time() > sent_at + ttl
+
+
 def presence_is_live(pf: Path) -> bool:
     """True iff a live process holds the exclusive flock on this presence file.
 
@@ -125,6 +139,21 @@ def live_agents(dispatch_dir: Path) -> list[str]:
         if ID_RE.match(str(aid)):
             out.append(str(aid))
     return out
+
+
+def durable_nick(agent_id: str) -> str:
+    """The stable identity behind a session id: ``publicai-1767991`` → ``publicai``.
+
+    An id with no pid suffix (a roster id, or an explicit MCP_DISPATCH_AGENT_ID)
+    is already durable and passes through unchanged.
+    """
+    m = PID_SUFFIX_RE.match(agent_id)
+    return m.group("nick") if m else agent_id
+
+
+def live_nicks(dispatch_dir: Path) -> set[str]:
+    """Durable nicks with at least one live session right now."""
+    return {durable_nick(aid) for aid in live_agents(dispatch_dir)}
 
 
 def channel_subscribers(dispatch_dir: Path, channel: str) -> list[str]:

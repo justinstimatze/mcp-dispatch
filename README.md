@@ -18,6 +18,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **TUI** — `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick. It needs no listener and no configuration: it is the way to look at the bus without opening a port.
 - **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, TLS required on every TCP listener (loopback included), and a hard refusal to serve a public address at all without asking. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
+- **Lifecycle** — `bin/dispatch-supervise` starts an agent's runtime when mail is waiting for a nick with no live session, so an offline teammate answers instead of accumulating. What runs comes only from an operator-written allowlist — never from the message — and is bounded by a cooldown, an hourly ceiling and a failure breaker. See [lifecycle](#lifecycle-starting-an-agent-that-has-mail).
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to
   manage for local comms (cross-host adds one, and installs it for you).
@@ -481,8 +482,70 @@ Three things follow:
 The TUI and the IRC gateway resolve identically, because the rule lives in the
 shared `tui/relay` package rather than in each writer.
 
-This is *identity*, not *lifecycle*: nothing here starts an agent. A message to
-an offline nick is durable, not a wake-up.
+This is *identity*, not *lifecycle*: nothing **here** starts an agent. A message
+to an offline nick is durable, not a wake-up — until you run the supervisor
+below, which is the piece that turns one into the other.
+
+
+## Lifecycle: starting an agent that has mail
+
+Durable identity made an offline teammate addressable. It did not make anyone
+answer: a DM to `publicai` sat in its inbox until a human happened to open that
+project. `dispatch-supervise` is the daemon that closes the gap — it watches for
+mail waiting on a nick with no live session, and starts that nick's runtime.
+
+```bash
+dispatch-supervise check             # validate the allowlist before trusting it
+dispatch-supervise --dry-run         # what would it start right now?
+dispatch-supervise service install   # systemd user unit, enabled + started
+dispatch-supervise status            # who is configured, live, and waiting
+```
+
+The trigger is not a new rule. It is exactly the set of mail a *successor
+session would inherit* — the nick's own inbox plus any dead session inbox of
+that nick — so the supervisor wakes an agent precisely when there is something
+for it to find, and a successful start clears the trigger by itself (the new
+session claims those files by rename). A message that is already `read`, or
+expired, never wakes anyone.
+
+### The command is an allowlist, and that is the whole security model
+
+An inbound message causing a process to run is remote-triggered execution, and
+messages arrive from other agents on this host *and* from other machines over
+the git bus. So the sender never influences what runs:
+
+```toml
+[supervisor]
+enabled = true
+
+[supervisor.agents.publicai]
+command = ["/home/you/bin/start-publicai"]   # argv, never a shell string
+cwd = "/home/you/code/publicai"
+```
+
+- **A nick with no block is never started**, whatever it is sent. There is no
+  wildcard, and `enabled = true` on its own supervises nothing.
+- **Nothing from a message reaches argv, cwd or env.** The supervisor reads
+  messages only to count them, and a count cannot carry a payload.
+- **`command[0]` must be absolute**, so a service's minimal `PATH` can't decide
+  which binary `claude` means.
+- **Rate limits bound the damage independently of correctness**: a per-nick
+  cooldown, a starts-per-hour ceiling, a concurrency cap, and a breaker that
+  parks a nick after repeated failures. A flood of mail costs a bounded number
+  of spawns; so does a runtime that starts, dies without reading its mail, and
+  would otherwise be restarted forever.
+
+`dispatch-supervise check` resolves every command, flags a nick the relay has
+never seen (almost always a typo in the section header), and refuses a config
+file other accounts can write — it is now an execution allowlist, so `chmod 600`
+it.
+
+The started process is detached into its own session and **survives a supervisor
+restart**; the unit sets `KillMode=process` so upgrading the babysitter doesn't
+kill the children. Each agent's output goes to `~/.cache/mcp-dispatch/supervisor/<nick>.log`,
+which is the first place to look when a start fails. A runtime that starts but
+never claims presence is counted a failed start and left alone — not killed; it
+may be doing real work, it just isn't a dispatch session.
 
 
 ## How It Works

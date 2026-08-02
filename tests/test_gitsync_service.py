@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import dispatch_common as common  # noqa: E402
 import gitsync_service as svc  # noqa: E402
+import systemd_user  # noqa: E402
 
 GITSYNC = REPO_ROOT / "bin" / "dispatch-gitsync"
 
@@ -460,7 +461,9 @@ def test_init_service_is_one_command_and_rerunnable(tmp_path):
 def test_dry_run_refuses_without_systemd(tmp_path, monkeypatch):
     """A dry run exists to say what WILL happen. Reporting a plan that can't run
     (macOS, a container with no user manager) says the opposite."""
-    monkeypatch.setattr(svc, "systemctl_available", lambda: False)
+    # Patched on systemd_user, not on svc: the probe lives in the shared driver
+    # that every dispatch daemon's `service install` routes through.
+    monkeypatch.setattr(systemd_user, "systemctl_available", lambda: False)
     with pytest.raises(svc.ServiceError):
         svc.install("[Service]\n", dry_run=True)
 
