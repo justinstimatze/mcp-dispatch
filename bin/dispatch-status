@@ -11,56 +11,12 @@ orphaned inboxes (messages whose owner is gone). Touches nothing.
 
 from __future__ import annotations
 
-import fcntl
 import json
-import os
+import sys
 from pathlib import Path
 
-
-def _configured_dir() -> str | None:
-    """Read dispatch_dir from the config file, if present (stdlib tomllib)."""
-    cfg = os.environ.get("MCP_DISPATCH_CONFIG") or os.path.expanduser(
-        "~/.config/mcp-dispatch/config.toml"
-    )
-    if not os.path.exists(cfg):
-        return None
-    try:
-        import tomllib
-
-        with open(cfg, "rb") as f:
-            data = tomllib.load(f)
-    except Exception:
-        return None
-    section = data.get("dispatch", data) if isinstance(data, dict) else {}
-    val = data.get("dispatch_dir") or (section or {}).get("dispatch_dir")
-    return str(val) if val else None
-
-
-def _relay_dir() -> Path:
-    raw = (
-        os.environ.get("MCP_DISPATCH_DIR")
-        or os.environ.get("DISPATCH_DIR")
-        or _configured_dir()
-        or "~/.config/mcp-dispatch/messages"
-    )
-    return Path(os.path.expanduser(raw))
-
-
-def _presence_is_live(pf: Path) -> bool:
-    """A live owner holds the exclusive flock on this presence file (uid-agnostic,
-    pid-reuse-immune). If we can take the lock, nobody's home."""
-    try:
-        fh = open(pf)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        return False
-    except OSError:
-        return True
-    finally:
-        fh.close()
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
 
 
 def _pending(inbox: Path) -> int:
@@ -77,7 +33,7 @@ def _pending(inbox: Path) -> int:
 
 
 def main() -> int:
-    relay = _relay_dir()
+    relay = common.dispatch_dir(common.load_config())
     if not relay.is_dir():
         print(f"No relay yet at {relay}")
         print("→ no dispatch-enabled session has started. Open a Claude Code window.")
@@ -90,7 +46,7 @@ def main() -> int:
             data = json.loads(pf.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if _presence_is_live(pf):
+        if common.flock_held(pf):
             live[data.get("agent_id", pf.stem)] = data
 
     print(f"relay: {relay}")
