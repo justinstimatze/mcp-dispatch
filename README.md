@@ -19,6 +19,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, TLS required on every TCP listener (loopback included), and a hard refusal to serve a public address at all without asking. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Lifecycle** — `bin/dispatch-supervise` starts an agent's runtime when mail is waiting for a nick with no live session, so an offline teammate answers instead of accumulating. What runs comes only from an operator-written allowlist — never from the message — and is bounded by a cooldown, an hourly ceiling and a failure breaker. See [lifecycle](#lifecycle-starting-an-agent-that-has-mail).
+- **Away digest** — `digest()` (or `bin/dispatch-digest`) reports what changed while a nick had no session: unread mail by sender, task activity since its last session ended, open tasks addressed to it, and who was around. Reading never consumes, so asking twice gives the same answer. See [the digest](#the-digest-what-happened-while-i-was-away).
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
 - **Zero infrastructure** — Filesystem relay survives process crashes. No daemon to
   manage for local comms (cross-host adds one, and installs it for you).
@@ -555,6 +556,43 @@ which is the first place to look when a start fails. A runtime that starts but
 never claims presence is counted a failed start and left alone — not killed; it
 may be doing real work, it just isn't a dispatch session.
 
+
+## The digest: what happened while I was away
+
+A session that starts after a gap knows only what is in its inbox. Everything
+else that moved while it was gone — tasks claimed, work finished, teammates
+active — is on disk and unread, because nothing ever assembled it into an
+answer. The supervisor above makes that sharper: an agent it starts had no
+human to brief it.
+
+```bash
+dispatch-digest                  # for this session's nick
+dispatch-digest publicai         # for a named nick
+dispatch-digest --json           # machine-readable
+```
+
+…and `digest()` as an MCP tool, which is the one that matters for an
+auto-started agent, since nobody is there to run a CLI.
+
+**The window** starts where the nick's last session ended. `_release_id` stamps
+`last_seen` on the way out, *before* dropping the presence lock, so that value
+is genuinely the last moment the nick was present; the next session preserves it
+as `previous_seen` before overwriting it. After an unclean exit (SIGKILL, crash,
+reboot) no such mark exists, so the window is too wide and the digest re-shows
+things already seen — it says so rather than hiding it, because a report that
+silently under-reports is worse than none: you would stop looking.
+
+**Reading is not consuming.** No cursor advances and nothing is deleted, so the
+digest is a pure function of the relay and the window. Asking twice gives the
+same answer, and a session that dies mid-read loses nothing. A read cursor would
+be at-most-once delivery for exactly the content you cannot afford to drop.
+
+**One honest gap:** channel posts fan out to live subscribers only — that is what
+lets channels need no separate state — so a post made while a nick was offline
+left no local record at all. Not unread: absent. The digest states this instead
+of printing an empty section that reads like "nothing happened". The git
+transport's append-only lanes do retain that traffic, which is where the section
+will come from.
 
 ## How It Works
 

@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""What happened while a nick was away.
+
+    dispatch-digest                  # for this session's nick
+    dispatch-digest publicai         # for a named nick
+    dispatch-digest --since 2026-08-01T00:00:00Z
+    dispatch-digest --json           # machine-readable
+
+The window starts where the nick's last session ended (`previous_seen` in the
+registry, stamped as that session dropped its presence lock). Read-only: it
+advances no cursor and deletes nothing, so running it twice gives the same
+answer and a crash mid-read loses nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import digest as digest_mod  # noqa: E402
+import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
+
+
+def _resolve_nick(dispatch_dir: Path) -> str | None:
+    """This session's nick: the explicit id's, else the sole live one matching $PWD."""
+    explicit = (os.environ.get("MCP_DISPATCH_AGENT_ID") or "").strip().lower()
+    if explicit:
+        return dispatch_fs.durable_nick(explicit)
+    prefix = re.sub(r"^-*", "", re.sub(r"[^a-z0-9-]", "", os.path.basename(os.getcwd()).lower()))
+    if not prefix:
+        return None
+    matches = {
+        dispatch_fs.durable_nick(aid)
+        for aid in dispatch_fs.live_agents(dispatch_dir)
+        if dispatch_fs.durable_nick(aid) == prefix
+    }
+    return matches.pop() if len(matches) == 1 else None
+
+
+def _channels_of(dispatch_dir: Path, nick: str) -> set[str]:
+    """Standing channels from the durable record — presence would only have the
+    rooms of a session that is live *now*, which is the wrong set for a digest
+    about a stretch when none was."""
+    try:
+        rec = json.loads((dispatch_dir / ".agents" / f"{nick}.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        return set()
+    chans = rec.get("channels") if isinstance(rec, dict) else None
+    return {c for c in chans if isinstance(c, str)} if isinstance(chans, list) else set()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Report what changed while a nick was away.")
+    ap.add_argument("nick", nargs="?", default=None, help="nick (default: this session's)")
+    ap.add_argument("--since", default=None, help="override the window start (ISO8601 Z)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+
+    dispatch_dir = common.dispatch_dir(common.load_config())
+    if not dispatch_dir.is_dir():
+        print(f"[digest] no relay at {dispatch_dir} — nothing to report.")
+        return 0
+
+    nick = (args.nick or "").strip().lower() or _resolve_nick(dispatch_dir)
+    if not nick:
+        print("[digest] could not resolve a nick (pass one, or set $MCP_DISPATCH_AGENT_ID).")
+        return 1
+    try:
+        dispatch_fs.validate_id(nick, "nick")
+    except ValueError as e:
+        print(f"[digest] {e}")
+        return 1
+
+    d = digest_mod.build(
+        dispatch_dir,
+        nick,
+        now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        since=args.since,
+        channels=_channels_of(dispatch_dir, nick),
+    )
+    if args.json:
+        print(json.dumps(dataclasses.asdict(d), indent=2))
+    else:
+        print(digest_mod.render(d))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

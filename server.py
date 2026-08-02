@@ -25,6 +25,7 @@ Tools:
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import fcntl
 import json
 import os
@@ -43,6 +44,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+import digest
 import dispatch_fs
 from notify_policy import should_notify
 
@@ -422,6 +424,17 @@ def _register_agent(agent_id: str) -> dict:
     rec.setdefault("first_seen", now)
     rec.setdefault("sessions", 0)
     rec["sessions"] = int(rec.get("sessions") or 0) + 1
+    # Preserve the watermark BEFORE `last_seen` is overwritten. _release_id
+    # stamps `last_seen` on the way out, so the value we are about to destroy is
+    # the moment this nick was last present — the only honest start for "what
+    # happened while I was away", and nothing else records it.
+    #
+    # Only on the offline→online edge. We already hold our own presence lock by
+    # now, so "was the nick away?" means "is any OTHER session of it live?". If
+    # one is, the teammate never left: advancing the watermark would collapse
+    # this window to nothing and hide everything the sibling hasn't handled.
+    if not [aid for aid in _live_sessions_of(nick) if aid != agent_id]:
+        rec["previous_seen"] = rec.get("last_seen") or rec.get("first_seen") or now
     rec["last_seen"] = now
     rec["last_session_id"] = agent_id
     try:
@@ -1310,6 +1323,40 @@ def ack_tool(
         "not_found": not_found if not_found else None,
     }
     return _with_pending(result)
+
+
+@mcp.tool(
+    name="digest",
+    description=(
+        "What happened while you were away: unread mail by sender, task activity "
+        "since your last session ended, open tasks addressed to you, and who was "
+        "around. Read-only — it advances no cursor and deletes nothing, so asking "
+        "twice gives the same answer. Call it at the start of a session, "
+        "especially one you did not choose to start."
+    ),
+)
+def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
+    """Assemble the away-report for a nick (default: mine).
+
+    The window starts at `previous_seen` — `last_seen` as it stood when this
+    session claimed its id, which _release_id stamps on the way out. See
+    digest.py for why reading must not consume, and for the channel gap.
+    """
+    target = (nick or _durable_nick(AGENT_ID)).strip().lower()
+    _validate_id(target, "nick")
+    d = digest.build(
+        DISPATCH_DIR,
+        target,
+        now=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        since=since,
+        channels=set(_PRESENCE_DATA.get("channels", []))
+        if target == _durable_nick(AGENT_ID)
+        else set(),
+    )
+    out = dataclasses.asdict(d)
+    out["rendered"] = digest.render(d)
+    out["channel_gap_note"] = digest.channel_gap_note()
+    return out
 
 
 @mcp.tool(

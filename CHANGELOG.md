@@ -11,8 +11,14 @@ truth for versions.
 Nothing to migrate — the new state is created on demand — but three things
 change under a running install:
 
-- **Restart your sessions.** The `task` tool is new, and an MCP server's tool
-  list is read at session start.
+- **Restart your sessions.** The `task` and `digest` tools are new, and an MCP
+  server's tool list is read at session start. This bites harder than a missing
+  tool: a server started before the durable-identity change keeps resolving
+  `dispatch(target="<nick>")` the old way, writing to the nick's drop box even
+  when that teammate has a live session — so mail waits for the *next* session
+  of an agent that is running right now. Observed in the wild while building the
+  digest. `dispatch-status` and the bin/ scripts read current code on every run,
+  so they will disagree with a stale server; the server is the stale one.
 - **Two directories appear** in the relay: `.agents/` (the durable nick
   registry) and `.tasks/`. Both are created on demand and are owner-only.
 - **`dispatch(target="<nick>")` resolves now.** Sending to `publicai` used to
@@ -22,6 +28,32 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Added
+- **The away-digest — `digest()` and `bin/dispatch-digest`.** A session that
+  starts after a gap knew only what was in its inbox; everything else that moved
+  while it was gone sat on disk unread because nothing assembled it. The
+  supervisor sharpened that: an agent it starts has no human to brief it. The
+  digest reports unread mail by sender, task transitions since the last session
+  ended, open tasks addressed to this nick, and who was around.
+
+  The window starts at `previous_seen`, which `_register_agent` now preserves
+  from `last_seen` before overwriting it — and only on the offline→online edge,
+  since a live sibling session means the teammate never left and advancing the
+  mark would collapse the window and hide what the sibling hasn't handled.
+  `_release_id` already stamped `last_seen` before dropping the presence lock, so
+  that value is genuinely the last moment the nick was present. After an unclean
+  exit there is no such mark, the window is too wide, and the digest reports it
+  as approximate rather than hiding it: a report that silently under-reports is
+  worse than none, because you stop looking.
+
+  Reading does not consume. No cursor advances and nothing is deleted, so the
+  digest is a pure function of relay and window — asking twice gives the same
+  answer, and a session that dies mid-read loses nothing. A read cursor would be
+  at-most-once delivery for exactly the content you cannot afford to drop.
+
+  One gap is stated rather than papered over: channel posts fan out to live
+  subscribers only, so a post made while a nick was offline left no local record
+  — absent, not unread. The git lanes retain it; the digest does not read them
+  yet.
 - **Lifecycle supervisor (`bin/dispatch-supervise`).** Durable nicks made an
   offline teammate addressable; nothing made one answer. A DM to `publicai` sat
   in its inbox until a human happened to open that project. The supervisor
