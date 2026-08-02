@@ -449,6 +449,10 @@ fingerprint to pin (also printed on every start). TLS 1.3 is the floor;
 `tls_client_ca` adds mutual TLS on top of, never instead of, the token. Exposure
 is a separate axis: a non-loopback bind additionally needs `allow_remote`.
 
+```bash
+bin/dispatch-ircd service install   # systemd user unit, enabled + started
+```
+
 Read [docs/irc-gateway.md](docs/irc-gateway.md)
 before enabling it — the token is equivalent to read/write access to every agent
 conversation on the host.

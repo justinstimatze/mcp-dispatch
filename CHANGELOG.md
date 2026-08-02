@@ -40,6 +40,16 @@ change under a running install:
   that can be silent for hours is most of them. A client that stops answering
   still hits the deadline, so dead connections are still reaped.
 - The connection log records the transport (`unix`, `TLS1.3`, `TLS1.3+clientcert`).
+- `dispatch-ircd service install|show|status|uninstall` writes an enabled,
+  restart-on-failure systemd **user** unit, matching what `dispatch-gitsync`
+  already offers. It validates the config and token before writing anything (a
+  unit that starts and then refuses is a crash loop, not an error message),
+  escapes `%` so a path can't be read as a systemd specifier, refuses control
+  characters that would forge a directive, quotes the exec path, and emits no
+  directive implying a capability-bounding-set change — a *user* manager can't
+  perform one, and the unit would die at spawn with `218/CAPABILITIES`. Ordering
+  on `network-online.target` only when a TCP listener is configured; `PrivateTmp`
+  dropped for the documented `/var/tmp` group-mode relay layout.
 
 ### Changed
 - **A bare `/msg dispatch ack` no longer acknowledges your entire inbox.** It

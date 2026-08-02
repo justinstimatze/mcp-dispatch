@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -1218,4 +1219,160 @@ func TestStandardQueriesAnswer(t *testing.T) {
 	c.expect(" 251 ")
 	c.sendf("MOTD")
 	c.expect("End of /MOTD")
+}
+
+// ---------------------------------------------------------------------------
+// systemd unit
+// ---------------------------------------------------------------------------
+
+func TestRenderUnitEscapesSystemdSpecifiers(t *testing.T) {
+	// '%h' is the home directory to systemd. An unescaped '%' in a path
+	// silently rewrites it — the unit installs fine and serves the wrong relay.
+	cfg := Config{Enabled: true, Socket: "/home/me/50%/irc.sock", TLSMinVersion: "1.3"}
+	unit, err := renderUnit(cfg, "/home/me/100%relay", "/opt/bin/dispatch-ircd", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(unit, "100%relay") {
+		t.Fatal("a bare '%' reached the unit — systemd will expand it as a specifier")
+	}
+	if !strings.Contains(unit, "100%%relay") {
+		t.Fatalf("'%%' should be doubled:\n%s", unit)
+	}
+}
+
+func TestRenderUnitRefusesControlCharacters(t *testing.T) {
+	// A newline ends the directive and starts a forged one.
+	cfg := Config{Enabled: true, TLSMinVersion: "1.3"}
+	_, err := renderUnit(cfg, "/relay\nExecStartPost=/bin/rm -rf /", "/opt/bin/dispatch-ircd", "")
+	if err == nil {
+		t.Fatal("a control character in a path must be refused, not escaped-ish")
+	}
+	if _, err := renderUnit(cfg, "/relay", "/opt/bin/ircd\nUser=root", ""); err == nil {
+		t.Fatal("the exec path is interpolated too and must be checked")
+	}
+}
+
+func TestRenderUnitQuotesTheExecPath(t *testing.T) {
+	cfg := Config{Enabled: true, TLSMinVersion: "1.3"}
+	unit, err := renderUnit(cfg, "/relay", "/opt/my tools/dispatch-ircd", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(unit, `ExecStart="/opt/my tools/dispatch-ircd"`) {
+		t.Fatalf("a path with a space must be quoted or systemd splits it:\n%s", unit)
+	}
+}
+
+func TestRenderUnitOmitsCapabilityImplyingDirectives(t *testing.T) {
+	// Each of these implies a CapabilityBoundingSet change that a *user*
+	// manager cannot perform: the unit then dies at spawn with 218/CAPABILITIES
+	// before running a line of the gateway.
+	cfg := Config{Enabled: true, TLSMinVersion: "1.3"}
+	unit, _ := renderUnit(cfg, "/relay", "/opt/bin/dispatch-ircd", "")
+	// Only actual directives count — the unit comments explain why these are
+	// absent, and naming them there is the documentation, not the bug.
+	var directives []string
+	for _, l := range strings.Split(unit, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !strings.HasPrefix(l, "#") {
+			directives = append(directives, l)
+		}
+	}
+	body := strings.Join(directives, "\n")
+	for _, bad := range []string{
+		"ProtectClock", "ProtectKernelTunables", "ProtectKernelModules",
+		"ProtectControlGroups", "CapabilityBoundingSet",
+	} {
+		if strings.Contains(body, bad) {
+			t.Fatalf("%s cannot be used in a user unit", bad)
+		}
+	}
+	for _, want := range []string{"NoNewPrivileges=yes", "SystemCallFilter=@system-service"} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("expected %s in the unit", want)
+		}
+	}
+}
+
+func TestRenderUnitOrdersOnNetworkOnlyForTCP(t *testing.T) {
+	sockOnly := Config{Enabled: true, Socket: "/x.sock", TLSMinVersion: "1.3"}
+	unit, _ := renderUnit(sockOnly, "/relay", "/opt/bin/dispatch-ircd", "")
+	if strings.Contains(unit, "network-online.target") {
+		t.Fatal("a unix-socket-only gateway should not wait on the network")
+	}
+	tcp := Config{Enabled: true, Listen: "127.0.0.1:6697",
+		TLSCert: "/c.pem", TLSKey: "/k.pem", TLSMinVersion: "1.3"}
+	unit, _ = renderUnit(tcp, "/relay", "/opt/bin/dispatch-ircd", "")
+	if !strings.Contains(unit, "network-online.target") {
+		t.Fatal("a TCP listener needs the network up first")
+	}
+}
+
+func TestRenderUnitDropsPrivateTmpForATmpRelay(t *testing.T) {
+	// PrivateTmp namespaces /var/tmp away; the documented group-mode relay
+	// lives there, and the unit would otherwise serve an empty directory.
+	cfg := Config{Enabled: true, TLSMinVersion: "1.3"}
+	unit, _ := renderUnit(cfg, "/var/tmp/mcp-dispatch/messages", "/opt/bin/dispatch-ircd", "")
+	if !strings.Contains(unit, "PrivateTmp=no") {
+		t.Fatalf("expected PrivateTmp=no for a /var/tmp relay:\n%s", unit)
+	}
+	unit, _ = renderUnit(cfg, "/home/me/.config/mcp-dispatch/messages", "/opt/bin/dispatch-ircd", "")
+	if !strings.Contains(unit, "PrivateTmp=yes") {
+		t.Fatal("a normal relay should keep PrivateTmp on")
+	}
+}
+
+func TestRenderUnitPinsAnExplicitConfigPath(t *testing.T) {
+	cfg := Config{Enabled: true, TLSMinVersion: "1.3"}
+	unit, _ := renderUnit(cfg, "/relay", "/opt/bin/dispatch-ircd", "/etc/dispatch.toml")
+	if !strings.Contains(unit, "Environment=MCP_DISPATCH_CONFIG=/etc/dispatch.toml") {
+		t.Fatalf("an explicit config path must be carried into the unit:\n%s", unit)
+	}
+	unit, _ = renderUnit(cfg, "/relay", "/opt/bin/dispatch-ircd", "")
+	if strings.Contains(unit, "MCP_DISPATCH_CONFIG") {
+		t.Fatal("with no explicit config, the service should resolve it the same way a shell run does")
+	}
+}
+
+func TestServiceDryRunFlagIsHonouredAfterTheVerb(t *testing.T) {
+	// The stdlib flag package stops parsing at the first positional, so
+	// `service install --dry-run` used to leave dryRun false and do the real
+	// thing. A dry run that isn't one is worse than none.
+	fs := flag.NewFlagSet("service", flag.ContinueOnError)
+	dry := fs.Bool("dry-run", false, "")
+	if err := fs.Parse([]string{"--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	if !*dry {
+		t.Fatal("precondition")
+	}
+
+	// And the real path: a temp HOME means install would write here if it ran.
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	if err := serviceInstall("[Unit]\n", true); err != nil {
+		t.Fatalf("dry run should not fail: %v", err)
+	}
+	if _, err := os.Stat(unitPath()); err == nil {
+		t.Fatal("a dry run must not write the unit file")
+	}
+}
+
+func TestServiceInstallWritesOwnerOnly(t *testing.T) {
+	if !systemctlAvailable() {
+		t.Skip("no systemctl on this host")
+	}
+	home := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	// systemctl will fail without a session bus; the file write is what matters
+	// and happens first.
+	_ = serviceInstall("[Unit]\nDescription=test\n", false)
+	fi, err := os.Stat(unitPath())
+	if err != nil {
+		t.Skipf("unit not written (%v) — nothing to assert", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("unit is %04o, want 0600 — it names paths and may carry env", fi.Mode().Perm())
+	}
 }

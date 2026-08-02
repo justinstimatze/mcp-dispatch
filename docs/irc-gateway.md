@@ -283,12 +283,37 @@ under `[irc]`. The ones worth knowing:
 
 ## Running it
 
-The gateway is a foreground process that exits on SIGINT/SIGTERM. Put it under
-whatever supervisor you already run — the same `systemd --user` pattern
-`dispatch-gitsync service install` uses works here, and the same
-[credential](../README.md#credentials) and
-[lingering](../README.md#headless-hosts-enable-lingering) caveats apply if you
-want it up without a login session.
+The gateway is only useful if it is up when you open your client, and
+"remember to start it in a spare terminal" is not a plan:
+
+```bash
+bin/dispatch-ircd service install      # systemd user unit, enabled + started
+bin/dispatch-ircd service status       # installed? active? enabled?
+bin/dispatch-ircd service show         # print the unit without writing it
+bin/dispatch-ircd service install --dry-run
+bin/dispatch-ircd service uninstall
+journalctl --user -u dispatch-ircd -f  # watch it work
+```
+
+Install validates the config and the token *before* writing anything — a unit
+that starts and then refuses is a crash loop, not an error message.
+
+The unit bakes **absolute** paths and systemd keeps running the process it
+started, so re-run `service install` after moving the repo, rebuilding the
+binary, or changing `[irc]`. It is idempotent, which makes it the upgrade path
+too.
+
+**On a headless host, enable lingering once.** A `systemd --user` manager
+doesn't start at boot without it, and many distros tear it down when your last
+session ends — so the gateway would run only while you happen to be logged in,
+which presents exactly like it being broken:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+Without systemd, the gateway is a plain foreground process that exits cleanly on
+SIGINT/SIGTERM — put it under whatever supervisor you do have.
 
 It polls; it does not hold presence and does not gate on it. Running with no
 live agents is fine — you see an empty roster and any traffic that arrives.

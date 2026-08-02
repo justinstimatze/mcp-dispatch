@@ -15,6 +15,7 @@
 //	dispatch-ircd --init-tls     # ...and a certificate, if you want TCP
 //	dispatch-ircd --check        # validate config and exit
 //	dispatch-ircd                # run (needs [irc] enabled = true)
+//	dispatch-ircd service install   # ...or run it under systemd
 package main
 
 import (
@@ -59,6 +60,7 @@ func main() {
 		tlsHosts    = flag.String("tls-hosts", "", "with --init-tls: extra hostnames/IPs for the certificate (comma separated)")
 		force       = flag.Bool("force", false, "with --init-token/--init-tls, replace what exists")
 		check       = flag.Bool("check", false, "validate configuration and exit")
+		dryRun      = flag.Bool("dry-run", false, "with `service`, print what would be done")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -108,6 +110,11 @@ func main() {
 		fmt.Println("a self-signed certificate is trusted by pinning, not by a CA:")
 		fmt.Printf("\n    [irc]\n    listen = \"127.0.0.1:6697\"\n    tls_cert = \"%s\"\n    tls_key = \"%s\"\n",
 			certPath, keyPath)
+		return
+	}
+
+	if flag.Arg(0) == "service" {
+		runService(flag.Args()[1:], cfg, *dir, *dryRun)
 		return
 	}
 
@@ -230,6 +237,78 @@ func main() {
 	}
 	wg.Wait()
 	shutdown()
+}
+
+// runService handles `dispatch-ircd service <verb> [flags]`.
+//
+// Flags are re-parsed here rather than read off the global set: the stdlib flag
+// package stops at the first positional, so `service install --dry-run` would
+// otherwise leave dryRun false and do the real thing — a dry run that isn't one
+// is worse than no dry run at all.
+func runService(args []string, cfg Config, dirOverride string, dryRun bool) {
+	verb := ""
+	if len(args) > 0 {
+		verb = args[0]
+		args = args[1:]
+	}
+	fs := flag.NewFlagSet("service", flag.ExitOnError)
+	sub := fs.Bool("dry-run", false, "print what would be done, change nothing")
+	if err := fs.Parse(args); err != nil {
+		fatal("%v", err)
+	}
+	dryRun = dryRun || *sub
+
+	switch verb {
+	case "status":
+		serviceStatus()
+		return
+	case "uninstall":
+		if err := serviceUninstall(dryRun); err != nil {
+			fatal("%v", err)
+		}
+		return
+	case "install", "show":
+	default:
+		fatal("unknown service verb %q — valid: install, show, status, uninstall", verb)
+	}
+
+	// A unit that starts and then refuses at Validate() is a crash loop, so
+	// check the config before writing one.
+	if err := cfg.Validate(); err != nil {
+		fatal("%v", err)
+	}
+	if _, err := ReadToken(cfg.TokenFile); err != nil {
+		fatal("%v", err)
+	}
+
+	relayDir := relay.RelayDir(relay.LoadConfig())
+	if dirOverride != "" {
+		relayDir = relay.ExpandUser(dirOverride)
+	}
+	// Absolute, and resolved now: systemd keeps running the process it started,
+	// so the unit must name the binary rather than whatever is on $PATH later.
+	exePath, err := os.Executable()
+	if err != nil {
+		fatal("cannot resolve my own path: %v", err)
+	}
+	if p, err := filepath.EvalSymlinks(exePath); err == nil {
+		exePath = p
+	}
+
+	unit, err := renderUnit(cfg, relayDir, exePath, os.Getenv("MCP_DISPATCH_CONFIG"))
+	if err != nil {
+		fatal("%v", err)
+	}
+	if verb == "show" {
+		fmt.Print(unit)
+		return
+	}
+	if err := serviceInstall(unit, dryRun); err != nil {
+		fatal("%v", err)
+	}
+	if !dryRun {
+		fmt.Print(lingerHint)
+	}
 }
 
 func repoLabel(repo string, readGit bool) string {
