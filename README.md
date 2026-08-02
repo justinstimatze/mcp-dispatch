@@ -540,6 +540,14 @@ never seen (almost always a typo in the section header), and refuses a config
 file other accounts can write — it is now an execution allowlist, so `chmod 600`
 it.
 
+Two config interactions worth knowing. With `inherit_inbox = false` a successor
+session adopts nothing, so the trigger narrows to the nick's own inbox — the one
+a new session is handed directly — because starting an agent for mail it cannot
+see would leave that mail in place and repeat the start until the hourly ceiling
+pinned it. And a stray `MCP_DISPATCH_AGENT_ID` in the launching shell is dropped
+from the child's environment; inheriting it would pin every started agent to the
+id of whatever session launched the supervisor.
+
 The started process is detached into its own session and **survives a supervisor
 restart**; the unit sets `KillMode=process` so upgrading the babysitter doesn't
 kill the children. Each agent's output goes to `~/.cache/mcp-dispatch/supervisor/<nick>.log`,

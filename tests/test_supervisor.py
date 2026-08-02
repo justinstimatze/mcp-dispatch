@@ -229,6 +229,31 @@ def test_must_read_pierces_ttl(tmp_path):
     assert supervisor.waiting_mail(tmp_path, "proj") == 1
 
 
+def test_inherit_inbox_false_narrows_the_trigger_to_the_nicks_own_inbox(tmp_path):
+    """With `inherit_inbox = false` the server adopts nothing, so waking an agent
+    for a dead session's mail would start it for mail it cannot see — and since
+    the mail then stays put, the trigger never clears and the start repeats until
+    the hourly ceiling pins it. The nick's own inbox still counts: a new session
+    is handed that directly, not by inheritance.
+    """
+    _plant(tmp_path, "proj-111", mid="dead")
+    _plant(tmp_path, "proj", mid="own")
+    assert supervisor.waiting_mail(tmp_path, "proj", inherit=True) == 2
+    assert supervisor.waiting_mail(tmp_path, "proj", inherit=False) == 1
+
+
+def test_the_server_flag_is_read_with_the_servers_own_precedence():
+    """server._load_config merges [dispatch] OVER the top level — the opposite of
+    dispatch_common.flat. For a key whose job is predicting the server, matching
+    the server wins."""
+    assert supervisor.load({"inherit_inbox": False}).inherit_inbox is False
+    assert supervisor.load({"dispatch": {"inherit_inbox": False}}).inherit_inbox is False
+    # [dispatch] wins over a conflicting top-level key, as the server does.
+    cfg = supervisor.load({"inherit_inbox": True, "dispatch": {"inherit_inbox": False}})
+    assert cfg.inherit_inbox is False
+    assert supervisor.load({}).inherit_inbox is True
+
+
 def test_another_nicks_mail_is_not_mine(tmp_path):
     _plant(tmp_path, "other", mid="m1")
     _plant(tmp_path, "other-999", mid="m2")
@@ -332,6 +357,23 @@ def test_a_start_in_flight_is_not_repeated():
 def test_a_parked_nick_stays_parked():
     state = supervisor.NickState(parked="5 consecutive failed starts")
     assert _decide(state).action == "skip"
+
+
+def test_a_skip_that_never_looked_does_not_claim_zero(tmp_path):
+    """`already live; 0 waiting` reads as a measurement. The pass short-circuits
+    before scanning when the nick is live, so it is not one."""
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    holder = _hold_presence(dd, "proj-111")
+    try:
+        cfg = _cfg(agents={"proj": _spec()}, log_dir=tmp_path / "logs")
+        sup = supervisor.Supervisor(dd, cfg, log=lambda _: None)
+        (decision,) = sup.tick()
+        assert decision.counted is False
+        assert "mail not checked" in decision.line()
+        assert "0 waiting" not in decision.line()
+    finally:
+        holder.kill()
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +526,9 @@ def test_no_part_of_a_message_reaches_the_child(tmp_path):
     proc.wait(timeout=30)
 
     recorded = json.loads(dump.read_text())
+    # An inherited agent id would pin every started agent to the id of whatever
+    # session launched the supervisor, colliding with that live session.
+    assert "MCP_DISPATCH_AGENT_ID" not in recorded["env"]
     assert recorded["argv"] == [str(script), "--configured-flag"]
     assert recorded["cwd"] == os.path.realpath(workdir)
     assert recorded["env"]["CONFIGURED"] == "yes"

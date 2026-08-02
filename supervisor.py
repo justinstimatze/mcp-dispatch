@@ -106,6 +106,9 @@ class SupervisorConfig:
     max_concurrent_starts: int = DEFAULTS["max_concurrent_starts"]
     log_dir: Path = field(default_factory=lambda: Path(os.path.expanduser(DEFAULT_LOG_DIR)))
     agents: dict[str, AgentSpec] = field(default_factory=dict)
+    # Not a [supervisor] key — it is the server's `inherit_inbox`, mirrored here
+    # because it decides whether a dead session's mail is reachable at all.
+    inherit_inbox: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +191,29 @@ def _spec(nick: str, raw: object) -> AgentSpec:
     )
 
 
+def _server_flag(cfg: dict, key: str, default: bool) -> bool:
+    """Read a *server* config key the way ``server._load_config`` reads it.
+
+    Deliberately not ``dispatch_common.flat``: that helper gives the top-level
+    key priority, while the server merges the ``[dispatch]`` table *over* the top
+    level. For a key whose whole purpose here is to predict what the server will
+    do, matching the server's own precedence is the only correct answer.
+    """
+    merged = dict(cfg)
+    sub = cfg.get("dispatch")
+    if isinstance(sub, dict):
+        merged.update(sub)
+    val = merged.get(key)
+    return default if val is None else bool(val)
+
+
 def load(cfg: dict) -> SupervisorConfig:
     """Build a SupervisorConfig from a parsed config dict. Raises ConfigError."""
     section = cfg.get("supervisor")
     if not isinstance(section, dict):
-        return SupervisorConfig()
+        # Disabled, so nothing will spawn — but still report the server flag
+        # honestly rather than handing back a default that contradicts config.
+        return SupervisorConfig(inherit_inbox=_server_flag(cfg, "inherit_inbox", True))
 
     agents_raw = section.get("agents", {})
     if not isinstance(agents_raw, dict):
@@ -213,6 +234,7 @@ def load(cfg: dict) -> SupervisorConfig:
         max_concurrent_starts=int(_num(section, "max_concurrent_starts", int)),
         log_dir=Path(os.path.expanduser(log_dir)),
         agents=agents,
+        inherit_inbox=_server_flag(cfg, "inherit_inbox", True),
     )
 
 
@@ -258,17 +280,37 @@ def config_permission_warning(config_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
-def inherit_sources(dispatch_dir: Path, nick: str) -> list[Path]:
+def _is_ours(d: Path) -> bool:
+    """Same-uid check. In group_mode another account's inbox is visible but its
+    mail is not ours to adopt, so waking an agent for it would be waking it for
+    mail it cannot claim."""
+    try:
+        return d.stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def inherit_sources(dispatch_dir: Path, nick: str, *, inherit: bool = True) -> list[Path]:
     """Inboxes whose pending mail this nick's next session would adopt.
 
     Mirrors ``server._inherit_orphan_inbox``: the nick's own inbox, plus any
     ``<nick>-<pid>`` session inbox with no live presence, skipping directories
     owned by another uid (in group_mode those are another account's mail, which
     our agent could not inherit either).
+
+    ``inherit=False`` mirrors the server's ``inherit_inbox = false``, under which
+    a successor adopts *nothing* — so only the nick's own inbox counts, that
+    being the one a new session is handed directly rather than by inheritance.
+    Without this, the supervisor would start an agent for mail the agent then
+    could not see, the mail would stay put, the trigger would never clear, and
+    the restart would repeat until the hourly ceiling pinned it.
     """
     out: list[Path] = []
     if not dispatch_dir.is_dir():
         return out
+    if not inherit:
+        own = dispatch_dir / nick
+        return [own] if own.is_dir() and _is_ours(own) else []
     for d in sorted(dispatch_dir.iterdir()):
         if not d.is_dir() or d.name.startswith("."):
             continue
@@ -278,23 +320,20 @@ def inherit_sources(dispatch_dir: Path, nick: str) -> list[Path]:
             pf = dispatch_dir / ".presence" / f"{d.name}.json"
             if pf.exists() and dispatch_fs.presence_is_live(pf):
                 continue  # a live session of this nick owns that inbox
-        try:
-            if d.stat().st_uid != os.getuid():
-                continue
-        except OSError:
+        if not _is_ours(d):
             continue
         out.append(d)
     return out
 
 
-def waiting_mail(dispatch_dir: Path, nick: str) -> int:
+def waiting_mail(dispatch_dir: Path, nick: str, *, inherit: bool = True) -> int:
     """Count of pending, unexpired messages waiting for ``nick``.
 
     Reads message JSON *only* to test state and TTL. No field of any message
     influences whether or what the supervisor spawns — see the module docstring.
     """
     total = 0
-    for d in inherit_sources(dispatch_dir, nick):
+    for d in inherit_sources(dispatch_dir, nick, inherit=inherit):
         for f in sorted(d.glob("*.json")):
             try:
                 msg = json.loads(f.read_text())
@@ -346,10 +385,14 @@ class Decision:
     action: str  # "start" | "skip"
     reason: str
     mail: int = 0
+    # False when the pass short-circuited before scanning (live, parked, in
+    # flight). Reporting "0 waiting" there states a measurement never taken.
+    counted: bool = True
 
     def line(self) -> str:
         verb = "START" if self.action == "start" else "skip "
-        return f"  {verb} {self.nick}  ({self.reason}; {self.mail} waiting)"
+        tail = f"{self.mail} waiting" if self.counted else "mail not checked"
+        return f"  {verb} {self.nick}  ({self.reason}; {tail})"
 
 
 def decide(
@@ -361,6 +404,7 @@ def decide(
     now: float,
     cfg: SupervisorConfig,
     concurrent: int,
+    counted: bool = True,
 ) -> Decision:
     """Pure: should ``spec.nick`` be started right now, and why not if not.
 
@@ -369,12 +413,12 @@ def decide(
     so the reported reason is the *decisive* one rather than the last one checked.
     """
     if state.parked:
-        return Decision(spec.nick, "skip", f"parked: {state.parked}", mail)
+        return Decision(spec.nick, "skip", f"parked: {state.parked}", mail, counted)
     if live:
-        return Decision(spec.nick, "skip", "already live", mail)
+        return Decision(spec.nick, "skip", "already live", mail, counted)
     if state.awaiting_since:
         waited = now - state.awaiting_since
-        return Decision(spec.nick, "skip", f"start in flight, {waited:.0f}s in", mail)
+        return Decision(spec.nick, "skip", f"start in flight, {waited:.0f}s in", mail, counted)
     if mail <= 0:
         return Decision(spec.nick, "skip", "no waiting mail", mail)
     since = now - state.last_start()
@@ -422,6 +466,12 @@ def spawn(spec: AgentSpec, cfg: SupervisorConfig) -> subprocess.Popen:
     from a message.
     """
     env = dict(os.environ)
+    # Dropped before the overlay: this daemon is often started from a shell that
+    # already belongs to an agent, and an inherited MCP_DISPATCH_AGENT_ID would
+    # pin *every* agent it starts to that one id — colliding with the live
+    # session that set it. An operator who genuinely wants to fix a child's id
+    # can still say so in the block's own `env`.
+    env.pop("MCP_DISPATCH_AGENT_ID", None)
     env.update(spec.env_map())
     # Informational marker so a runtime can tell it was woken by mail rather than
     # launched by a human. Never read back as an instruction.
@@ -531,8 +581,9 @@ class Supervisor:
             # Only scan the relay when the answer can matter. A live nick needs no
             # start, and a parked one will not get one.
             mail = 0
-            if not live and not state.parked and not state.awaiting_since:
-                mail = waiting_mail(self.dispatch_dir, nick)
+            counted = not live and not state.parked and not state.awaiting_since
+            if counted:
+                mail = waiting_mail(self.dispatch_dir, nick, inherit=self.cfg.inherit_inbox)
 
             concurrent = sum(1 for s in self.states.values() if s.awaiting_since)
             decision = decide(
@@ -543,6 +594,7 @@ class Supervisor:
                 now=now,
                 cfg=self.cfg,
                 concurrent=concurrent,
+                counted=counted,
             )
             decisions.append(decision)
             if decision.action == "start":

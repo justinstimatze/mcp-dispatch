@@ -143,7 +143,7 @@ def cmd_status(argv: list[str]) -> int:
     if cfg is not None and relay.is_dir():
         for nick, spec in cfg.agents.items():
             live = supervisor.is_live(relay, nick)
-            mail = supervisor.waiting_mail(relay, nick)
+            mail = supervisor.waiting_mail(relay, nick, inherit=cfg.inherit_inbox)
             problems = supervisor.check_spec(spec)
             state = "live" if live else f"offline, {mail} waiting"
             note = f"  ✗ {problems[0]}" if problems else ""
@@ -286,10 +286,24 @@ def cmd_run(argv: list[str]) -> int:
 
     # One supervisor per relay. Two would race to start the same nick, and both
     # would win — the cooldown is per-process state, not a lock.
-    lock = common.acquire_flock(_host_lock_path(relay), attempts=2)
+    #
+    # Losing the race WAITS rather than exits. This daemon only ever runs
+    # supervised, and systemd's Restart=always restarts on a clean exit too: a
+    # second instance that returned 0 here would be restarted every RestartSec
+    # until it tripped StartLimitBurst, leaving the unit latched `failed` even
+    # after the other supervisor went away. Running it in a terminal to watch it
+    # while the service is installed is the obvious way to hit that.
+    lock_path = _host_lock_path(relay)
+    lock = common.acquire_flock(lock_path, attempts=2)
     if lock is None:
-        print(f"[supervise] a supervisor is already watching {relay}; not starting a second.")
-        return 0
+        print(f"[supervise] another supervisor holds {relay}; waiting to take over…")
+        try:
+            while lock is None:
+                time.sleep(max(interval, 1.0))
+                lock = common.acquire_flock(lock_path)
+        except KeyboardInterrupt:
+            return 0
+        print("[supervise] took over the host lock.")
 
     print(
         f"[supervise] watching {relay} for {len(cfg.agents)} agent(s) "

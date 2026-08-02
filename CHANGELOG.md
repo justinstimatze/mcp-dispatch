@@ -54,6 +54,17 @@ change under a running install:
   loop — a runtime that starts, dies without reading its mail, and would
   otherwise be restarted forever, each start "succeeding" and so never tripping
   the failure counter. Off unless `[supervisor] enabled = true`.
+
+  Two config interactions the first review caught: under `inherit_inbox = false`
+  the trigger narrows to the nick's own inbox, because a successor adopts
+  nothing and starting an agent for mail it cannot see would leave the mail in
+  place and repeat the start until the ceiling pinned it; and a stray
+  `MCP_DISPATCH_AGENT_ID` in the launching shell is dropped from the child's
+  environment, since inheriting it would pin every started agent to the id of
+  whatever session launched the supervisor. A second supervisor now **waits**
+  for the host lock rather than exiting — this daemon only ever runs supervised,
+  and `Restart=always` restarts on a clean exit too, so exiting would have
+  latched the unit `failed` after ten restarts.
 - **IRC gateway polish.** Three IRCv3 capabilities, implemented rather than
   merely advertised: `server-time` (each message shows the time it crossed the
   relay — without it a JOIN replay is fifty messages that all look like they
