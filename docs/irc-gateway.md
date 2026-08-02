@@ -63,11 +63,13 @@ socket   = "~/.config/mcp-dispatch/irc.sock"   # else TCP is the ONLY transport
 /connect -tls -tls_pinned_cert FE:08:C7:…:11 127.0.0.1 6697 <token>
 ```
 
-`--init-tls` and every startup print the certificate's SHA-256 fingerprint. A
-self-signed certificate is trusted by **pinning**, not by a CA, so put that
-fingerprint in your client rather than turning verification off. Pinning is the
-stronger of the two anyway — it notices a swapped certificate, which a public CA
-would not.
+`--init-tls` and every startup print the SHA-256 fingerprint of the **leaf** —
+the certificate the gateway actually serves. No public CA can vouch for "the IRC
+gateway on my laptop", so a client trusts it one of two ways: by pinning that
+fingerprint, or by trusting the private CA that signed it (see
+[GUI clients](#gui-clients)). Either beats turning verification off. Pinning is
+the stronger of the two — it notices a swapped certificate, which a CA would
+not.
 
 Every client spells this differently, and **the format is not portable** — the
 two most common want opposite things, and getting it wrong fails as a mismatch,
@@ -195,11 +197,31 @@ processes end up disagreeing about who is live.
 
 Terminal clients pin a fingerprint; most graphical ones don't offer pinning at
 all, and the usual workaround — a checkbox that accepts any certificate — throws
-away the protection instead of configuring it. There is a better path, because
-`--init-tls` marks the certificate `CA:TRUE` with `keyCertSign` so it validates
-as **its own trust anchor**. A client that lets you nominate a root certificate
-can therefore do full chain and hostname verification against exactly one
-certificate: yours.
+away the protection instead of configuring it. There is a better path: `--init-tls`
+writes a small **CA** alongside the certificate it signs, and a client that lets
+you nominate a root certificate can do full chain and hostname verification
+against exactly that one root: yours.
+
+This is why there are three files, and why it matters which one you hand a
+client:
+
+| file | what it is | who wants it |
+|---|---|---|
+| `irc-cert.pem` | leaf **+ CA**, in that order | `tls_cert` — the gateway serves it |
+| `irc-key.pem` | the leaf's private key, `0600` | `tls_key` |
+| `irc-cert-ca.pem` | the CA alone | `root_cert_path` and equivalents |
+
+**Point a root-certificate setting at the CA, never at the served certificate.**
+A leaf is not a valid trust anchor. A single self-signed certificate could only
+act as its own anchor by carrying `CA:TRUE` — and a certificate with `CA:TRUE`
+is not a legal end-entity certificate, so a strict client rejects the handshake
+outright rather than falling back.
+
+Be careful how you check this: **OpenSSL tolerates the contradiction and rustls
+does not.** `openssl s_client` will report `Verify return code: 0 (ok)` against
+a CA-as-leaf that Halloy refuses with `CaUsedAsEndEntity`. A green result from
+`s_client` is therefore not evidence that a Rust client will connect — for that
+class of client, the only verifier that counts is the client.
 
 [Halloy](https://halloy.chat) is the one to reach for. It ships as a plain
 tarball, so nothing is snap- or flatpak-confined and it reads your real config
@@ -231,7 +253,7 @@ one path and no copies.
 server   = "localhost"           # must match a SAN on the certificate
 port     = 6697
 use_tls  = true
-root_cert_path = "/home/you/.config/mcp-dispatch/irc-cert.pem"
+root_cert_path = "/home/you/.config/mcp-dispatch/irc-cert-ca.pem"   # the CA, not the leaf
 nickname = "you"
 channels = ["&dispatch"]
 
@@ -264,8 +286,8 @@ says `localhost` fails verification, correctly.
 To check the two halves independently before blaming the client:
 
 ```bash
-# 1. does the certificate validate as its own anchor, for this hostname?
-openssl s_client -connect localhost:6697 -CAfile ~/.config/mcp-dispatch/irc-cert.pem \
+# does the served chain verify against the CA, for this hostname?
+openssl s_client -connect localhost:6697 -CAfile ~/.config/mcp-dispatch/irc-cert-ca.pem \
   -verify_return_error -verify_hostname localhost </dev/null | grep 'Verify return code'
 ```
 

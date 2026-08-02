@@ -104,12 +104,18 @@ func main() {
 		if err != nil {
 			fatal("%v", err)
 		}
-		fmt.Printf("wrote %s\n      %s (0600)\n\n", certPath, keyPath)
+		fmt.Printf("wrote %s   (leaf + CA — serve this)\n", certPath)
+		fmt.Printf("      %s (0600)\n", keyPath)
+		fmt.Printf("      %s   (CA only — give this to clients)\n\n", CACertPath(certPath))
 		fmt.Printf("  SHA-256  %s\n\n", fp)
-		fmt.Println("Point the config at them, then pin that fingerprint in your client —")
-		fmt.Println("a self-signed certificate is trusted by pinning, not by a CA:")
-		fmt.Printf("\n    [irc]\n    listen = \"127.0.0.1:6697\"\n    tls_cert = \"%s\"\n    tls_key = \"%s\"\n",
+		fmt.Printf("    [irc]\n    listen = \"127.0.0.1:6697\"\n    tls_cert = \"%s\"\n    tls_key = \"%s\"\n\n",
 			certPath, keyPath)
+		fmt.Println("Clients trust this one of two ways, and they need different files:")
+		fmt.Printf("  · pinning (irssi, WeeChat)   — the SHA-256 above, of the leaf\n")
+		fmt.Printf("  · a trusted root (Halloy)    — %s\n\n", CACertPath(certPath))
+		fmt.Println("Point a root-certificate setting at the CA, never at the served")
+		fmt.Println("certificate: a leaf is not a valid trust anchor, and strict clients")
+		fmt.Println("reject the whole handshake rather than fall back.")
 		return
 	}
 
@@ -182,6 +188,10 @@ func main() {
 			for _, l := range ls {
 				_ = l.Close()
 			}
+			// Stop accepting first, then say goodbye to whoever is already here:
+			// dropping live connections with the process gives them a truncated
+			// TLS stream instead of a disconnect.
+			h.closeAll("Server shutting down")
 			if cfg.Socket != "" {
 				_ = os.Remove(cfg.Socket)
 			}

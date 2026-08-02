@@ -77,6 +77,30 @@ func (h *hub) remove(s *session) {
 	h.mu.Unlock()
 }
 
+// closeAll says goodbye to every connected client, then closes their
+// connections. Shutdown used to drop the listeners and let the process exit,
+// which killed live connections with the process: no IRC `ERROR` line and, on
+// TLS, no close_notify — so a strict client reports a truncation error rather
+// than a disconnect. rustls says "peer closed connection without sending TLS
+// close_notify". Under systemd the gateway is restarted for every upgrade, so
+// that turned routine restarts into something that reads like a fault.
+func (h *hub) closeAll(reason string) {
+	h.mu.RLock()
+	live := make([]*session, 0, len(h.clients))
+	for s := range h.clients {
+		live = append(live, s)
+	}
+	h.mu.RUnlock()
+
+	for _, s := range live {
+		s.sendRaw("ERROR :" + reason)
+	}
+	for _, s := range live {
+		s.drain() // let the ERROR reach the wire before the socket goes
+		s.close() // *tls.Conn.Close() emits close_notify; a raw fd exit does not
+	}
+}
+
 func (h *hub) clientCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

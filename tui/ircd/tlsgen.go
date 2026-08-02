@@ -31,6 +31,15 @@ import (
 // generating.
 const certValidity = 2 * 365 * 24 * time.Hour
 
+// CACertPath is where the CA certificate sits relative to the served chain:
+// alongside it, with "-ca" before the extension. Derived rather than configured
+// — it is an output of --init-tls, not a knob, and a client that needs it needs
+// exactly the one that signed the leaf being served.
+func CACertPath(certPath string) string {
+	ext := filepath.Ext(certPath)
+	return strings.TrimSuffix(certPath, ext) + "-ca" + ext
+}
+
 // fingerprint is the SHA-256 of the DER certificate, formatted the way IRC
 // clients show it — this is what a user pins instead of trusting a CA.
 func fingerprint(der []byte) string {
@@ -103,19 +112,59 @@ func WriteSelfSignedCert(certPath, keyPath string, extraHosts []string, force bo
 		}
 	}
 
+	// Two certificates, not one. A single self-signed certificate that is its
+	// own trust anchor must carry CA:TRUE to be usable as an anchor — and a
+	// certificate with CA:TRUE is not a legal *end-entity* certificate. OpenSSL
+	// tolerates the contradiction, so `openssl s_client` reports a clean
+	// verification; rustls does not, and every Rust IRC client (Halloy among
+	// them) refuses the handshake with `CaUsedAsEndEntity`. So generate what the
+	// rule actually wants: a CA that signs a leaf which is not itself a CA.
+	//
+	// The CA's key is never written. It signs the leaf here and is discarded, so
+	// there is no long-lived signing key at rest that could mint a certificate
+	// for any name. Reissuing means regenerating both, exactly as it did when
+	// this produced one certificate.
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", err
+	}
+	caSerial, err := rand.Int(rand.Reader, serialMax)
+	if err != nil {
+		return "", err
+	}
+	caTmpl := x509.Certificate{
+		SerialNumber:          caSerial,
+		Subject:               pkix.Name{CommonName: "mcp-dispatch IRC gateway CA"},
+		NotBefore:             time.Now().Add(-time.Hour), // tolerate mild clock skew
+		NotAfter:              time.Now().Add(certValidity),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTmpl, &caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return "", err
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return "", err
+	}
+
 	tmpl := x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "mcp-dispatch IRC gateway"},
-		NotBefore:             time.Now().Add(-time.Hour), // tolerate mild clock skew
+		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(certValidity),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA:                  true, // self-signed: it is its own issuer
+		IsCA:                  false, // an end-entity certificate is not a CA
 		DNSNames:              dns,
 		IPAddresses:           ips,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, caCert, &key.PublicKey, caKey)
 	if err != nil {
 		return "", err
 	}
@@ -123,8 +172,20 @@ func WriteSelfSignedCert(certPath, keyPath string, extraHosts []string, force bo
 	// The certificate is public; the key is not. Write the key through O_EXCL
 	// into a fresh inode so we never write a secret through a symlink someone
 	// left in place.
-	if err := os.WriteFile(certPath, pem.EncodeToMemory(
-		&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil { //nolint:gosec // a certificate is public
+	//
+	// certPath holds leaf-then-CA: Go serves the whole chain from it, and a
+	// client that only reads the first block still gets the leaf, which is what
+	// fingerprint-pinning clients pin. caPath holds the CA alone, which is what
+	// a client with `root_cert_path` (or any "trust this root" setting) needs —
+	// pointing such a client at the leaf is the mistake this layout prevents.
+	chain := append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
+	if err := os.WriteFile(certPath, chain, 0o644); err != nil { //nolint:gosec // a certificate is public
+		return "", err
+	}
+	if err := os.WriteFile(CACertPath(certPath), pem.EncodeToMemory(
+		&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o644); err != nil { //nolint:gosec // a certificate is public
 		return "", err
 	}
 	keyDER, err := x509.MarshalECPrivateKey(key)

@@ -74,6 +74,32 @@ change under a running install:
   docs now say to check your client rather than assume, and give the one-liner
   that proves which side is at fault.
 
+- **Shutdown dropped live connections instead of closing them.** It closed the
+  listeners and let the process exit, so established connections died with the
+  process — no IRC `ERROR` line, and on TLS no `close_notify`, which a strict
+  client reports as a truncated stream rather than a disconnect ("peer closed
+  connection without sending TLS close_notify"). Now that the gateway runs under
+  systemd and is restarted on every upgrade, that made routine restarts look
+  like faults. It now sends `ERROR :Server shutting down`, drains, and closes
+  each connection — the `drain()` helper the refusal paths already used for
+  exactly this reason.
+- **`--init-tls` produced a certificate that strict TLS clients refuse.** It
+  wrote one self-signed certificate marked `CA:TRUE` so it could serve as its
+  own trust anchor — but a certificate with `CA:TRUE` is not a legal
+  *end-entity* certificate, and rustls enforces that where OpenSSL does not.
+  Every Rust IRC client, Halloy included, failed the handshake with
+  `CaUsedAsEndEntity`; `openssl s_client` against the same listener reported
+  `Verify return code: 0 (ok)`, so checking with OpenSSL confirmed a
+  configuration no such client could use. It now writes a real chain: a small CA
+  that signs a leaf which is not a CA. The CA's key is generated, used once, and
+  never written, so no signing key is left at rest.
+
+  `tls_cert` now holds leaf-then-CA and is served as a chain; a new
+  `irc-cert-ca.pem` holds the CA alone, which is what `root_cert_path` and
+  equivalents want. **Point a root-certificate setting at the CA, never at the
+  served certificate.** The printed fingerprint is the leaf's, unchanged in
+  meaning for pinning clients. Existing certificates must be regenerated with
+  `--init-tls --force`; pinning clients will need the new fingerprint.
 - **`--check` explains an unbound unix socket instead of printing `(none)`.**
   The socket default applies only while `listen` is unset, so adding a TCP
   listener silently takes the socket away — from a reader the same document has

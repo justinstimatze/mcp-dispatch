@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"net"
@@ -943,6 +944,73 @@ func TestSelfSignedCertIsUsableAndKeyIsOwnerOnly(t *testing.T) {
 	fromFile, err := fingerprintFile(certPath)
 	if err != nil || fromFile != fp {
 		t.Fatalf("fingerprint mismatch: %q vs %q (%v)", fromFile, fp, err)
+	}
+}
+
+// The served certificate must NOT be a CA. A single self-signed certificate has
+// to carry CA:TRUE to work as its own trust anchor, and a certificate with
+// CA:TRUE is not a legal end-entity certificate. OpenSSL tolerates that
+// contradiction — `openssl s_client` verifies it clean — so this cannot be
+// caught by checking with OpenSSL. rustls does not: every Rust IRC client
+// refuses the handshake outright with `CaUsedAsEndEntity`. Hence a real chain,
+// and hence a test that asserts the shape rather than asking a lenient verifier.
+func TestServedLeafIsNotACAAndChainsToTheWrittenCA(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	if _, err := WriteSelfSignedCert(certPath, filepath.Join(dir, "key.pem"), nil, false); err != nil {
+		t.Fatal(err)
+	}
+
+	chain := readCerts(t, certPath)
+	if len(chain) != 2 {
+		t.Fatalf("served file has %d certificates, want leaf + CA", len(chain))
+	}
+	leaf, ca := chain[0], chain[1]
+
+	if leaf.IsCA {
+		t.Error("the served leaf is a CA — rustls clients reject this as CaUsedAsEndEntity")
+	}
+	if leaf.KeyUsage&x509.KeyUsageCertSign != 0 {
+		t.Error("the served leaf carries keyCertSign; an end-entity certificate must not sign certificates")
+	}
+	if !ca.IsCA {
+		t.Error("the second certificate must be a CA — it is what clients trust as a root")
+	}
+
+	// The separate CA file is what a root_cert_path setting gets, and it must be
+	// the CA alone: handing a client the served chain makes the leaf a candidate
+	// anchor again, which is the bug this whole layout exists to avoid.
+	caOnly := readCerts(t, CACertPath(certPath))
+	if len(caOnly) != 1 || !caOnly[0].IsCA || !caOnly[0].Equal(ca) {
+		t.Fatalf("%s must hold exactly the signing CA", CACertPath(certPath))
+	}
+
+	// And the chain actually verifies, hostname included, against that root.
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, DNSName: "localhost"}); err != nil {
+		t.Fatalf("leaf does not verify against the written CA: %v", err)
+	}
+}
+
+func readCerts(t *testing.T, path string) []*x509.Certificate {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []*x509.Certificate
+	for {
+		var block *pem.Block
+		block, raw = pem.Decode(raw)
+		if block == nil {
+			return out
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, c)
 	}
 }
 
