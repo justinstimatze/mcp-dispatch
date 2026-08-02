@@ -12,10 +12,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +44,20 @@ const (
 	ircChunk = 400
 )
 
+// supportedCaps are the IRCv3 capabilities we actually implement. The list is
+// the contract: CAP REQ is atomic, so a request naming anything outside this
+// set is rejected whole rather than half-honoured.
+//
+//   - sasl         PLAIN, as an alternative to PASS
+//   - server-time  the real time a message crossed the relay, which is what
+//     makes replayed history readable instead of misleading
+//   - message-tags carries msgid, so a client can ack one specific message
+var supportedCaps = map[string]bool{
+	"sasl":         true,
+	"server-time":  true,
+	"message-tags": true,
+}
+
 type session struct {
 	hub   *hub
 	cfg   Config
@@ -61,6 +77,7 @@ type session struct {
 	joined     map[string]bool
 	saslActive bool
 	capHeld    bool
+	caps       map[string]bool
 
 	closeOnce sync.Once
 }
@@ -72,6 +89,7 @@ func newSession(h *hub, cfg Config, token []byte, lim *limiter, conn net.Conn) *
 		out:    make(chan string, maxOut),
 		done:   make(chan struct{}),
 		joined: map[string]bool{},
+		caps:   map[string]bool{},
 	}
 }
 
@@ -325,7 +343,17 @@ func (s *session) handle(line string) bool {
 		if len(params) > 0 {
 			s.sendTopic(params[0])
 		}
-	case "AWAY", "USERHOST", "ISON":
+	case "MOTD":
+		s.sendMOTD()
+	case "VERSION":
+		s.numeric("351", "dispatch-ircd-%s %s :IRC gateway to a local mcp-dispatch relay",
+			buildVersion(), serverName)
+	case "TIME":
+		s.numeric("391", "%s :%s", serverName, time.Now().UTC().Format(time.RFC1123))
+	case "LUSERS":
+		s.numeric("251", ":There are %d agents and %d client(s) on this relay",
+			len(s.hub.allNicks()), s.hub.clientCount())
+	case "AWAY", "USERHOST", "ISON", "WHOWAS":
 		// Accepted and ignored — clients send these unprompted.
 	default:
 		s.numeric("421", "%s :Unknown command", cmd)
@@ -337,33 +365,86 @@ func (s *session) handle(line string) bool {
 // Authentication
 // ---------------------------------------------------------------------------
 
+// capList renders the supported set in a stable order.
+func capList() string {
+	names := make([]string, 0, len(supportedCaps))
+	for c := range supportedCaps {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	return strings.Join(names, " ")
+}
+
+func (s *session) enabledCaps() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.caps))
+	for c := range s.caps {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *session) hasCap(c string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.caps[c]
+}
+
 func (s *session) handleCap(params []string) bool {
 	if len(params) == 0 {
 		return true
 	}
 	switch strings.ToUpper(params[0]) {
 	case "LS":
+		// `CAP LS 302` just tells us the client speaks CAP v3.2; the reply shape
+		// is the same either way, and holding registration is the part that
+		// matters — a client that says LS is going to say END.
 		s.mu.Lock()
 		s.capHeld = true
 		s.mu.Unlock()
-		s.send(":%s CAP * LS :sasl", serverName)
+		s.send(":%s CAP * LS :%s", serverName, capList())
 	case "REQ":
+		s.mu.Lock()
+		s.capHeld = true
+		s.mu.Unlock()
 		want := ""
 		if len(params) > 1 {
 			want = strings.TrimSpace(params[len(params)-1])
 		}
-		if strings.Contains(want, "sasl") {
-			s.send(":%s CAP * ACK :sasl", serverName)
-		} else {
-			s.send(":%s CAP * NAK :%s", serverName, want)
+		asked := strings.Fields(want)
+		// REQ is atomic by spec: all of them or none. Ack'ing a set that
+		// includes something we don't implement is worse than refusing — the
+		// client then formats for a capability we will never honour.
+		ok := len(asked) > 0
+		for _, c := range asked {
+			if !supportedCaps[strings.TrimPrefix(c, "-")] {
+				ok = false
+				break
+			}
 		}
+		if !ok {
+			s.send(":%s CAP * NAK :%s", serverName, want)
+			return true
+		}
+		s.mu.Lock()
+		for _, c := range asked {
+			if strings.HasPrefix(c, "-") {
+				delete(s.caps, strings.TrimPrefix(c, "-"))
+			} else {
+				s.caps[c] = true
+			}
+		}
+		s.mu.Unlock()
+		s.send(":%s CAP * ACK :%s", serverName, want)
 	case "END":
 		s.mu.Lock()
 		s.capHeld = false
 		s.mu.Unlock()
 		s.tryRegister()
 	case "LIST":
-		s.send(":%s CAP * LIST :sasl", serverName)
+		s.send(":%s CAP * LIST :%s", serverName, strings.Join(s.enabledCaps(), " "))
 	}
 	return true
 }
@@ -523,20 +604,29 @@ func (s *session) tryRegister() {
 	s.mu.Unlock()
 
 	s.hub.add(s)
-	log.Printf("irc: %s: registered as %s (%d client(s))", s.key, nick, s.hub.clientCount())
+	log.Printf("irc: %s: registered as %s over %s (%d client(s))",
+		s.key, nick, s.transport(), s.hub.clientCount())
+	go s.keepalive()
 
 	s.numeric("001", ":Welcome to the mcp-dispatch relay, %s", nick)
 	s.numeric("002", ":Your host is %s, running dispatch-ircd", serverName)
 	s.numeric("003", ":This gateway is a view of a local filesystem relay")
 	s.numeric("004", "%s dispatch-ircd o o", serverName)
 	s.numeric("005", "CHANTYPES=#& NICKLEN=64 CASEMAPPING=ascii :are supported by this server")
+	s.sendMOTD()
+
+	// Put everyone somewhere useful immediately.
+	s.joinChannel(firehose)
+}
+
+func (s *session) sendMOTD() {
 	s.numeric("375", ":- %s message of the day -", serverName)
 	for _, l := range []string{
 		"mcp-dispatch IRC gateway.",
 		"",
 		fmt.Sprintf("  %-14s every message crossing the relay (read-only view)", firehose),
 		"  #name          a relay channel — JOIN to watch, send to post",
-		fmt.Sprintf("  /msg %-9s help, who, ack, replay — what IRC has no verb for", serviceNick),
+		fmt.Sprintf("  /msg %-9s help, inbox, ack, who, tasks — what IRC has no verb for", serviceNick),
 		"",
 		"You are an observer and a sender: this gateway does not claim presence,",
 		"so agents do not see your client as a live session.",
@@ -544,9 +634,53 @@ func (s *session) tryRegister() {
 		s.numeric("372", ":- %s", l)
 	}
 	s.numeric("376", ":End of /MOTD command")
+}
 
-	// Put everyone somewhere useful immediately.
-	s.joinChannel(firehose)
+// transport describes the connection for the log: which socket, and whether it
+// is encrypted (and how). Never logs anything from the message stream.
+func (s *session) transport() string {
+	if tc, ok := s.conn.(*tls.Conn); ok {
+		st := tc.ConnectionState()
+		name := map[uint16]string{
+			tls.VersionTLS12: "TLS1.2", tls.VersionTLS13: "TLS1.3",
+		}[st.Version]
+		if name == "" {
+			name = "TLS"
+		}
+		if len(st.PeerCertificates) > 0 {
+			name += "+clientcert"
+		}
+		return name
+	}
+	if s.conn.RemoteAddr() != nil && s.conn.RemoteAddr().Network() == "unix" {
+		return "unix"
+	}
+	return "tcp"
+}
+
+// keepalive PINGs a quiet client so the connection survives an idle stretch.
+//
+// Without this the read deadline is a guillotine: a client that has nothing to
+// say for idle_timeout is disconnected even though it is perfectly healthy, and
+// on a relay that can be silent for hours that is most of them. Clients answer
+// PONG, which is traffic, which resets the deadline. A client that does NOT
+// answer still hits the deadline — which is the point, and how a dead
+// connection is reaped rather than held open forever.
+func (s *session) keepalive() {
+	every := s.cfg.idleTimeout() / 2
+	if every < 15*time.Second {
+		every = 15 * time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+			s.send("PING :%s", serverName)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -701,13 +835,56 @@ func (s *session) linesFor(m relay.Message, ctx string) []string {
 	}
 
 	flags := messageFlags(m)
+	tags := s.tagPrefix(m)
 	var out []string
 	for _, chunk := range chunkContent(m.Content) {
-		out = append(out, fmt.Sprintf(":%s!agent@%s PRIVMSG %s :%s%s%s",
-			from, serverName, target, prefix, flags, chunk))
+		out = append(out, fmt.Sprintf("%s:%s!agent@%s PRIVMSG %s :%s%s%s",
+			tags, from, serverName, target, prefix, flags, chunk))
 		flags = "" // only the first line of a multi-line body carries the flags
 	}
 	return out
+}
+
+// tagPrefix renders the IRCv3 message tags this session has negotiated.
+//
+// server-time is the one that matters: without it, fifty messages replayed on
+// JOIN all appear to have arrived just now, which is worse than no history at
+// all — you cannot tell a week-old decision from a live one. With it, the
+// client shows each message at the time it actually crossed the relay.
+func (s *session) tagPrefix(m relay.Message) string {
+	var tags []string
+	if s.hasCap("server-time") {
+		if ts := ircTime(m.Timestamp); ts != "" {
+			tags = append(tags, "time="+ts)
+		}
+	}
+	if s.hasCap("message-tags") && m.ID != "" {
+		tags = append(tags, "msgid="+tagEscape(m.ID))
+	}
+	if len(tags) == 0 {
+		return ""
+	}
+	return "@" + strings.Join(tags, ";") + " "
+}
+
+// ircTime converts the relay's second-resolution stamp to the millisecond
+// format server-time requires. An unparseable stamp yields "" rather than a
+// wrong time — a missing tag degrades to "now", a bad one lies.
+func ircTime(ts string) string {
+	t, err := time.Parse("2006-01-02T15:04:05Z", ts)
+	if err != nil {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// tagEscape applies the IRCv3 tag escaping rules. Relay ids can't contain any
+// of these, but a tag value is attacker-adjacent data and escaping it is one
+// line — the alternative is trusting that the id validator never loosens.
+func tagEscape(v string) string {
+	return strings.NewReplacer(
+		"\\", "\\\\", ";", "\\:", " ", "\\s", "\r", "\\r", "\n", "\\n",
+	).Replace(v)
 }
 
 func messageFlags(m relay.Message) string {
@@ -821,7 +998,9 @@ func (s *session) service(text string) {
 		for _, l := range []string{
 			"help                     this",
 			"who                      the relay roster (live / remote)",
-			"ack                      acknowledge everything in your own inbox",
+			"inbox                    what is waiting for you, with message ids",
+			"ack <id> [<id>…]         acknowledge those messages",
+			"ack all                  acknowledge your whole inbox",
 			"replay [n]               re-send the last n messages into " + firehose,
 			"urgent <target> <text>   send at urgent priority",
 			"channels                 list relay channels",
@@ -849,13 +1028,58 @@ func (s *session) service(text string) {
 			}
 			s.notice("%-28s %-7s%s", a.ID, state, chans)
 		}
+	case "inbox":
+		msgs, err := s.hub.inbox(s.currentNick())
+		if err != nil {
+			s.notice("inbox failed: %v", err)
+			return
+		}
+		var pending int
+		for _, m := range msgs {
+			state := m.State
+			if state == "" {
+				state = "pending"
+			}
+			if state == "pending" {
+				pending++
+			}
+			first := firstLine(m.Content)
+			s.notice("%-14s %-8s %-16s %s%s", m.ID, state, relay.Project(m.From),
+				messageFlags(m), first)
+		}
+		if len(msgs) == 0 {
+			s.notice("inbox empty — nothing is waiting for %s", s.currentNick())
+			return
+		}
+		s.notice("%d message(s), %d unread. ack <id> [<id>…], or ack all", len(msgs), pending)
 	case "ack":
-		n, err := s.hub.ack(s.currentNick())
+		nick := s.currentNick()
+		ids := fields[1:]
+		// Bare `ack` used to mean "everything", which is a destructive default
+		// for a command you might type to clear one notification. It now needs
+		// to be said: `ack all`.
+		if len(ids) == 0 {
+			s.notice("usage: ack <id> [<id>…]  ·  ack all   (see: inbox)")
+			return
+		}
+		if len(ids) == 1 && strings.EqualFold(ids[0], "all") {
+			n, err := s.hub.ack(nick)
+			if err != nil {
+				s.notice("ack failed: %v", err)
+				return
+			}
+			s.notice("acknowledged all %d message(s) in %s's inbox", n, nick)
+			return
+		}
+		n, missing, err := s.hub.ackIDs(nick, ids)
 		if err != nil {
 			s.notice("ack failed: %v", err)
 			return
 		}
-		s.notice("acknowledged %d message(s) in %s's inbox", n, s.currentNick())
+		s.notice("acknowledged %d message(s)", n)
+		if len(missing) > 0 {
+			s.notice("not in %s's inbox: %s", nick, strings.Join(missing, " "))
+		}
 	case "channels":
 		chans := s.hub.channels()
 		if len(chans) == 0 {
@@ -907,6 +1131,18 @@ func (s *session) service(text string) {
 	default:
 		s.notice("unknown command %q — try: help", fields[0])
 	}
+}
+
+// firstLine is the one-line preview an inbox listing shows.
+func firstLine(content string) string {
+	line := content
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i] + " …"
+	}
+	if len(line) > 80 {
+		line = line[:77] + "…"
+	}
+	return strings.TrimSpace(line)
 }
 
 func parseCount(s string) (int, error) {

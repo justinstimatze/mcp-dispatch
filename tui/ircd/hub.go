@@ -226,6 +226,14 @@ func (h *hub) send(from, target, content, priority string) (int, error) {
 
 func (h *hub) ack(nick string) (int, error) { return relay.AckInbox(h.relayDir, nick) }
 
+func (h *hub) inbox(nick string) ([]relay.Message, error) {
+	return relay.LoadInbox(h.relayDir, nick)
+}
+
+func (h *hub) ackIDs(nick string, ids []string) (int, []string, error) {
+	return relay.AckMessages(h.relayDir, nick, ids)
+}
+
 // tasks reads the task store. The gateway is read-only here on purpose:
 // creating and claiming are the MCP server's job (claiming in particular is an
 // O_EXCL race that must have exactly one implementation), so a human watching

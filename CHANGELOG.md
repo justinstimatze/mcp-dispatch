@@ -21,6 +21,32 @@ change under a running install:
   inbox for the next one. Addressing a concrete session id is unchanged. This is
   the fix, but it *is* a behaviour change to an existing call.
 
+### Added
+- **IRC gateway polish.** Three IRCv3 capabilities, implemented rather than
+  merely advertised: `server-time` (each message shows the time it crossed the
+  relay — without it a JOIN replay is fifty messages that all look like they
+  arrived just now, which is worse than no history), `message-tags` (carries
+  `msgid`), and `sasl`. `CAP REQ` is now honoured **atomically** — a set naming
+  anything unsupported is NAK'd whole instead of half-ACK'd, which previously
+  left a client formatting for a capability the gateway would never send.
+  `CAP LS 302` is understood.
+- `/msg dispatch inbox` lists what is actually addressed to you, with each
+  message's id and read state, and `ack` now takes those ids: `ack <id> [<id>…]`
+  acknowledges exactly those and reports any it could not find. `MOTD`,
+  `VERSION`, `TIME` and `LUSERS` answer properly.
+- A server-side keepalive PINGs an idle authenticated client at half the idle
+  timeout (floored at 15s). Without it the read deadline was a guillotine: a
+  healthy but quiet client was disconnected at `idle_timeout`, which on a relay
+  that can be silent for hours is most of them. A client that stops answering
+  still hits the deadline, so dead connections are still reaped.
+- The connection log records the transport (`unix`, `TLS1.3`, `TLS1.3+clientcert`).
+
+### Changed
+- **A bare `/msg dispatch ack` no longer acknowledges your entire inbox.** It
+  prints usage instead. Acking is destructive — the MCP server deletes an acked
+  message — and that is not a sensible default for a command you might type to
+  clear one notification. Say `ack all` when you mean all.
+
 ### Security
 - **TLS is required on every TCP listener the IRC gateway binds — loopback
   included.** There is no cleartext TCP mode at any address any more. Cleartext

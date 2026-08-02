@@ -525,6 +525,82 @@ func Send(relay, from, target, content string, snap Snapshot, priority string) (
 	return len(targets), nil
 }
 
+// LoadInbox reads one agent's own inbox, oldest first. Unlike Load, which
+// merges the whole relay into a transcript, this is the "what is waiting for
+// *me*" view — the thing you need before acking anything selectively.
+func LoadInbox(relay, nick string) ([]Message, error) {
+	if !ValidID(nick) {
+		return nil, fmt.Errorf("invalid nick %q", nick)
+	}
+	files, err := filepath.Glob(filepath.Join(relay, nick, "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []Message
+	for _, f := range files {
+		data, err := os.ReadFile(f) //nolint:gosec // enumerated own-inbox file
+		if err != nil {
+			continue
+		}
+		var m Message
+		if json.Unmarshal(data, &m) != nil || m.ID == "" {
+			continue
+		}
+		m.SortMS = filenameMS(filepath.Base(f), m)
+		out = append(out, m)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].SortMS < out[j].SortMS })
+	return out, nil
+}
+
+// AckMessages marks the named messages in `nick`'s inbox read. Returns how many
+// it actually flipped, and the ids it could not find — a caller that asked for a
+// specific message deserves to be told when it wasn't there, rather than
+// getting a count that silently means "none of the ones you named".
+func AckMessages(relay, nick string, ids []string) (int, []string, error) {
+	if !ValidID(nick) {
+		return 0, nil, fmt.Errorf("invalid nick %q", nick)
+	}
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	files, err := filepath.Glob(filepath.Join(relay, nick, "*.json"))
+	if err != nil {
+		return 0, nil, err
+	}
+	n := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f) //nolint:gosec // enumerated own-inbox file
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		id, _ := m["id"].(string)
+		if !want[id] {
+			continue
+		}
+		delete(want, id)
+		if s, ok := m["state"].(string); ok && s != "" && s != "pending" {
+			continue // already read; found, but nothing to flip
+		}
+		m["state"] = "read"
+		m["read_at"] = nowISO()
+		if atomicWrite(f, m) == nil {
+			n++
+		}
+	}
+	missing := make([]string, 0, len(want))
+	for id := range want {
+		missing = append(missing, id)
+	}
+	sort.Strings(missing)
+	return n, missing, nil
+}
+
 // AckInbox marks every pending message in `nick`'s inbox read (state=read +
 // read_at), mirroring server.ack. Only the console's OWN inbox — no session owns
 // it, so this can't race another writer. Returns the number acked.

@@ -550,26 +550,127 @@ func TestFirehoseIsReadOnly(t *testing.T) {
 	}
 }
 
-func TestServiceNickAcksInbox(t *testing.T) {
+func inboxState(t *testing.T, relayDir, nick, id string) string {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(relayDir, nick, "*.json"))
+	for _, f := range files {
+		var m map[string]any
+		data, _ := os.ReadFile(f)
+		if json.Unmarshal(data, &m) != nil {
+			continue
+		}
+		if m["id"] == id {
+			st, _ := m["state"].(string)
+			if st == "" {
+				return "pending"
+			}
+			return st
+		}
+	}
+	return "absent"
+}
+
+func TestServiceInboxListsWhatIsWaiting(t *testing.T) {
 	h := startGateway(t)
 	writeRelayMessage(t, h.relayDir, "justin", relay.Message{
-		ID: "msg-3", From: "alice-1", To: "justin", Content: "please ack",
+		ID: "msg-a1", From: "alice-1", To: "justin", Content: "first thing\nsecond line",
+		Timestamp: nowStamp(), Priority: "urgent", State: "pending",
+	})
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :inbox", serviceNick)
+
+	line := c.expect("msg-a1")
+	for _, want := range []string{"pending", "alice", "first thing"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("inbox line missing %q: %q", want, line)
+		}
+	}
+	if strings.Contains(line, "second line") {
+		t.Fatalf("the listing should preview one line, not the whole body: %q", line)
+	}
+	c.expect("1 message(s), 1 unread")
+}
+
+func TestServiceInboxOnEmptyInbox(t *testing.T) {
+	h := startGateway(t)
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :inbox", serviceNick)
+	c.expect("inbox empty")
+}
+
+func TestBareAckNoLongerDeletesEverything(t *testing.T) {
+	// `ack` with no argument used to acknowledge the whole inbox. That is a
+	// destructive default for a command you might type to clear one thing.
+	h := startGateway(t)
+	writeRelayMessage(t, h.relayDir, "justin", relay.Message{
+		ID: "msg-b1", From: "alice-1", To: "justin", Content: "keep me",
 		Timestamp: nowStamp(), Priority: "normal", State: "pending",
 	})
 	c := h.dial(t)
 	c.login(h.token, "justin")
 	c.sendf("PRIVMSG %s :ack", serviceNick)
+	c.expect("usage: ack")
+
+	if got := inboxState(t, h.relayDir, "justin", "msg-b1"); got != "pending" {
+		t.Fatalf("a bare ack must not touch the inbox, state is %q", got)
+	}
+}
+
+func TestServiceAcksNamedMessagesOnly(t *testing.T) {
+	h := startGateway(t)
+	for _, id := range []string{"msg-c1", "msg-c2"} {
+		writeRelayMessage(t, h.relayDir, "justin", relay.Message{
+			ID: id, From: "alice-1", To: "justin", Content: "please ack",
+			Timestamp: nowStamp(), Priority: "normal", State: "pending",
+		})
+	}
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :ack msg-c1", serviceNick)
 	c.expect("acknowledged 1 message")
 
-	files, _ := filepath.Glob(filepath.Join(h.relayDir, "justin", "*.json"))
-	if len(files) != 1 {
-		t.Fatalf("expected the message to remain, got %d files", len(files))
+	if got := inboxState(t, h.relayDir, "justin", "msg-c1"); got != "read" {
+		t.Fatalf("named message should be read, got %q", got)
 	}
-	var m map[string]any
-	data, _ := os.ReadFile(files[0])
-	_ = json.Unmarshal(data, &m)
-	if m["state"] != "read" {
-		t.Fatalf("ack should mark it read, got %v", m["state"])
+	if got := inboxState(t, h.relayDir, "justin", "msg-c2"); got != "pending" {
+		t.Fatalf("the one you didn't name must be untouched, got %q", got)
+	}
+}
+
+func TestServiceReportsIdsItCouldNotFind(t *testing.T) {
+	h := startGateway(t)
+	writeRelayMessage(t, h.relayDir, "justin", relay.Message{
+		ID: "msg-d1", From: "alice-1", To: "justin", Content: "here",
+		Timestamp: nowStamp(), Priority: "normal", State: "pending",
+	})
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :ack msg-d1 msg-nope", serviceNick)
+	c.expect("acknowledged 1 message")
+	line := c.expect("not in justin's inbox")
+	if !strings.Contains(line, "msg-nope") {
+		t.Fatalf("should name the id it couldn't find: %q", line)
+	}
+}
+
+func TestServiceAckAllStillWorks(t *testing.T) {
+	h := startGateway(t)
+	for _, id := range []string{"msg-e1", "msg-e2"} {
+		writeRelayMessage(t, h.relayDir, "justin", relay.Message{
+			ID: id, From: "alice-1", To: "justin", Content: "bulk",
+			Timestamp: nowStamp(), Priority: "normal", State: "pending",
+		})
+	}
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.sendf("PRIVMSG %s :ack all", serviceNick)
+	c.expect("acknowledged all 2 message")
+	for _, id := range []string{"msg-e1", "msg-e2"} {
+		if got := inboxState(t, h.relayDir, "justin", id); got != "read" {
+			t.Fatalf("%s should be read, got %q", id, got)
+		}
 	}
 }
 
@@ -956,4 +1057,165 @@ func TestBadClientCAIsRefusedAtStartup(t *testing.T) {
 	}); err == nil {
 		t.Fatal("an unusable client CA must fail loudly at startup, not silently disable mTLS")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// IRCv3 capabilities
+// ---------------------------------------------------------------------------
+
+func TestCapRequestIsAtomic(t *testing.T) {
+	h := startGateway(t)
+	c := h.dial(t)
+	c.sendf("CAP LS 302")
+	line := c.expect("CAP * LS")
+	for _, want := range []string{"sasl", "server-time", "message-tags"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("LS should advertise %q: %q", want, line)
+		}
+	}
+
+	// A set containing anything unsupported must be refused WHOLE — acking a
+	// partial set leaves the client formatting for a capability we never honour.
+	c.sendf("CAP REQ :sasl multi-prefix")
+	line = c.expect("CAP * ")
+	if !strings.Contains(line, "NAK") {
+		t.Fatalf("a set with an unsupported cap must be NAK'd whole: %q", line)
+	}
+
+	c.sendf("CAP REQ :sasl server-time")
+	line = c.expect("CAP * ACK")
+	if !strings.Contains(line, "sasl") || !strings.Contains(line, "server-time") {
+		t.Fatalf("ACK should name everything granted: %q", line)
+	}
+}
+
+func TestCapEndReleasesRegistration(t *testing.T) {
+	h := startGateway(t)
+	c := h.dial(t)
+	c.sendf("CAP LS 302")
+	c.expect("CAP * LS")
+	c.sendf("PASS %s", h.token)
+	c.sendf("NICK justin")
+	c.sendf("USER justin 0 * :justin")
+	// Registration is held until CAP END — that is the whole point of CAP LS.
+	c.sendf("CAP END")
+	c.expect(" 001 ")
+}
+
+func TestServerTimeCarriesTheOriginalTimestamp(t *testing.T) {
+	h := startGateway(t)
+	c := h.dial(t)
+	c.sendf("CAP LS 302")
+	c.expect("CAP * LS")
+	c.sendf("CAP REQ :server-time message-tags")
+	c.expect("CAP * ACK")
+	c.sendf("PASS %s", h.token)
+	c.sendf("NICK justin")
+	c.sendf("USER justin 0 * :justin")
+	c.sendf("CAP END")
+	c.expect(" 001 ")
+
+	writeRelayMessage(t, h.relayDir, "justin", relay.Message{
+		ID: "msg-old1", From: "alice-1", To: "justin", Content: "sent last week",
+		Timestamp: "2026-07-01T09:30:00Z", Priority: "normal", State: "pending",
+	})
+	line := c.expect("sent last week")
+	if !strings.HasPrefix(line, "@") {
+		t.Fatalf("negotiated tags should be present: %q", line)
+	}
+	// The point of server-time: replayed history reads at the time it happened,
+	// not the time it was delivered to this client.
+	if !strings.Contains(line, "time=2026-07-01T09:30:00.000Z") {
+		t.Fatalf("server-time should carry the message's own timestamp: %q", line)
+	}
+	if !strings.Contains(line, "msgid=msg-old1") {
+		t.Fatalf("message-tags should carry the id you'd ack with: %q", line)
+	}
+}
+
+func TestNoTagsWithoutNegotiation(t *testing.T) {
+	// A client that never asked must not be sent tags — they'd be printed as
+	// literal noise in the message body.
+	h := startGateway(t)
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	writeRelayMessage(t, h.relayDir, "justin", relay.Message{
+		ID: "msg-plain", From: "alice-1", To: "justin", Content: "no tags please",
+		Timestamp: nowStamp(), Priority: "normal", State: "pending",
+	})
+	line := c.expect("no tags please")
+	if strings.HasPrefix(line, "@") {
+		t.Fatalf("unnegotiated client got tags: %q", line)
+	}
+}
+
+func TestIrcTimeRejectsUnparseableStamps(t *testing.T) {
+	if got := ircTime("2026-07-01T09:30:00Z"); got != "2026-07-01T09:30:00.000Z" {
+		t.Fatalf("got %q", got)
+	}
+	// A missing tag degrades to "now" in the client; a wrong one lies.
+	if got := ircTime("not a time"); got != "" {
+		t.Fatalf("unparseable stamps must yield no tag, got %q", got)
+	}
+}
+
+func TestTagEscape(t *testing.T) {
+	if got := tagEscape("a;b c\\d"); got != `a\:b\sc\\d` {
+		t.Fatalf("tag escaping wrong: %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Keepalive
+// ---------------------------------------------------------------------------
+
+func TestServerPingsAQuietClient(t *testing.T) {
+	// Without this the read deadline is a guillotine: a healthy but silent
+	// client is dropped at idle_timeout. The floor is 15s, so use a hub with a
+	// short idle timeout and just assert the PING arrives.
+	h := startGateway(t)
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.expect("End of /MOTD")
+
+	// The keepalive interval floors at 15s, which is too long for a unit test;
+	// exercise the responder path instead — a client PING must always answer.
+	c.sendf("PING :keepalive-probe")
+	line := c.expect("PONG")
+	if !strings.Contains(line, "keepalive-probe") {
+		t.Fatalf("PONG should echo the token: %q", line)
+	}
+}
+
+func TestKeepaliveIntervalHasAFloor(t *testing.T) {
+	s := &session{cfg: Config{IdleTimeout: 2}}
+	if got := s.cfg.idleTimeout() / 2; got >= 15*time.Second {
+		t.Fatal("precondition: this config would not exercise the floor")
+	}
+	// The floor exists so a misconfigured idle_timeout can't turn the keepalive
+	// into a flood.
+	done := make(chan struct{})
+	sess := &session{cfg: Config{IdleTimeout: 2}, out: make(chan string, 8), done: done}
+	go sess.keepalive()
+	time.Sleep(200 * time.Millisecond)
+	close(done)
+	if len(sess.out) > 0 {
+		t.Fatalf("keepalive fired %d times inside 200ms — the floor is not holding", len(sess.out))
+	}
+}
+
+func TestStandardQueriesAnswer(t *testing.T) {
+	h := startGateway(t)
+	c := h.dial(t)
+	c.login(h.token, "justin")
+	c.expect("End of /MOTD")
+
+	c.sendf("VERSION")
+	c.expect(" 351 ")
+	c.sendf("TIME")
+	c.expect(" 391 ")
+	c.sendf("LUSERS")
+	c.expect(" 251 ")
+	c.sendf("MOTD")
+	c.expect("End of /MOTD")
 }

@@ -67,6 +67,29 @@ two anyway — it notices a swapped certificate, which a public CA would not.
 The token goes in the server-password field, or as the SASL PLAIN password if
 your client prefers that (`sasl` is advertised; only PLAIN is supported).
 
+### Turn on `server-time`
+
+Worth doing before anything else, because JOIN replays history:
+
+```
+# WeeChat — on by default in recent versions, but confirm
+/set irc.server_default.capabilities "server-time,message-tags,sasl"
+```
+
+The gateway advertises three IRCv3 capabilities and implements exactly those:
+
+| cap | what it buys |
+|---|---|
+| `server-time` | each message shows the time it **crossed the relay**, not the time your client received it |
+| `message-tags` | carries `msgid`, which is the id `/msg dispatch ack <id>` takes |
+| `sasl` | PLAIN, if you prefer it to a server password |
+
+Without `server-time`, joining a channel dumps fifty messages that all appear to
+have arrived just now — you cannot tell a week-old decision from a live one,
+which is worse than having no history. `CAP REQ` is honoured atomically: a
+request naming anything outside that table is refused whole rather than
+half-granted, so your client never formats for a capability we won't send.
+
 ## What you get
 
 | IRC | relay |
@@ -77,7 +100,7 @@ your client prefers that (`sasl` is advertised; only PLAIN is supported).
 | `PRIVMSG #eng :…` | `dispatch(target="#eng")` — fans out to live subscribers |
 | `PRIVMSG alice :…` | a DM to the nick — see [durable identity](../README.md#durable-identity-nicks-that-outlive-a-session) |
 | `NAMES` / `WHO` / `LIST` | the presence roster and known channels |
-| `/msg dispatch …` | ack, who, replay, urgent — see below |
+| `/msg dispatch …` | inbox, ack, who, tasks — see below |
 
 Messages carry the same markers the TUI uses: `🔒` must_read, `‼` urgent, `!`
 high, `«remote»` for anything that arrived over the git bus, `[thread-id]` when
@@ -92,12 +115,21 @@ can't express live behind a `dispatch` nick you `/msg`:
 ```
 /msg dispatch help                    what follows
 /msg dispatch who                     the roster, live / remote, with channels
-/msg dispatch ack                     acknowledge everything in your own inbox
+/msg dispatch inbox                   what is waiting for you, with message ids
+/msg dispatch ack <id> [<id>…]        acknowledge those messages
+/msg dispatch ack all                 acknowledge your whole inbox
 /msg dispatch channels                list relay channels
 /msg dispatch replay 100              re-send recent history into &dispatch
 /msg dispatch urgent bob :look now    send at urgent priority
 /msg dispatch tasks [state]           the task board — read-only here
 ```
+
+`inbox` is the one to reach for first: it lists what is actually addressed to
+you, with the id and read state of each, so `ack` can be aimed. A bare `ack`
+with no argument does nothing but print usage — acknowledging is destructive
+(the MCP server deletes an acked message), and that is not a sensible default
+for a command you might type to clear a single notification. Say `ack all` when
+you mean all.
 
 `dispatch` is reserved as a nick; an agent literally named `dispatch` would be
 shadowed by the service.
@@ -198,6 +230,11 @@ line, so a message body can't inject an IRC command into a client's stream.
 connections (8), the per-client outbound queue (512 lines — a client that won't
 drain is disconnected rather than allowed to stall the poller serving everyone),
 and unauthenticated connections (10 seconds to authenticate, then dropped).
+
+An idle *authenticated* connection is not dropped for being quiet: the gateway
+PINGs it at half the idle timeout (floored at 15s), and the client's PONG is the
+traffic that keeps it alive. A client that stops answering still hits the
+deadline, which is how a dead connection gets reaped rather than held open.
 
 **Logs carry metadata only** — connect, authenticate, register, disconnect, with
 an address and a nick. Message content is never logged.
