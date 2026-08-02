@@ -97,13 +97,24 @@ Worth doing before anything else, because JOIN replays history:
 /set irc.server_default.capabilities "server-time,message-tags,sasl"
 ```
 
-**Then check that your client actually honours it**, because acknowledging the
-capability and rendering it are two different things. irssi 1.4.5 negotiates
-`server-time` and then timestamps replayed messages with the moment they
-arrived anyway — every line of a JOIN replay reads as "just now", which is the
-precise failure the capability exists to prevent. The gateway is not the
-variable here: on the wire each message carries `@time=` with the instant it
-crossed the relay, which you can confirm without a client at all —
+**Check that your client actually honours it**, because acknowledging the
+capability and rendering it are two different things, and they disagree in
+practice:
+
+| client | negotiates | renders |
+|---|---|---|
+| Halloy | yes | **yes** — a JOIN replay shows each message's real time |
+| irssi 1.4.5 | yes | no — replayed lines are stamped with the moment they arrived |
+
+irssi's failure is the precise one the capability exists to prevent: every line
+of a replay reads as "just now", so a week-old decision is indistinguishable
+from a live one. If reading history matters to you, that is a reason to prefer
+Halloy over a terminal client — it is the one place where the GUI is not merely
+a matter of taste.
+
+The gateway is not the variable here. On the wire each message carries `@time=`
+with the instant it crossed the relay, which you can confirm without a client at
+all —
 
 ```bash
 # after JOIN, every replayed PRIVMSG should carry a tag with an OLD timestamp

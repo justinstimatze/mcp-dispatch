@@ -67,13 +67,13 @@ change under a running install:
   which accuses the certificate rather than the punctuation. WeeChat wants the
   opposite (bare hex, `tls_fingerprint`; it renamed `ssl_*` to `tls_*` in 4.0),
   so the docs now carry a per-client format table.
-- **`server-time` is documented honestly.** The gateway sends `@time=` with the
-  instant each message crossed the relay — verified on the wire — but irssi
-  1.4.5 negotiates the capability and then stamps replayed messages with their
-  arrival time anyway, which is the exact failure the capability prevents. The
-  docs now say to check your client rather than assume, and give the one-liner
-  that proves which side is at fault.
-
+- **`server-time` is documented per client.** The gateway sends `@time=` with
+  the instant each message crossed the relay — verified on the wire — but
+  clients disagree about rendering it. Halloy honours it, so a JOIN replay shows
+  each message's real time; irssi 1.4.5 negotiates the capability and then
+  stamps replayed lines with their arrival time anyway, which is the exact
+  failure the capability prevents. Both are named, along with the one-liner that
+  proves which side is at fault.
 - **Shutdown dropped live connections instead of closing them.** It closed the
   listeners and let the process exit, so established connections died with the
   process — no IRC `ERROR` line, and on TLS no `close_notify`, which a strict
