@@ -51,6 +51,39 @@ change under a running install:
   on `network-online.target` only when a TCP listener is configured; `PrivateTmp`
   dropped for the documented `/var/tmp` group-mode relay layout.
 
+### Fixed
+- **The IRC gateway ignored the cross-host git bus unless `read_git` was set
+  explicitly**, though every doc gave its default as `true`. It was a plain Go
+  bool, so an omitted key took the zero value and silently disabled the remote
+  feed: no error, no `«remote»` messages, and `--check` reporting the bus as
+  `(none)` as though none were configured. It is now a pointer read through
+  `ReadGitEnabled()`, so absent means true and a zero `Config` cannot
+  reintroduce the bug, and `--check` prints a configured-but-unread bus as such
+  rather than hiding it behind `(none)`. Found by pointing a real IRC client at
+  a relay with a live git bridge and seeing no remote traffic at all.
+- **The pinning instructions named an irssi option that does not exist.** It is
+  `-tls_pinned_cert`, not `tls_cert_fp` — and the fingerprint must be in the
+  colon-separated form, since bare hex fails as `Pinned certificate mismatch`,
+  which accuses the certificate rather than the punctuation. WeeChat wants the
+  opposite (bare hex, `tls_fingerprint`; it renamed `ssl_*` to `tls_*` in 4.0),
+  so the docs now carry a per-client format table.
+- **`server-time` is documented honestly.** The gateway sends `@time=` with the
+  instant each message crossed the relay — verified on the wire — but irssi
+  1.4.5 negotiates the capability and then stamps replayed messages with their
+  arrival time anyway, which is the exact failure the capability prevents. The
+  docs now say to check your client rather than assume, and give the one-liner
+  that proves which side is at fault.
+
+### Removed
+- **`bin/dispatch-tail`.** Its own docstring described it as watching messages
+  "scroll by like IRC", and `&dispatch` on the gateway is now literally that.
+  It was also a third independent implementation of the on-disk contract —
+  stdlib-only Python that shared no code with `git_transport.py` or
+  `tui/relay/`, reimplementing config resolution, git-lane scanning,
+  dedupe-by-msgid and `«remote»` marking. Three copies of a wire format is how
+  the copies drift. Use `dispatch-tui` for a no-listener view, the gateway's
+  `&dispatch` for a scrolling one, and `bin/dispatch-status` for a snapshot.
+
 ### Changed
 - **A bare `/msg dispatch ack` no longer acknowledges your entire inbox.** It
   prints usage instead. Acking is destructive — the MCP server deletes an acked

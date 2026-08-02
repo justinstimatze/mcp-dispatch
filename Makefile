@@ -3,7 +3,7 @@
 PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_policy.py \
 	dispatch_common.py gitsync_service.py install.py tests/ \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
-	bin/dispatch-status bin/dispatch-tail bin/dispatch-wait bin/dispatch-gitsync \
+	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync \
 	scripts/
 
 # One-command setup: sync deps, register the MCP server, wire the hooks.
@@ -32,7 +32,7 @@ lint:
 # mypy ever see anything — a module missing here is a module nobody checks.
 TYPED := server.py dispatch_common.py gitsync_service.py \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
-	bin/dispatch-status bin/dispatch-tail bin/dispatch-wait bin/dispatch-gitsync
+	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync
 
 typecheck:
 	uv run mypy --scripts-are-modules $(TYPED)

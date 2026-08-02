@@ -139,7 +139,7 @@ func main() {
 	if *gitRepo != "" {
 		repo = relay.ExpandUser(*gitRepo)
 	}
-	readGit := !*noGit && repo != "" && cfg.ReadGit
+	readGit := !*noGit && repo != "" && cfg.ReadGitEnabled()
 
 	if *check {
 		fmt.Println("configuration OK")
@@ -311,9 +311,15 @@ func runService(args []string, cfg Config, dirOverride string, dryRun bool) {
 	}
 }
 
+// repoLabel describes the git bus for --check. A configured-but-unread bus says
+// so out loud: printing "(none)" for it reads as "you have no git bus", which
+// sends you looking for the wrong problem when the cross-host feed goes quiet.
 func repoLabel(repo string, readGit bool) string {
-	if !readGit {
+	if repo == "" {
 		return ""
+	}
+	if !readGit {
+		return repo + "  ← configured but NOT read (read_git = false, or --no-git)"
 	}
 	return repo
 }

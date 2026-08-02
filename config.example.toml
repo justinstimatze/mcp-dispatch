@@ -199,7 +199,8 @@ Available targets: {agent_list}.
 # ban_seconds = 300
 
 # Relay poll seconds, how much history a JOIN replays, and whether the
-# cross-host git lanes are read as well as the local inboxes.
+# cross-host git lanes are read as well as the local inboxes. Leaving read_git
+# unset means true — set it to false only to deliberately drop remote traffic.
 # interval = 1.0
 # history = 50
 # read_git = true

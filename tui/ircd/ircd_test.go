@@ -32,6 +32,53 @@ func TestGatewayIsOffUntilExplicitlyEnabled(t *testing.T) {
 	}
 }
 
+// read_git's documented default is true. It was a plain bool, so an omitted key
+// took Go's zero value and silently disabled the cross-host feed — no error, and
+// --check reported the bus as "(none)" as though none were configured. These pin
+// all three states so the default cannot drift back.
+func TestReadGitDefaultsToTrueWhenAbsent(t *testing.T) {
+	if !(Config{}).ReadGitEnabled() {
+		t.Fatal("an absent read_git must mean true — the docs promise it, and " +
+			"omitting a key is not a request to disable the cross-host feed")
+	}
+	for _, tc := range []struct{ toml, name string }{
+		{"[irc]\nenabled = true\n", "absent"},
+		{"[irc]\nenabled = true\nread_git = true\n", "explicit true"},
+	} {
+		if got := loadConfigFrom(t, tc.toml).ReadGitEnabled(); !got {
+			t.Errorf("%s: ReadGitEnabled() = false, want true", tc.name)
+		}
+	}
+	if loadConfigFrom(t, "[irc]\nenabled = true\nread_git = false\n").ReadGitEnabled() {
+		t.Error("an explicit read_git = false must still disable the feed")
+	}
+}
+
+// repoLabel is what --check prints. A configured-but-unread bus must not render
+// as "(none)": that reads as "no git bus here" and hides the real cause.
+func TestCheckDistinguishesUnreadBusFromAbsentOne(t *testing.T) {
+	if got := repoLabel("", true); got != "" {
+		t.Errorf("no repo configured: got %q, want empty (prints as %q)", got, "(none)")
+	}
+	if got := repoLabel("/bus", true); got != "/bus" {
+		t.Errorf("read bus: got %q, want %q", got, "/bus")
+	}
+	got := repoLabel("/bus", false)
+	if !strings.Contains(got, "/bus") || !strings.Contains(got, "read_git") {
+		t.Errorf("unread bus: got %q, want the path and the reason it is unread", got)
+	}
+}
+
+func loadConfigFrom(t *testing.T, body string) Config {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MCP_DISPATCH_CONFIG", path)
+	return LoadConfig()
+}
+
 func TestRefusesNonLoopbackWithoutAllowRemote(t *testing.T) {
 	// TLS is satisfied here so the *address* axis is what is under test — the
 	// two refusals are independent, and encryption does not imply exposure.

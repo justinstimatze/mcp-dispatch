@@ -55,14 +55,29 @@ tls_key  = "~/.config/mcp-dispatch/irc-key.pem"
 ```
 
 ```bash
-/connect -tls -tls_cert_fp <fingerprint> dispatch 127.0.0.1 6697 <token>
+# irssi — the fingerprint goes in COLON-SEPARATED form, exactly as printed
+/connect -tls -tls_pinned_cert FE:08:C7:…:11 127.0.0.1 6697 <token>
 ```
 
 `--init-tls` and every startup print the certificate's SHA-256 fingerprint. A
 self-signed certificate is trusted by **pinning**, not by a CA, so put that
-fingerprint in your client (`tls_cert_fp` in irssi, `ssl_fingerprint` in
-WeeChat) rather than turning verification off. Pinning is the stronger of the
-two anyway — it notices a swapped certificate, which a public CA would not.
+fingerprint in your client rather than turning verification off. Pinning is the
+stronger of the two anyway — it notices a swapped certificate, which a public CA
+would not.
+
+Every client spells this differently, and **the format is not portable** — the
+two most common want opposite things, and getting it wrong fails as a mismatch,
+not as a parse error, so the message accuses the certificate rather than your
+punctuation:
+
+| client | option | format |
+|---|---|---|
+| irssi | `-tls_pinned_cert` (on `/connect`) | colon-separated, as printed: `FE:08:…:11` |
+| WeeChat | `irc.server.<name>.tls_fingerprint` | bare hex, no colons, 64 chars: `fe08…11` |
+| Halloy | `root_cert_path` — no pinning; see [GUI clients](#gui-clients) | n/a |
+
+Lowercasing and stripping the colons for irssi produces `Pinned certificate
+mismatch` against a fingerprint that is byte-for-byte correct.
 
 The token goes in the server-password field, or as the SASL PLAIN password if
 your client prefers that (`sasl` is advertised; only PLAIN is supported).
@@ -75,6 +90,22 @@ Worth doing before anything else, because JOIN replays history:
 # WeeChat — on by default in recent versions, but confirm
 /set irc.server_default.capabilities "server-time,message-tags,sasl"
 ```
+
+**Then check that your client actually honours it**, because acknowledging the
+capability and rendering it are two different things. irssi 1.4.5 negotiates
+`server-time` and then timestamps replayed messages with the moment they
+arrived anyway — every line of a JOIN replay reads as "just now", which is the
+precise failure the capability exists to prevent. The gateway is not the
+variable here: on the wire each message carries `@time=` with the instant it
+crossed the relay, which you can confirm without a client at all —
+
+```bash
+# after JOIN, every replayed PRIVMSG should carry a tag with an OLD timestamp
+… | grep -o '^@time=[^;]*' | sort -u
+```
+
+— so if the times on screen are all identical and all recent, the tag was
+delivered and discarded, and the fix belongs in the client.
 
 The gateway advertises three IRCv3 capabilities and implements exactly those:
 
@@ -155,6 +186,53 @@ is running. `/msg publicai-1767991` addresses that one window and never fans out
 Presence semantics stay owned by the MCP server alone. That is deliberate:
 duplicating the flock protocol in a second implementation is exactly how two
 processes end up disagreeing about who is live.
+
+### GUI clients
+
+Terminal clients pin a fingerprint; most graphical ones don't offer pinning at
+all, and the usual workaround — a checkbox that accepts any certificate — throws
+away the protection instead of configuring it. There is a better path, because
+`--init-tls` marks the certificate `CA:TRUE` with `keyCertSign` so it validates
+as **its own trust anchor**. A client that lets you nominate a root certificate
+can therefore do full chain and hostname verification against exactly one
+certificate: yours.
+
+[Halloy](https://halloy.chat) is the one to reach for. It ships as a plain
+tarball, so nothing is snap- or flatpak-confined and it reads your real config
+paths:
+
+The archive is laid out as a `~/.local` prefix (`bin/halloy` plus a `.desktop`
+entry and icons under `share/`), so extracting it there installs the binary and
+registers the launcher in one step:
+
+```bash
+v=2026.8   # check the releases page; the asset name carries the version
+curl -fsSL "https://github.com/squidowl/halloy/releases/download/$v/halloy-$v-x86_64-linux.tar.gz" \
+  | tar -xzf - -C ~/.local
+```
+
+```toml
+# ~/.config/halloy/config.toml
+[servers.dispatch]
+server    = "localhost"          # must match a SAN on the certificate
+port      = 6697
+use_tls   = true
+root_cert_path = "~/.config/mcp-dispatch/irc-cert.pem"
+nickname  = "you"
+
+[servers.dispatch.sasl.plain]
+username = "you"
+password_keyring = true          # the token lives in the system keyring
+```
+
+Note `password_keyring`: the token is read/write on every conversation on this
+host, and this is the one client path that keeps it out of a plaintext config
+file. Put it in the keyring under the entry Halloy names and it never touches
+disk in the clear.
+
+`server` has to match a name the certificate covers — `localhost`, this host's
+name, or an address in `--tls-hosts`. Pointing it at `127.0.0.1` when the SAN
+says `localhost` fails verification, correctly.
 
 ## Security
 

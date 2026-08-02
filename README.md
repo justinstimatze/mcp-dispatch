@@ -15,7 +15,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Durable nicks** — the id behind the pid (`publicai`, not `publicai-1767991`) is registered and never reaped, so a teammate stays discoverable and addressable while offline. A DM to a nick reaches its live sessions, or waits for the next one. See [durable identity](#durable-identity-nicks-that-outlive-a-session).
-- **Live tail & TUI** — `bin/dispatch-tail` streams every message across the relay (local + cross-host) to a terminal, IRC-style; `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick.
+- **TUI** — `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick. It needs no listener and no configuration: it is the way to look at the bus without opening a port.
 - **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, TLS required on every TCP listener (loopback included), and a hard refusal to serve a public address at all without asking. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
@@ -354,25 +354,18 @@ resolves, so wiring it globally is safe.
 
 ### Watching the relay
 
-To watch messages flow by like an IRC channel, run the live tail in a spare
-terminal:
+Two ways to watch messages flow by, and one to take a snapshot.
 
-```bash
-bin/dispatch-tail              # follow new traffic from now on
-bin/dispatch-tail --replay     # print what's already queued, then follow
-bin/dispatch-tail --interval 0.5   # poll faster (default 1.0s)
-bin/dispatch-tail --no-git     # local inboxes only, ignore the git bus
-```
+`tui/dispatch-tui` is the zero-setup option: no listener, no token, no config.
+It shows the whole bus — local inboxes plus the cross-host git lanes, with
+git-origin messages marked «remote» — and flags `must_read` (🔒), urgent (‼) and
+high (!) priority, thread ids, and structured `payload` types. A broadcast shows
+once, not once per recipient. It finds the relay from your config like the
+server does (override with `MCP_DISPATCH_DIR`).
 
-Each message prints once as a one-liner — `time  from → to  content` — with
-flags for `must_read` (🔒), urgent (‼) and high (!) priority, the thread id, and
-any structured `payload` type. A broadcast shows as a single line (its `to`
-reads `all` or `#channel`), not one per recipient. When [cross-host
-comms](#cross-host-comms-git-transport) are enabled it also reads the git bus
-lanes, so the feed shows the whole cross-host bus — including traffic bound for
-other hosts — with git-origin messages marked «remote». It's read-only — never
-acks or deletes, and never fetches (the daemon owns that) — and finds the relay
-from your config like the server does (override with `MCP_DISPATCH_DIR`).
+`bin/dispatch-ircd` serves that same view to any IRC client, where the `&dispatch`
+channel is the scrolling firehose. That buys mobile clients and a bouncer, at
+the cost of running a listener — see [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 
 For a point-in-time snapshot instead of a stream — who's live, their channel
 subscriptions, and unread counts — run `bin/dispatch-status`.

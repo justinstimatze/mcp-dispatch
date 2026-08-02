@@ -64,8 +64,17 @@ type Config struct {
 	BanSeconds      int     `toml:"ban_seconds"`
 	Interval        float64 `toml:"interval"`
 	History         int     `toml:"history"`
-	ReadGit         bool    `toml:"read_git"`
+	// ReadGit is a pointer because its documented default is *true*, and a
+	// plain bool cannot tell "absent" from "read_git = false" — the zero value
+	// silently meant false, so an unset key disabled the cross-host feed while
+	// the docs promised the opposite. Read it through ReadGitEnabled, never
+	// directly, so a zero Config still gets the documented default.
+	ReadGit *bool `toml:"read_git"`
 }
+
+// ReadGitEnabled reports whether the cross-host git lanes should be read.
+// Absent means true: an omitted key is not a request to disable the feed.
+func (c Config) ReadGitEnabled() bool { return c.ReadGit == nil || *c.ReadGit }
 
 type fileConfig struct {
 	IRC Config `toml:"irc"`
