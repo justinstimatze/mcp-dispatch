@@ -12,7 +12,8 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Tasks** — `task('create', title=…, target='#eng')` posts a claimable work item. Claiming is atomic (an `O_EXCL` create — exactly one agent wins a race), and the announcement is an ordinary message, so it wakes parked sessions and crosses hosts through the paths that already exist.
 - **Structured payloads** — Attach machine-readable data alongside human-readable messages.
 - **TTL & must_read** — Time-sensitive messages auto-expire. Critical messages survive until acknowledged.
-- **Delivery receipts** — `peek()` shows read/unread state of messages you've sent.
+- **Delivery receipts** — `peek()` shows whether messages you've sent were read,
+  are still waiting, or expired unread.
 - **`$PWD`-derived identity** — `bin/dispatch-launcher` gives each session a `<project>-<pid>` id with no per-window config.
 - **Durable nicks** — the id behind the pid (`publicai`, not `publicai-1767991`) is registered and never reaped, so a teammate stays discoverable and addressable while offline. A DM to a nick reaches its live sessions, or waits for the next one. See [durable identity](#durable-identity-nicks-that-outlive-a-session).
 - **TUI** — `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick. It needs no listener and no configuration: it is the way to look at the bus without opening a port.
@@ -155,6 +156,14 @@ The response includes `queued_to` — the inboxes the message was written to
 receipt*: it says the message is durably waiting, not that anyone has looked at
 it. To confirm it was read, check `sent_receipts` in your next `peek()` — a
 recipient flips the message from `pending` to `read` when they read it.
+
+A third state, `expired`, means the TTL elapsed with nobody ever reading it.
+Expiry used to delete the message, and since receipts are built by reading those
+same files the receipt disappeared too — indistinguishable from an acked message,
+which also disappears. Now what is left behind is a tombstone: enough to say the
+message was never read, without the content, which is genuinely gone. `peek()`
+lists those ids under `expired_unread`. `must_read=true` opts out of expiry
+entirely.
 
 ### channels
 

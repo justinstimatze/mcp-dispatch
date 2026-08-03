@@ -196,6 +196,14 @@ class GitBridge:
                     continue
                 if msg.get("_via") == "git":
                     continue  # arrived over git — never echo back
+                if msg.get("state") == "expired":
+                    # A tombstone is local bookkeeping — the record that this
+                    # message was never read — not a message to transmit. Narrow
+                    # window, but real: a daemon down across a message's whole TTL
+                    # comes back to find it unledgered and would publish the
+                    # remains, delivering a truncated body to another host past
+                    # the deadline its sender set.
+                    continue
                 yield msg
 
     def _outbound(self) -> int:

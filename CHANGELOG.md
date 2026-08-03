@@ -28,6 +28,30 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Fixed
+- **An expired message took its own delivery receipt with it.** `_cleanup_expired`
+  unlinked the file, and `_get_sent_receipts` builds the sender's receipts by
+  reading those same files — so the receipt vanished along with the message. A
+  sender who checked before the deadline saw `state: pending`; afterwards they
+  saw nothing at all, which is exactly what an acked message looks like, since
+  `ack()` deletes too. The two outcomes furthest apart in meaning — *read and
+  handled* versus *never read by anyone* — were byte-identical from the sender's
+  side, and the natural reading of a missing receipt is the wrong one.
+
+  A message that expires while still `pending` now leaves a tombstone: id,
+  addressing, timestamps, a 120-character preview, `state: "expired"` and
+  `expired_at`. The sender's receipt reports it, and `peek()` gathers the ids
+  under `expired_unread` with a note saying the content is gone and a resend is
+  the only recourse. Messages that expire *after* being read are still deleted
+  outright — the receipt said `read`, that was true, and there is nothing further
+  to tell.
+
+  The tombstone is bookkeeping for the sender, never mail: `_read_inbox` skips it
+  unless asked for by name, so a recipient is not offered something they can no
+  longer act on, and `iter_pending` already excluded it by state, so no unread
+  count moves. It is dropped a week after expiry. The git bridge skips it too —
+  a narrow window, but a daemon down across a message's whole TTL would come back
+  to find the tombstone unledgered and publish the remains to another host, past
+  the deadline its sender set.
 - **Mail orphaned after a session started was never adopted.** Inbox inheritance
   ran once, at claim time, on the assumption that a successor arrives to collect
   what its predecessor left. But orphaning is continuous and adoption was not: a

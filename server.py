@@ -153,6 +153,12 @@ NOTIFY_COMMAND = str(CONFIG["notify_command"]).strip()
 NOTIFY_ON = str(CONFIG["notify_on"]).strip().lower()
 INHERIT_INBOX = bool(CONFIG["inherit_inbox"])
 NOTIFY_POLL_SECONDS = 4
+# A message that expires unread leaves a tombstone so the sender's receipt can
+# say so. It is retained this long past expiry, then dropped: a sender who has
+# not looked in a week is not about to. The preview bounds what a 64KB message
+# costs to keep as a record of its own non-delivery.
+TOMBSTONE_TTL = 604800
+TOMBSTONE_PREVIEW = 120
 # How often a live session re-checks for mail orphaned by a dead sibling. Slow on
 # purpose: the condition is rare (a session has to die holding unread mail) and
 # the cost of noticing late is a delay, while the cost of noticing never is the
@@ -701,20 +707,63 @@ _parse_timestamp = dispatch_fs.parse_timestamp
 _is_expired = dispatch_fs.is_expired
 
 
+def _tombstone(msg: dict) -> dict:
+    """What is left of a message that expired before anyone read it.
+
+    Enough for the sender's receipt to name it and no more: the body is cut to a
+    preview, since the point is to record that this was never delivered, not to
+    keep delivering it after the deadline the sender set.
+    """
+    keep = {k: msg.get(k) for k in ("id", "from", "to", "timestamp", "thread_id", "priority")}
+    keep["content"] = (msg.get("content", "") or "")[:TOMBSTONE_PREVIEW]
+    keep["state"] = "expired"
+    keep["expired_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return keep
+
+
 def _cleanup_expired(agent_id: str) -> int:
-    """Remove expired messages from an agent's inbox. Returns count removed."""
+    """Retire expired messages from an agent's inbox. Returns the count retired.
+
+    A message that expired *unread* leaves a tombstone rather than vanishing.
+    Deleting it outright destroyed the only record that it had never been read:
+    `_get_sent_receipts` builds the sender's receipts by reading these very
+    files, so a sender who checked before the deadline saw `state: pending` and
+    afterwards saw nothing at all — indistinguishable from the receipt of a
+    message that was read and acked, which disappears the same way. The natural
+    reading of a missing receipt is "it got handled", which is precisely
+    backwards. Now it reads `state: expired`.
+
+    Messages that expire after being read are still deleted. They carry no
+    information a sender doesn't already have — the receipt said `read`, and that
+    was true.
+    """
     _maybe_sweep_stale_tmp()
     inbox = DISPATCH_DIR / agent_id
-    removed = 0
+    retired = 0
     for f in inbox.glob("*.json"):
         try:
             msg = json.loads(f.read_text())
-            if _is_expired(msg):
-                f.unlink()
-                removed += 1
         except (json.JSONDecodeError, OSError):
-            pass
-    return removed
+            continue
+        state = msg.get("state", "pending")
+        try:
+            if state == "expired":
+                # The tombstone outlives the message, but not forever: a sender
+                # that has not looked in a week is not about to.
+                stamped = dispatch_fs.parse_timestamp(msg.get("expired_at", ""))
+                if stamped > 0 and time.time() > stamped + TOMBSTONE_TTL:
+                    f.unlink()
+                continue
+            if not _is_expired(msg):
+                continue
+            if state == "pending":
+                _atomic_write(f, _tombstone(msg))
+            else:
+                f.unlink()
+            retired += 1
+        except OSError:
+            continue
+    return retired
 
 
 def _read_inbox(
@@ -729,7 +778,13 @@ def _read_inbox(
         except (json.JSONDecodeError, OSError):
             continue
 
-        if state_filter and msg.get("state", "pending") != state_filter:
+        state = msg.get("state", "pending")
+        # A tombstone is bookkeeping for the *sender*, not mail for the reader:
+        # this message never reached them and showing it now would offer
+        # something they cannot act on. It surfaces via sent_receipts instead.
+        if state == "expired" and state_filter != "expired":
+            continue
+        if state_filter and state != state_filter:
             continue
         if thread_id and msg.get("thread_id") != thread_id:
             continue
@@ -1018,16 +1073,17 @@ def _get_sent_receipts(agent_id: str) -> list[dict]:
             try:
                 msg = json.loads(f.read_text())
                 if msg.get("from") == agent_id:
-                    receipts.append(
-                        {
-                            "id": msg["id"],
-                            "to": agent,
-                            "state": msg.get("state", "pending"),
-                            "read_at": msg.get("read_at"),
-                            "sent_at": msg.get("timestamp"),
-                            "preview": msg.get("content", "")[:60],
-                        }
-                    )
+                    rec = {
+                        "id": msg["id"],
+                        "to": agent,
+                        "state": msg.get("state", "pending"),
+                        "read_at": msg.get("read_at"),
+                        "sent_at": msg.get("timestamp"),
+                        "preview": msg.get("content", "")[:60],
+                    }
+                    if rec["state"] == "expired":
+                        rec["expired_at"] = msg.get("expired_at")
+                    receipts.append(rec)
             except (json.JSONDecodeError, OSError):
                 continue
     return receipts
@@ -1336,7 +1392,8 @@ mcp = FastMCP("dispatch", instructions=_instructions)
         "must_read=true prevents auto-expiry. "
         "Returns queued_to — the inboxes written, which is addressing, NOT receipt. "
         "Confirm a message was actually read via peek()'s sent_receipts (state: "
-        "pending vs read). Plus any pending messages for you."
+        "pending, read, or expired — the last meaning its TTL elapsed with nobody "
+        "ever reading it). Plus any pending messages for you."
     ),
 )
 def dispatch_tool(
@@ -1413,6 +1470,16 @@ def peek_tool(
     }
     if receipts:
         result["sent_receipts"] = receipts
+        dead = [r["id"] for r in receipts if r.get("state") == "expired"]
+        if dead:
+            result["expired_unread"] = dead
+            result["expired_unread_note"] = (
+                "These messages you sent reached the addressee's inbox and were "
+                "never read — their TTL elapsed first. Nobody declined them and "
+                "nobody is going to; the content is gone. Resend if it still "
+                "matters, and consider must_read=true or a longer ttl for anything "
+                "that must survive an absence."
+            )
     # Not _with_pending — this already drained the inbox. The arm notice still
     # belongs here, and doubly so: peek is what a session reaches for when it
     # suspects it is missing mail, which is exactly the symptom of being unarmed.
