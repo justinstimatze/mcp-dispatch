@@ -239,6 +239,13 @@ Available targets: {agent_list}.
 # restarted forever; max_concurrent_starts caps how many nicks may be starting
 # at once; after max_failures consecutive failures a nick is parked until the
 # supervisor is restarted.
+#
+# max_concurrent_starts is also a memory-pressure knob, which is not obvious
+# from its name. Two cold starts in one tick on a loaded box pushed the dispatch
+# server's registration to 57s — past the window a session waits for MCP startup
+# — so both agents came up with a connected server exposing no tools, said so,
+# and exited. Set it to 1 on a box that is swapping; the retries succeeded in 5s
+# each once they were staggered.
 # cooldown = 60.0
 # max_starts_per_hour = 12
 # max_concurrent_starts = 2

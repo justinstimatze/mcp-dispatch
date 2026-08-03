@@ -570,6 +570,19 @@ The prompt is a constant in the script. Nothing from the message reaches it —
 the woken agent finds out what it was sent by asking the relay, exactly as a
 human-started session does.
 
+It also waits for its tools. A woken agent whose dispatch server has not finished
+registering is worse than one that fails to start: it comes up, finds a connected
+server exposing nothing, correctly reports that it cannot do the job, and exits —
+spending a session and a slot in the failure breaker. The first real wake hit
+exactly that, twice, when two nicks started in the same tick on a swapping box
+and registration took 57 seconds. So the script raises `MCP_TIMEOUT` and
+`MCP_CONNECT_TIMEOUT_MS` well past their defaults: nobody is waiting on a
+supervised start, which makes patience nearly free here in a way it is not for an
+interactive session. Override either from the allowlist's `env` table.
+
+The other half of that fix is `max_concurrent_starts`, which reads like a
+throughput knob and is really a memory-pressure one — see `config.example.toml`.
+
 Two config interactions worth knowing. With `inherit_inbox = false` a successor
 session adopts nothing, so the trigger narrows to the nick's own inbox — the one
 a new session is handed directly — because starting an agent for mail it cannot

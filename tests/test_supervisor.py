@@ -812,3 +812,43 @@ def test_the_runtime_refuses_a_project_that_is_not_there(tmp_path):
         env={**os.environ, "DISPATCH_AGENT_CLAUDE": str(stub)},
     )
     assert r.returncode == 64
+
+
+def test_a_woken_agent_waits_for_its_tools(tmp_path):
+    """A session that starts before its dispatch server registers finds a
+    connected server exposing no tools, reports that it cannot work, and exits —
+    burning a start and a slot in the failure breaker for nothing. Observed on
+    the first real wake. Nobody is waiting on a supervised start, so it can
+    afford to be patient in a way an interactive session cannot."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    stub = tmp_path / "claude-stub"
+    env_out = tmp_path / "env.txt"
+    stub.write_text(f"#!/usr/bin/env bash\nenv > {env_out}\n")
+    stub.chmod(0o755)
+    subprocess.run(
+        [str(RUNTIME), str(project)],
+        capture_output=True,
+        env={**os.environ, "DISPATCH_AGENT_CLAUDE": str(stub)},
+    )
+    seen = dict(line.split("=", 1) for line in env_out.read_text().splitlines() if "=" in line)
+    assert int(seen["MCP_TIMEOUT"]) >= 60000
+    assert int(seen["MCP_CONNECT_TIMEOUT_MS"]) >= 60000
+
+
+def test_the_operators_env_still_wins_over_the_patience_defaults(tmp_path):
+    """These are defaults, not policy. A nick that needs a different budget sets
+    it in the allowlist's env table and that value must survive."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    stub = tmp_path / "claude-stub"
+    env_out = tmp_path / "env.txt"
+    stub.write_text(f"#!/usr/bin/env bash\nenv > {env_out}\n")
+    stub.chmod(0o755)
+    subprocess.run(
+        [str(RUNTIME), str(project)],
+        capture_output=True,
+        env={**os.environ, "DISPATCH_AGENT_CLAUDE": str(stub), "MCP_TIMEOUT": "5000"},
+    )
+    seen = dict(line.split("=", 1) for line in env_out.read_text().splitlines() if "=" in line)
+    assert seen["MCP_TIMEOUT"] == "5000"

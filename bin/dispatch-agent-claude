@@ -99,6 +99,23 @@ if [[ "${DISPATCH_AGENT_FULL_MCP:-0}" != "1" ]]; then
          "{\"mcpServers\":{\"dispatch\":{\"command\":\"$LAUNCHER\"}}}")
 fi
 
+# Wait for the dispatch server before reasoning.
+#
+# A woken agent whose tools have not registered yet is worse than one that fails
+# to start: it comes up, finds a connected server exposing nothing, correctly
+# reports that it cannot do the job, and exits — burning a session and a slot in
+# the failure breaker. Seen on the first real wake, where two nicks started at
+# once on a swapping box and the server took 57s to register; both first attempts
+# died toolless and both retries succeeded in 5s.
+#
+# A supervised start has nobody waiting on it, so patience is close to free here
+# in a way it is not for an interactive session. Only set what the operator has
+# not already set, so the allowlist's env table still wins.
+: "${MCP_TIMEOUT:=180000}"                 # server startup budget, ms
+: "${MCP_CONNECT_TIMEOUT_MS:=180000}"      # newer name for the same thing
+: "${MCP_CONNECTION_NONBLOCKING:=false}"   # block until servers are up, if honoured
+export MCP_TIMEOUT MCP_CONNECT_TIMEOUT_MS MCP_CONNECTION_NONBLOCKING
+
 echo "[$(date -u +%FT%TZ)] waking $(basename "$project") in $project" >&2
 # `--` is load-bearing: --allowed-tools and --mcp-config are both variadic, so
 # without it the prompt is swallowed as one more value and claude tries to open

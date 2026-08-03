@@ -152,6 +152,26 @@ change under a running install:
   by asking the relay, which is the same path a human-started session takes.
 
 ### Fixed
+- **A woken agent could come up before its tools did, and burn a start saying
+  so.** The first wake of two real nicks started both in the same tick on a box
+  at 12 GiB used and 9.7 GiB swapped. The dispatch server took 57 seconds to
+  register — past the window a session waits for MCP startup — so each agent
+  came up holding a server that `claude mcp list` called `✔ Connected` while
+  exposing no tools at all. Both did the right thing: reported that they could
+  not read the mail they had been woken for, and exited. Both retries, staggered,
+  were live in 5 seconds.
+
+  Fixed from both ends. `dispatch-agent-claude` now raises `MCP_TIMEOUT` and
+  `MCP_CONNECT_TIMEOUT_MS` to 180s, because nobody is waiting on a supervised
+  start and patience is nearly free there in a way it is not for an interactive
+  session; the allowlist's `env` table still overrides. And `max_concurrent_starts`
+  is documented as the memory-pressure knob it actually is rather than the
+  throughput knob it looks like — set it to 1 on a swapping box.
+
+  The failure was self-healing and bounded, which is the part worth keeping: a
+  toolless agent costs one start and one slot of the five-failure breaker, not a
+  lost message. Nothing was dropped in the incident — both nicks' mail was
+  answered and acked on the retry.
 - **`dispatch-supervise check` claimed a never-seen nick could not fire.** The
   warning read "it will only ever fire once some session has used that id",
   which is false: the trigger reads inboxes, and dispatching to an unknown name
