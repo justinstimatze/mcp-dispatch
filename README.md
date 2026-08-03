@@ -551,14 +551,20 @@ and it is a separate file because that answer is local policy — which model,
 which tools, how much a woken agent is trusted to do.
 
 It comes up **stripped**: `--strict-mcp-config` with dispatch as the only server,
-and an `--allowed-tools` list holding only the dispatch tools. A full session
-here loads ten MCP servers; a triage session needs one. That gap is most of the
-reason to run agents on demand instead of leaving them resident, so waking a
-fully-loaded session would spend the win back on arrival. A woken agent has no
-file or shell tools, and is told to say so rather than improvise if a message
+and an `--allowed-tools` list holding only the dispatch tools. A woken agent has
+no file or shell tools, and is told to say so rather than improvise if a message
 asks for real work. Widen it per nick with `DISPATCH_AGENT_TOOLS` in the
-allowlist's `env` table if you want one that can act; the defaults assume you
-do not.
+allowlist's `env` table if you want one that can act; the defaults assume you do
+not.
+
+Be clear about what that saves, because it is easy to overstate. Measured on a
+15 GiB box with seven sessions up: a session's MCP servers are 80–96 MiB PSS and
+the `claude` process itself is 410–720 MiB. Stripping removes eight of nine
+servers, which is real but is the smaller share — **the memory case for the
+supervisor is not running the session at all**, and that holds whether the woken
+one is stripped or not. What stripping actually buys is a cheaper, faster
+transient, and a remote-triggered process that never holds file or shell tools
+to begin with. The second one is not a percentage.
 
 The prompt is a constant in the script. Nothing from the message reaches it —
 the woken agent finds out what it was sent by asking the relay, exactly as a

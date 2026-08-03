@@ -132,15 +132,21 @@ change under a running install:
   which reads its mail, replies, and exits.
 
   It comes up **stripped** — `--strict-mcp-config` with dispatch as the only
-  server, and an allowed-tools list holding only the dispatch tools. A full
-  session on a developer box loads every MCP server configured; a triage session
-  needs one. That difference is most of the reason to start agents on demand
-  rather than leave them resident, so waking a fully-loaded session would spend
-  the win back on arrival. A woken agent therefore has no file or shell tools,
-  and is told to say so rather than improvise if a message asks for real work.
-  `DISPATCH_AGENT_TOOLS`, `DISPATCH_AGENT_MODEL`, `DISPATCH_AGENT_MAX_TURNS` and
-  `DISPATCH_AGENT_FULL_MCP` widen it per nick from the allowlist's `env` table —
-  operator-set, never message-set, and none of them the default.
+  server, and an allowed-tools list holding only the dispatch tools. A woken
+  agent therefore has no file or shell tools, and is told to say so rather than
+  improvise if a message asks for real work. `DISPATCH_AGENT_TOOLS`,
+  `DISPATCH_AGENT_MODEL`, `DISPATCH_AGENT_MAX_TURNS` and `DISPATCH_AGENT_FULL_MCP`
+  widen it per nick from the allowlist's `env` table — operator-set, never
+  message-set, and none of them the default.
+
+  What stripping saves is worth stating accurately, because the first version of
+  this note overstated it. Measured on a 15 GiB box with seven sessions up: a
+  session's MCP servers are 80–96 MiB PSS, the `claude` process itself is
+  410–720 MiB. Dropping eight of nine servers is real and it is the smaller
+  share — the memory case for the supervisor is *not running the session at
+  all*, which holds whether the woken one is stripped or not. Stripping buys a
+  cheaper and faster transient, and a remote-triggered process that never holds
+  file or shell tools. Only the first of those is a percentage.
 
   The prompt is a constant in the script. A woken agent learns what it was sent
   by asking the relay, which is the same path a human-started session takes.

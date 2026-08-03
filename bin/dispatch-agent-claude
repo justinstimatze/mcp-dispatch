@@ -23,10 +23,15 @@
 #     by you. A woken agent learns what it was sent by *asking the relay*, which
 #     is the same path a human-started session uses.
 #   * It comes up stripped. Only the dispatch MCP server is loaded, and only the
-#     dispatch tools are allowed. A full session on this host loads ten servers;
-#     a triage session needs one. That difference is most of the reason to run
-#     agents on demand rather than leave them resident, so spending it back by
-#     waking a fully-loaded session would defeat the point.
+#     dispatch tools are allowed. A full session on this host runs 8-9 servers;
+#     a triage session needs one.
+#
+#     Measured on a 15 GiB box: the servers are 80-96 MiB PSS per session and the
+#     claude process itself is 410-720 MiB, so stripping saves the smaller share.
+#     The memory case for the supervisor is not running the session at all; what
+#     stripping buys is a cheaper and faster transient, and — the part that is
+#     not a percentage — a remote-triggered process that holds no file or shell
+#     tools in the first place.
 #
 # Knobs, all set from the allowlist's `env` table (operator-controlled, never
 # message-controlled):
