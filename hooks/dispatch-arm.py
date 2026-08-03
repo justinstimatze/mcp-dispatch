@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 
 # subprocess only runs the opt-in, local-config notify_command as an argv list
@@ -53,6 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
 
 MAX_BLOCKS = 2  # consecutive Stop blocks before degrading, so a bad launch can't wedge
 # On SessionStart the MCP server may not have claimed presence yet, so id
@@ -71,7 +71,7 @@ def _resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
     if explicit:
         return explicit
 
-    prefix = re.sub(r"^-*", "", re.sub(r"[^a-z0-9-]", "", os.path.basename(cwd).lower()))
+    prefix = dispatch_fs.nick_for_dir(cwd)
     if not prefix:
         return None
     presence = dispatch_dir / ".presence"

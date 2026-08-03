@@ -163,6 +163,34 @@ change under a running install:
   `~/Documents` next to its name is something a sender can act on; `documents-3556967`
   on its own is not, especially beside a `documents-4125273` from another host.
 
+- **The supervisor says when an allowlist entry points at the wrong directory.**
+  A session claims a nick derived from its launch directory's name, so an entry
+  aimed at `~/Documents` rather than `~/Documents/stope` starts cleanly, registers
+  as `documents`, and leaves `stope` offline with its mail untouched. Every part
+  of that looks like success — the process spawns, exits zero, and the nick is
+  woken again on the next tick until the breaker parks it after five.
+
+  The registry record now carries `last_cwd`, so both ends can compare where an
+  entry starts against where the nick has actually been claimed.
+  `dispatch-supervise check` reports the mismatch before anything is spent, and
+  the park line names it rather than reporting `no presence after 120s` and
+  leaving the cause to be traced. `supervisor.misconfig_hint` is the one
+  implementation behind both, and it stays quiet whenever the answer would be a
+  guess: no recorded directory, no discernible launch directory, or two
+  directory-shaped arguments to choose between.
+
+  Enforcement was considered and dropped. Refusing to start on a mismatch
+  deadlocks the legitimate case — move a project, update the allowlist, and the
+  recorded directory disagrees for a good reason — and the breaker already bounds
+  the damage at five sessions. The gap was never the stop; it was that nothing
+  said why.
+- **`dispatch_fs.nick_for_dir`** — the launcher computes the nick from `$PWD` in
+  shell, before it can import anything, which meant the rule also lived in two
+  Python copies. It is now one function plus the shell original, with
+  `tests/test_launcher.py` running the real launcher across awkward directory
+  names and asserting the two agree. `hooks/dispatch-peek.py` keeps its own copy
+  on purpose — it is deliberately standalone, with no repo imports at all.
+
 ### Fixed
 - **Inbox inheritance could cross hosts.** `_inherit_orphan_inbox` adopts pending
   mail from dead sessions sharing a nick, which is right for `stope-3218326` →

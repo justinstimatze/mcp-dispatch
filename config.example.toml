@@ -262,3 +262,33 @@ Available targets: {agent_list}.
 # command = ["/home/you/bin/start-publicai"]   # argv list; command[0] absolute
 # cwd = "/home/you/code/publicai"              # optional
 # env = { SOME_KEY = "value" }                 # optional, overlays the daemon's
+#
+# The section name and the directory have to agree, and nothing enforces it: a
+# session started in `cwd` claims a nick derived from that directory's *name*.
+# Aim an entry one level too high — at ~/Documents rather than ~/Documents/stope
+# — and the start succeeds, the session registers as `documents`, the nick
+# `stope` never goes live, and the mail it was woken for is never inherited.
+# `dispatch-supervise check` compares the two and says so, and the supervisor
+# repeats it when the breaker parks the nick.
+
+# What a woken agent may do — deliberately narrow, per nick.
+#
+# The default runtime (bin/dispatch-agent-claude) allows only the dispatch tools:
+# a woken agent can read its mail, reply, ack, and nothing else. That is not
+# about memory. It is because this is the one process on the box whose reason for
+# existing arrived over the wire — an unattended session, started by a message,
+# from a sender that (over the git bus) need not even be on this host.
+#
+# So a woken agent can triage but cannot verify. Asked "does this change break
+# the generator?", it answers with a reasoned prior and says it could not grep.
+# If that trade is wrong for one project, widen that project and no other:
+#
+# [supervisor.agents.stope]
+# command = ["/abs/path/to/mcp-dispatch/bin/dispatch-agent-claude", "/home/you/code/stope"]
+# env = { DISPATCH_AGENT_TOOLS = "mcp__dispatch__peek mcp__dispatch__ack mcp__dispatch__dispatch mcp__dispatch__who mcp__dispatch__digest Read Grep Glob" }
+#
+# Read and Grep cost no memory — they are built into the harness, not MCP servers.
+# What they cost is the exfiltration path: a hostile message can now steer the
+# session into reading a file and putting it on the bus. Bash and Write are a
+# different question again, and the answer here is no; if you want them, you want
+# a full session, not a woken one.

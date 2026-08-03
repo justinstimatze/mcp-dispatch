@@ -151,6 +151,23 @@ def durable_nick(agent_id: str) -> str:
     return m.group("nick") if m else agent_id
 
 
+def nick_for_dir(cwd: str) -> str:
+    """The nick a session launched in `cwd` will claim: ``~/code/webapp`` → ``webapp``.
+
+    The rule lives in bin/dispatch-launcher, which computes it in shell before it
+    can import anything. This is the Python half of that pair — kept identical so
+    the supervisor can answer "what would a session started here actually be
+    called?" without launching one. tests/test_launcher.py runs the real launcher
+    and asserts the two agree; change one and change the other.
+
+    Returns "" when the directory name has no usable characters, which is the
+    launcher's `base="agent"` case — the caller decides what to do about it
+    rather than being handed a plausible-looking wrong answer.
+    """
+    base = re.sub(r"^-*", "", re.sub(r"[^a-z0-9-]", "", os.path.basename(cwd.rstrip("/")).lower()))
+    return base[:50]
+
+
 def live_nicks(dispatch_dir: Path) -> set[str]:
     """Durable nicks with at least one live session right now."""
     return {durable_nick(aid) for aid in live_agents(dispatch_dir)}

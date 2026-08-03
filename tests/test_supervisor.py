@@ -852,3 +852,114 @@ def test_the_operators_env_still_wins_over_the_patience_defaults(tmp_path):
     )
     seen = dict(line.split("=", 1) for line in env_out.read_text().splitlines() if "=" in line)
     assert seen["MCP_TIMEOUT"] == "5000"
+
+
+# ---------------------------------------------------------------------------
+# where an entry starts vs where its nick actually lives
+# ---------------------------------------------------------------------------
+
+
+def _register(dd, nick, cwd):
+    """A registry record as server.py writes one when a session claims the nick."""
+    agents = dd / ".agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / f"{nick}.json").write_text(
+        json.dumps({"nick": nick, "sessions": 1, "last_cwd": cwd, "last_session_id": f"{nick}-1"})
+    )
+
+
+def test_launch_dir_reads_the_project_out_of_argv(tmp_path):
+    proj = tmp_path / "stope"
+    proj.mkdir()
+    spec = _spec(nick="stope", command=["/bin/true", str(proj)])
+    assert supervisor.launch_dir(spec) == str(proj)
+
+
+def test_an_explicit_cwd_wins_over_a_positional(tmp_path):
+    proj = tmp_path / "stope"
+    proj.mkdir()
+    spec = _spec(nick="stope", command=["/bin/true", str(proj)], cwd="/elsewhere")
+    assert supervisor.launch_dir(spec) == "/elsewhere"
+
+
+def test_two_directory_arguments_are_not_guessed_between(tmp_path):
+    """A confident warning about the wrong path is worse than none."""
+    a, b = tmp_path / "one", tmp_path / "two"
+    a.mkdir()
+    b.mkdir()
+    spec = _spec(nick="stope", command=["/bin/true", str(a), str(b)])
+    assert supervisor.launch_dir(spec) == ""
+
+
+def test_a_mismatch_between_config_and_registry_is_named(tmp_path):
+    """The incident this exists for: an entry aimed one directory too high.
+
+    A session started in the parent registers under the parent's name, so the
+    nick the supervisor waits for never goes live and the mail is never
+    inherited — while the start itself looks fine.
+    """
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    parent = tmp_path / "Documents"
+    (parent / "stope").mkdir(parents=True)
+    _register(dd, "stope", str(parent / "stope"))
+
+    spec = _spec(nick="stope", command=["/bin/true", str(parent)])
+    hint = supervisor.misconfig_hint(dd, spec)
+    assert "registers as 'documents'" in hint
+    assert "not 'stope'" in hint
+    assert str(parent / "stope") in hint, "say where the nick does live, not just that it doesn't"
+
+
+def test_a_matching_directory_says_nothing(tmp_path):
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    proj = tmp_path / "stope"
+    proj.mkdir()
+    _register(dd, "stope", str(proj))
+    assert (
+        supervisor.misconfig_hint(dd, _spec(nick="stope", command=["/bin/true", str(proj)])) == ""
+    )
+
+
+def test_a_nick_never_claimed_anywhere_is_not_second_guessed(tmp_path):
+    """No recorded directory means no evidence, and no evidence means no claim —
+    a new project allowlisted before it is ever opened must not be warned about."""
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    proj = tmp_path / "brandnew"
+    proj.mkdir()
+    assert (
+        supervisor.misconfig_hint(dd, _spec(nick="brandnew", command=["/bin/true", str(proj)]))
+        == ""
+    )
+
+
+def test_the_park_says_why_when_the_directory_is_the_reason(tmp_path):
+    """`no presence after 120s` is the symptom. The cause goes next to it."""
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    parent = tmp_path / "Documents"
+    (parent / "stope").mkdir(parents=True)
+    _register(dd, "stope", str(parent / "stope"))
+    _plant(dd, "stope", mid="m1")
+
+    cfg = _cfg(
+        agents={"stope": _spec(nick="stope", command=["/bin/false", str(parent)])},
+        log_dir=tmp_path / "logs",
+        cooldown=0.01,
+        max_failures=2,
+    )
+    lines: list[str] = []
+    sup = supervisor.Supervisor(dd, cfg, log=lines.append)
+    for _ in range(20):
+        sup.tick()
+        if sup.states["stope"].parked:
+            break
+        time.sleep(0.05)
+
+    assert sup.states["stope"].parked
+    assert any("PARKED" in line for line in lines)
+    assert any("registers as 'documents'" in line for line in lines), (
+        "a park with a knowable cause must name it"
+    )

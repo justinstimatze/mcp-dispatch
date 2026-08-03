@@ -565,6 +565,15 @@ asks for real work. Widen it per nick with `DISPATCH_AGENT_TOOLS` in the
 allowlist's `env` table if you want one that can act; the defaults assume you do
 not.
 
+That default has a cost worth naming, because you will meet it. A woken agent can
+triage but cannot verify: asked whether a proposed change breaks something, it
+answers with a reasoned prior and tells you it could not grep. Adding `Read` and
+`Grep` to one nick's `DISPATCH_AGENT_TOOLS` fixes that for zero memory — they are
+built into the harness, not MCP servers. What it costs is an exfiltration path
+that does not exist today, since a hostile message could then steer the session
+into reading a file and putting it on the bus. That is a per-project judgement,
+which is why it is a per-nick knob and not a default.
+
 Be clear about what that saves, because it is easy to overstate. Measured on a
 15 GiB box with seven sessions up: a session's MCP servers are 80–96 MiB PSS and
 the `claude` process itself is 410–720 MiB. Stripping removes eight of nine
@@ -590,6 +599,16 @@ interactive session. Override either from the allowlist's `env` table.
 
 The other half of that fix is `max_concurrent_starts`, which reads like a
 throughput knob and is really a memory-pressure one — see `config.example.toml`.
+
+**The section name and the directory have to agree.** A session claims a nick
+derived from its launch directory's name, so an entry aimed one level too high —
+`~/Documents` rather than `~/Documents/stope` — starts cleanly, registers as
+`documents`, and leaves `stope` offline with its mail untouched. The start looks
+like a success and the nick keeps getting woken until the breaker parks it after
+five. Since a registry record now carries the directory a nick was last claimed
+from, both ends say so: `dispatch-supervise check` compares them before you spend
+anything, and the park line names the mismatch instead of reporting `no presence
+after 120s` and leaving you to trace it.
 
 Two config interactions worth knowing. With `inherit_inbox = false` a successor
 session adopts nothing, so the trigger narrows to the nick's own inbox — the one

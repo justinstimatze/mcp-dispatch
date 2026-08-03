@@ -116,6 +116,11 @@ def cmd_check(argv: list[str]) -> int:
                 "spelling. It will still start the first time anyone dispatches to that "
                 "exact name; the trigger is the inbox, not the registry."
             )
+        # Cheaper here than in the journal: a mismatch costs five wasted sessions
+        # and a parked nick before anything says so at runtime.
+        hint = supervisor.misconfig_hint(relay, spec)
+        if not problems and hint:
+            print(f"      ! {hint}")
         bad = bad or bool(problems)
 
     if bad:

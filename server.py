@@ -441,6 +441,12 @@ def _register_agent(agent_id: str) -> dict:
     rec.setdefault("nick", nick)
     rec.setdefault("first_seen", now)
     rec.setdefault("sessions", 0)
+    # Where this nick actually gets claimed from. The supervisor's allowlist says
+    # which directory to start for a nick; this says which directory has ever
+    # produced it. When they disagree the entry starts a session that registers
+    # under some other name, so the mail it was woken for is never inherited and
+    # the start is counted a failure with nothing in the log naming the cause.
+    rec["last_cwd"] = _session_cwd()
     rec["sessions"] = int(rec.get("sessions") or 0) + 1
     # Preserve the watermark BEFORE `last_seen` is overwritten. _release_id
     # stamps `last_seen` on the way out, so the value we are about to destroy is

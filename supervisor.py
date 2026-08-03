@@ -256,6 +256,55 @@ def check_spec(spec: AgentSpec) -> list[str]:
     return problems
 
 
+def launch_dir(spec: AgentSpec) -> str:
+    """The project directory this entry starts a session in, or "" if unclear.
+
+    `command` is arbitrary argv, so there is no field to read: the runtime script
+    takes the project as a positional. Look for exactly one argument that is an
+    existing directory. Zero means we cannot tell; two or more means a guess, and
+    a guess here produces a confident warning about the wrong path — worse than
+    no warning, so both return "".
+    """
+    if spec.cwd:
+        return spec.cwd
+    dirs = [a for a in spec.command[1:] if a.startswith("/") and Path(a).is_dir()]
+    return dirs[0] if len(dirs) == 1 else ""
+
+
+def misconfig_hint(dispatch_dir: Path, spec: AgentSpec) -> str:
+    """Name the mismatch between where an entry starts and where its nick lives.
+
+    The failure this catches is quiet and expensive. Point an entry at the parent
+    of a project and the session it starts claims the parent's name, so the nick
+    the supervisor is waiting for never goes live, the mail never clears, and the
+    start is counted a failure — five times, then parked, with `no presence after
+    120s` as the only explanation. That describes the symptom and names nothing.
+
+    Returns "" whenever the answer would be a guess: no recorded directory (the
+    nick has never been claimed), no discernible launch directory, or a directory
+    whose name yields no usable nick.
+    """
+    configured = launch_dir(spec)
+    if not configured:
+        return ""
+    would_be = dispatch_fs.nick_for_dir(configured)
+    if not would_be:
+        return ""
+    try:
+        rec = json.loads((dispatch_dir / ".agents" / f"{spec.nick}.json").read_text())
+        recorded = str(rec.get("last_cwd") or "")
+    except (json.JSONDecodeError, OSError):
+        return ""
+    if not recorded or os.path.realpath(recorded) == os.path.realpath(configured):
+        return ""
+    return (
+        f"this entry starts a session in {configured}, which registers as "
+        f"'{would_be}', not '{spec.nick}' — that nick has only ever been claimed "
+        f"from {recorded}. As written the start succeeds and the mail is never "
+        f"inherited."
+    )
+
+
 def config_permission_warning(config_path: Path) -> str:
     """Warn if the config — now an execution allowlist — is writable by others.
 
@@ -539,6 +588,12 @@ class Supervisor:
                 f"[supervise] {spec.nick} PARKED after {state.failures} failures. "
                 f"Fix it and restart the supervisor; see {self.cfg.log_dir / spec.nick}.log"
             )
+            # `no presence after 120s` is the symptom. If the config and the
+            # registry disagree about where this nick lives, that is the cause,
+            # and it is the difference between reading a log and reading a diff.
+            hint = misconfig_hint(self.dispatch_dir, spec)
+            if hint:
+                self.log(f"[supervise] {spec.nick}: {hint}")
 
     def _resolve_in_flight(self, spec: AgentSpec, state: NickState, live: bool, now: float) -> None:
         """Decide the fate of a start we are still waiting on."""
