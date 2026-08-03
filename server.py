@@ -153,6 +153,11 @@ NOTIFY_COMMAND = str(CONFIG["notify_command"]).strip()
 NOTIFY_ON = str(CONFIG["notify_on"]).strip().lower()
 INHERIT_INBOX = bool(CONFIG["inherit_inbox"])
 NOTIFY_POLL_SECONDS = 4
+# How often a live session re-checks for mail orphaned by a dead sibling. Slow on
+# purpose: the condition is rare (a session has to die holding unread mail) and
+# the cost of noticing late is a delay, while the cost of noticing never is the
+# message. See _start_sweeper.
+SWEEP_SECONDS = 120
 GROUP_MODE = bool(CONFIG["group_mode"])
 # Directory mode: setgid + group-rwx when sharing, else owner-only. The setgid
 # bit makes inboxes created by any participant inherit the relay's group.
@@ -1164,6 +1169,53 @@ def _start_notifier(agent_id: str) -> None:
     threading.Thread(target=_loop, name="dispatch-notifier", daemon=True).start()
 
 
+def _start_sweeper(agent_id: str) -> None:
+    """Keep adopting orphaned mail for as long as this session lives.
+
+    ``_inherit_orphan_inbox`` ran once, at claim time. But orphaning is
+    continuous and adoption was not: a sibling that dies with unread mail *after*
+    we started leaves it in a directory nobody will open again, and the only
+    thing that would have adopted it — a new session of the same nick — may never
+    be started. Measured on this host before the fix: nine unread messages across
+    five dead inboxes, the oldest six days, three of them belonging to a nick
+    that had two live sessions the entire time.
+
+    Concurrent sweepers are safe for the same reason concurrent successors are:
+    the claim is the ``os.replace``, so a message is adopted exactly once.
+    Adopted mail lands in the inbox by the normal arrival path, so an armed watch
+    wakes the model and the notifier fires, without either knowing this happened.
+
+    The reap of dead presence files is deliberately NOT on this loop. Claiming an
+    identity opens the presence file and then flocks it; a reaper unlinking
+    between those two syscalls leaves the claimant holding a lock on an unlinked
+    inode, and since ``_write_presence`` writes *through* that handle the path
+    stays gone. The session would then be invisible to ``who()``,
+    ``dispatch-status`` and the supervisor — which would start a second session
+    for the nick and race it for this inbox. At startup that window is one shot;
+    on a loop in every session it would be permanent. A stale presence file
+    misleads nobody who filters on the flock, which is every consumer.
+    """
+    if AGENT_IDS or not INHERIT_INBOX:
+        return  # nothing to inherit from: a roster id keeps its inbox across restarts
+    inbox_owner = agent_id
+
+    def _loop() -> None:
+        while True:
+            time.sleep(SWEEP_SECONDS)
+            try:
+                adopted = _inherit_orphan_inbox(inbox_owner)
+            except OSError:
+                continue
+            if adopted:
+                print(
+                    f"[dispatch] adopted {adopted} unread message(s) left by a dead "
+                    f"session of this project — peek() to read them",
+                    file=sys.stderr,
+                )
+
+    threading.Thread(target=_loop, name="dispatch-sweeper", daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Filesystem watcher (stderr alerts for the human operator)
 # ---------------------------------------------------------------------------
@@ -1233,6 +1285,7 @@ signal.signal(signal.SIGTERM, _on_sigterm)
 
 _start_watcher(AGENT_ID)
 _start_notifier(AGENT_ID)
+_start_sweeper(AGENT_ID)
 
 # Build instructions from template. The default below is the load-bearing
 # "when to reach for this" contract — override it via the `instructions` config

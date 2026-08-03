@@ -27,6 +27,37 @@ change under a running install:
   inbox for the next one. Addressing a concrete session id is unchanged. This is
   the fix, but it *is* a behaviour change to an existing call.
 
+### Fixed
+- **Mail orphaned after a session started was never adopted.** Inbox inheritance
+  ran once, at claim time, on the assumption that a successor arrives to collect
+  what its predecessor left. But orphaning is continuous and adoption was not: a
+  sibling that dies with unread mail *after* we started leaves it in a directory
+  nobody will open again, and the only thing that would have adopted it — a new
+  session of that nick — may simply never be started.
+
+  Counted on this host before the fix: nine unread, unexpired messages across
+  five dead inboxes, the oldest six days. Three of them belonged to a nick that
+  had two live sessions the entire time — both had done their one inheritance
+  sweep before those messages were orphaned, so neither would ever look again.
+  Among them a direct question about model access, an executor cutover
+  announcement and a production corpus change.
+
+  Every live session now re-runs the same sweep on a slow loop (`SWEEP_SECONDS`,
+  120s). Same function, same guards; concurrent sweepers are safe for the reason
+  concurrent successors already were, since the claim is the `os.replace`.
+  Adopted mail arrives by the normal path, so an armed watch wakes the model
+  without knowing anything special happened.
+
+  The reap of dead presence files is deliberately *not* on this loop, and there
+  is a test pinning that. Claiming an identity opens the presence file and then
+  flocks it; an unlink between those two syscalls leaves the claimant holding a
+  lock on an unlinked inode, and `_write_presence` writes *through* that handle,
+  so the path stays gone. That session would be invisible to `who()`, to
+  `dispatch-status` and to the supervisor — which would then start a second
+  session for the nick and race it for the same inbox. At startup the window is
+  one shot; on a loop in every session it would be permanent. A stale presence
+  file misleads no consumer, because they all filter on the flock.
+
 ### Added
 - **The server tells its own session when nothing is listening for it.** Every
   dispatch tool result already carries whatever mail arrived while the model was
