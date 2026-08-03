@@ -45,6 +45,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 import digest
+import dispatch_common
 import dispatch_fs
 from notify_policy import should_notify
 
@@ -323,6 +324,11 @@ def _try_lock_presence(pf: Path, agent_id: str) -> bool:
         "agent_id": agent_id,
         "pid": os.getpid(),
         "cwd": _session_cwd(),
+        # Where this session's arm lock lives. Publishing it is what lets another
+        # agent ask whether we are *listening* rather than merely running: the
+        # lock sits under the watcher's own HOME, so a reader resolving it
+        # against theirs would be probing a path that never existed.
+        "state_dir": str(dispatch_common.state_dir()),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "channels": _initial_channels(),
     }
@@ -1396,7 +1402,9 @@ def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
     description=(
         "List agents: those live on this host, plus any reachable cross-host via "
         "the git transport (the 'remote' list — durable delivery, so they may be "
-        "offline right now). dispatch(target=id) reaches either the same way."
+        "offline right now). dispatch(target=id) reaches either the same way. "
+        "Each local agent carries 'armed': false means it is running but holds no "
+        "message watch, so nothing wakes it and a reply waits on its operator."
     ),
 )
 def who_tool() -> dict:
@@ -1412,9 +1420,11 @@ def who_tool() -> dict:
     agents: list[dict] = []
     for pf in _live_presence_files():
         try:
-            agents.append(json.loads(pf.read_text()))
+            rec = json.loads(pf.read_text())
         except (json.JSONDecodeError, OSError):
-            pass
+            continue
+        rec["armed"] = dispatch_common.armed_for(rec, pf)
+        agents.append(rec)
 
     local_ids = {a.get("agent_id") for a in agents}
     remote: list[dict] = []
@@ -1444,6 +1454,16 @@ def who_tool() -> dict:
         "agents": agents,
         "count": len(agents),
     }
+    deaf = [str(a.get("agent_id")) for a in agents if a.get("armed") is False]
+    if deaf:
+        result["unarmed"] = deaf
+        result["unarmed_note"] = (
+            "These sessions are running but hold no message watch, so a message "
+            "lands in the inbox and nothing wakes them; they read it whenever "
+            "their operator next types. Delivery is still durable — nothing is "
+            "lost — but do not expect a reply on any timescale, and do not read "
+            "silence from one as a decision."
+        )
     if remote:
         result["remote"] = remote
         result["remote_count"] = len(remote)

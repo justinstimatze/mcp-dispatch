@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Read-only snapshot of the dispatch relay.
 
-Shows which agent sessions are live (hold their presence lock), their channel
-subscriptions, and how many unread messages sit in each inbox — plus any
-orphaned inboxes (messages whose owner is gone). Touches nothing.
+Shows which agent sessions are live (hold their presence lock), whether each is
+actually listening (holds a message watch), their channel subscriptions, and how
+many unread messages sit in each inbox — plus any orphaned inboxes (messages
+whose owner is gone). Touches nothing.
+
+Live and listening are separate facts. A session with no watch armed collects
+mail it will not notice until its operator next types, and looks healthy from
+every other angle.
 
     bin/dispatch-status            # default relay dir
     MCP_DISPATCH_DIR=... bin/dispatch-status
@@ -40,21 +45,36 @@ def main() -> int:
         return 0
 
     presence = relay / ".presence"
-    live: dict[str, dict] = {}
+    live: dict[str, tuple[dict, Path]] = {}
     for pf in sorted(presence.glob("*.json")):
         try:
             data = json.loads(pf.read_text())
         except (json.JSONDecodeError, OSError):
             continue
         if common.flock_held(pf):
-            live[data.get("agent_id", pf.stem)] = data
+            live[data.get("agent_id", pf.stem)] = (data, pf)
 
     print(f"relay: {relay}")
     print(f"live agents: {len(live)}")
-    for aid, data in live.items():
+    deaf: list[tuple[str, int]] = []
+    for aid, (data, pf) in live.items():
         chans = data.get("channels") or []
         chan_s = "  " + " ".join(f"#{c}" for c in chans) if chans else ""
-        print(f"  {aid}  (pid {data.get('pid')})  unread:{_pending(relay / aid)}{chan_s}")
+        pending = _pending(relay / aid)
+        armed = common.armed_for(data, pf)
+        mark = {True: "", False: "  NOT LISTENING", None: "  listening:?"}[armed]
+        print(f"  {aid}  (pid {data.get('pid')})  unread:{pending}{mark}{chan_s}")
+        if armed is False:
+            deaf.append((aid, pending))
+
+    if deaf:
+        # Live and addressable and asleep at the same time — the state that reads
+        # as healthy from every other angle, and the one that quietly swallows
+        # mail. Waiting on a reply from one of these is waiting on a human.
+        print("live but not listening (no message watch armed):")
+        for aid, count in deaf:
+            print(f"  {aid}  unread:{count}")
+        print("  → these wake when their operator next types, not when mail lands.")
 
     # Orphaned inboxes: a dir with messages but no live owner.
     live_ids = set(live)

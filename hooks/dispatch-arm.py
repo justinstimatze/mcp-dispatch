@@ -89,7 +89,7 @@ def _resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
 
 def _is_armed(agent_id: str) -> bool:
     """True if a live ``dispatch-wait --follow`` holds this agent's arm lock."""
-    return common.flock_held(common.state_dir() / f"wait-{common.md5_key(agent_id)}.lock")
+    return common.armed(agent_id) is True
 
 
 def _block_count(agent_id: str, *, reset: bool = False, bump: bool = False) -> int:

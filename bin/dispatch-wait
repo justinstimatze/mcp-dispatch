@@ -71,7 +71,7 @@ STANDALONE_FALLBACK_SECONDS = 1800.0
 
 
 def _arm_lock_path(agent_id: str) -> Path:
-    return common.state_dir() / f"wait-{common.md5_key(agent_id)}.lock"
+    return common.arm_lock(agent_id)
 
 
 def _notify_on(cli_value: str | None) -> str:

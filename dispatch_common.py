@@ -78,6 +78,62 @@ def md5_key(text: str) -> str:
     return hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()[:8]
 
 
+def arm_lock(agent_id: str, state: Path | None = None) -> Path:
+    """The lock a live ``dispatch-wait --follow`` holds while a session is armed.
+
+    ``state`` overrides the local cache directory, for a reader asking about a
+    session that is not its own: the lock lives under the *watcher's* HOME, so
+    resolving it against ours would answer about a file that was never going to
+    exist there. Sessions record their own state directory in the presence file.
+    """
+    return (state or state_dir()) / f"wait-{md5_key(agent_id)}.lock"
+
+
+def armed(agent_id: str, state: Path | None = None) -> bool | None:
+    """Whether a watch is holding this session's arm lock — the difference
+    between a session that is running and one that will hear you.
+
+    None means unprobeable, not unarmed. Another uid's cache directory is not
+    ours to read, and calling a session deaf on the strength of a permission
+    error would be a confident wrong answer where "can't tell" is the true one.
+    """
+    lock = arm_lock(agent_id, state)
+    try:
+        lock.open().close()
+    except FileNotFoundError:
+        return False  # no watch has ever armed this id
+    except OSError:
+        return None  # someone else's cache, or otherwise not ours to read
+    return flock_held(lock)
+
+
+def armed_for(rec: dict, presence_file: Path) -> bool | None:
+    """``armed()`` for a presence record — the reader's side of the same fact.
+
+    A session with no watch still receives mail; nothing wakes it to read it, so
+    it answers whenever its operator next types. That is a different state from
+    being offline and it deserves a different word.
+
+    Sessions publish their own state directory. Ones started before that field
+    existed get our directory instead, but only when the presence file is ours to
+    begin with: another uid's session resolved against our cache finds no lock
+    and would be reported deaf, which is the one wrong answer worth going out of
+    the way to avoid.
+    """
+    aid = str(rec.get("agent_id") or "")
+    if not aid:
+        return None
+    raw = rec.get("state_dir")
+    if raw:
+        return armed(aid, Path(str(raw)))
+    try:
+        if presence_file.stat().st_uid != os.getuid():
+            return None
+    except OSError:
+        return None
+    return armed(aid)
+
+
 def flock_held(path: Path) -> bool:
     """True if some live process holds an exclusive flock on ``path``. We probe by
     trying to take it: success (we got it) means nobody holds it — release and

@@ -118,3 +118,67 @@ def test_who_shows_where_each_live_session_was_launched(server_factory):
     me = [a for a in s.who_tool()["agents"] if a["agent_id"] == "documents-111"]
     assert me, "self must be live in who()"
     assert me[0]["cwd"] == "/home/x/Documents"
+
+
+# ---------------------------------------------------------------------------
+# Live is not the same as listening. A session holding its presence lock with no
+# message watch armed collects mail nobody wakes it to read — and it looks
+# healthy from every other angle who() reports.
+# ---------------------------------------------------------------------------
+
+
+def test_who_says_whether_each_session_is_listening(server_factory, tmp_path):
+    import dispatch_common as common
+
+    state = tmp_path / "armstate"
+    s = server_factory("alpha", extra_env={"MCP_DISPATCH_STATE_DIR": str(state)})
+    me = [a for a in s.who_tool()["agents"] if a["agent_id"] == "alpha"][0]
+    assert me["armed"] is False, "nothing has armed a watch for this session yet"
+
+    lock = common.arm_lock("alpha", state)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = common.acquire_flock(lock)
+    try:
+        me = [a for a in s.who_tool()["agents"] if a["agent_id"] == "alpha"][0]
+        assert me["armed"] is True
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_a_session_publishes_where_its_arm_lock_lives(server_factory, tmp_path):
+    """Without this field a reader probes its own cache and calls every session
+    on another account deaf."""
+    state = tmp_path / "armstate"
+    s = server_factory("alpha", extra_env={"MCP_DISPATCH_STATE_DIR": str(state)})
+    rec = json.loads((s.DISPATCH_DIR / ".presence" / "alpha.json").read_text())
+    assert rec["state_dir"] == str(state)
+
+
+def test_who_names_the_sessions_that_will_not_hear_you(server):
+    """The point of the field: a sender can tell a live-and-deaf target from a
+    live one before reading silence as an answer."""
+    pf = _make_presence(server, "parked")
+    fh = _lock(pf)
+    try:
+        out = server.who_tool()
+        assert "parked" in out["unarmed"]
+        assert "durable" in out["unarmed_note"], "say the mail is still safe"
+    finally:
+        fh.close()
+
+
+def test_an_all_armed_relay_says_nothing_about_it(server_factory, tmp_path):
+    import dispatch_common as common
+
+    state = tmp_path / "armstate"
+    s = server_factory("alpha", extra_env={"MCP_DISPATCH_STATE_DIR": str(state)})
+    lock = common.arm_lock("alpha", state)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = common.acquire_flock(lock)
+    try:
+        out = s.who_tool()
+        assert "unarmed" not in out, "no warning when there is nothing to warn about"
+    finally:
+        if fh is not None:
+            fh.close()

@@ -25,6 +25,7 @@ _ENV_KEYS = [
     "MCP_DISPATCH_CWD",
     "MCP_DISPATCH_CONFIG",
     "MCP_DISPATCH_CHANNELS",
+    "MCP_DISPATCH_STATE_DIR",
 ]
 
 
@@ -46,6 +47,11 @@ def load_server(dispatch_dir, agent_id="alpha", *, config_path=None, extra_env=N
     os.environ["MCP_DISPATCH_CONFIG"] = str(
         config_path if config_path is not None else dispatch_dir.parent / "no-such-config.toml"
     )
+    # Same reasoning for the arm locks: the session stamps this directory into its
+    # presence record, and who() probes it to answer "is anyone listening". Left
+    # unpinned it would read the developer's real ~/.cache and the answer would
+    # depend on which windows happened to be open.
+    os.environ["MCP_DISPATCH_STATE_DIR"] = str(dispatch_dir.parent / "state")
     if extra_env:
         os.environ.update(extra_env)
 

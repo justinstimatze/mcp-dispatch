@@ -131,7 +131,7 @@ Agent bob:   ack(["msg-abc12345"])  →  message removed
 | `dispatch(message, target, ...)` | Send to one agent (`id`), a channel (`#name`), or `all` |
 | `peek(thread_id?, include_read?)` | Read messages and delivery receipts for sent messages |
 | `ack(message_ids)` | Acknowledge and delete processed messages |
-| `who()` | List connected agents and their channel subscriptions |
+| `who()` | List connected agents, whether each is listening, and their channel subscriptions |
 | `subscribe(channel)` / `unsubscribe(channel)` | Join / leave a channel |
 | `task(action, ...)` | Claimable work items — `create`, `claim`, `done`, `list` |
 
@@ -379,6 +379,18 @@ the cost of running a listener — see [dispatch-ircd](#dispatch-ircd--an-irc-ga
 
 For a point-in-time snapshot instead of a stream — who's live, their channel
 subscriptions, and unread counts — run `bin/dispatch-status`.
+
+It also marks sessions that are live but **not listening**. Holding a presence
+lock means the process is running; it does not mean anyone will notice a message.
+That takes an armed watch, and the hook that arms one only fires when a session
+parks — so a session whose watch ends while it is *already* parked has no event
+left to re-arm it. It keeps its lock, keeps answering to its name, and quietly
+accumulates mail until its operator next types. Nothing is lost; the reply is
+just waiting on a human. `who()` reports the same thing per agent as `armed`,
+so a sender can tell that silence from a considered one.
+
+Sessions on another account read as unknown rather than deaf: their arm locks
+live under their own `~/.cache`, which is not ours to open.
 
 #### dispatch-tui — an IRC client for the relay
 

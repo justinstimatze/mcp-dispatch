@@ -9,8 +9,11 @@ so no consumer can drift again.
 from __future__ import annotations
 
 import fcntl
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -125,3 +128,83 @@ def test_acquire_flock_after_release_succeeds(tmp_path):
     finally:
         if second is not None:
             second.close()
+
+
+# ---------------------------------------------------------------------------
+# armed(): running and listening are separate facts
+#
+# A session with no watch still receives mail; nothing wakes it to read it. The
+# three-state answer exists because the arm lock lives under the *watcher's*
+# HOME, so a reader looking at another account's session is not entitled to a
+# yes-or-no — and "no" there would name a healthy session deaf.
+# ---------------------------------------------------------------------------
+
+
+def test_arm_lock_path_is_stable_and_scoped(tmp_path):
+    a = common.arm_lock("stope-42", tmp_path)
+    assert a.parent == tmp_path
+    assert a == common.arm_lock("stope-42", tmp_path), "same id → same path"
+    assert a != common.arm_lock("stope-43", tmp_path), "different id → different path"
+
+
+def test_a_lock_nobody_ever_took_is_unarmed(tmp_path):
+    assert common.armed("never-armed", tmp_path) is False
+
+
+def test_a_held_lock_is_armed(tmp_path):
+    lock = common.arm_lock("watching-1", tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = common.acquire_flock(lock)
+    try:
+        assert common.armed("watching-1", tmp_path) is True
+    finally:
+        if fh is not None:
+            fh.close()
+    assert common.armed("watching-1", tmp_path) is False, "the watch died → unarmed"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits this tests")
+def test_an_unreadable_cache_is_unknown_not_unarmed(tmp_path):
+    """The distinction the whole three-state return exists for."""
+    theirs = tmp_path / "someone-elses-cache"
+    theirs.mkdir()
+    (common.arm_lock("theirs-1", theirs)).write_text("")
+    theirs.chmod(0o000)
+    try:
+        assert common.armed("theirs-1", theirs) is None
+    finally:
+        theirs.chmod(0o700)  # let tmp_path cleanup run
+
+
+def test_armed_for_uses_the_directory_the_session_published(tmp_path):
+    lock = common.arm_lock("published-1", tmp_path)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = common.acquire_flock(lock)
+    try:
+        rec = {"agent_id": "published-1", "state_dir": str(tmp_path)}
+        assert common.armed_for(rec, tmp_path / "presence.json") is True
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_armed_for_falls_back_to_our_cache_for_our_own_session(tmp_path, monkeypatch):
+    """No state_dir means a session older than the field. Ours to probe, so probe."""
+    monkeypatch.setenv("MCP_DISPATCH_STATE_DIR", str(tmp_path))
+    pf = tmp_path / "presence.json"
+    pf.write_text("{}")
+    assert common.armed_for({"agent_id": "legacy-1"}, pf) is False
+
+
+def test_armed_for_will_not_guess_about_another_account(tmp_path, monkeypatch):
+    """Same missing field, but the presence file belongs to someone else: their
+    lock was never going to be in our cache, so absence proves nothing."""
+    monkeypatch.setenv("MCP_DISPATCH_STATE_DIR", str(tmp_path))
+    pf = tmp_path / "presence.json"
+    pf.write_text("{}")
+    monkeypatch.setattr(common.os, "getuid", lambda: os.stat(pf).st_uid + 1)
+    assert common.armed_for({"agent_id": "legacy-1"}, pf) is None
+
+
+def test_armed_for_without_an_id_is_unknown(tmp_path):
+    assert common.armed_for({}, tmp_path / "presence.json") is None

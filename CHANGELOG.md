@@ -28,6 +28,30 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Added
+- **`who()` and `dispatch-status` distinguish live from listening.** A session
+  holds its presence lock for as long as the process runs, which is what made
+  liveness trustworthy — and it says nothing about whether anyone will *notice*
+  a message. The mechanism that does that is a `dispatch-wait --follow` watch
+  under the Monitor tool, armed by the Stop hook. But the Stop hook only fires
+  when a session parks, so a session that is *already* parked when its watch ends
+  has no event left to re-arm it. It goes on holding its lock, answering to its
+  name, and collecting mail nobody wakes it to read.
+
+  Found by counting: every unread message on this host sat in a session that
+  `who()` reported as live and addressable. Each local agent now carries
+  `armed`, and a relay with any deaf session gets an `unarmed` list — enough for
+  a sender to tell that silence is a parked window rather than a decision.
+  `dispatch-status` marks the same sessions `NOT LISTENING` and summarizes them
+  with their unread counts.
+
+  The answer is three-valued, and the third value is the point. Arm locks live
+  under the watching session's own `~/.cache`, so a session belonging to another
+  account is not ours to probe — reported as unknown rather than deaf, because
+  the failure worth avoiding is confidently calling a healthy session asleep.
+  (The first ad-hoc script written to investigate this did exactly that, and
+  overstated the problem by two sessions.) Sessions publish their state directory
+  in the presence record so the probe lands in the right place; ones that predate
+  the field fall back to ours only when the presence file is ours to begin with.
 - **The away-digest — `digest()` and `bin/dispatch-digest`.** A session that
   starts after a gap knew only what was in its inbox; everything else that moved
   while it was gone sat on disk unread because nothing assembled it. The
