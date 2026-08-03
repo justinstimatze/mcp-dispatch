@@ -150,8 +150,30 @@ change under a running install:
 
   The prompt is a constant in the script. A woken agent learns what it was sent
   by asking the relay, which is the same path a human-started session takes.
+- **`who()` reports where each live session was launched.** The presence record
+  gains a `cwd`, stamped by the launcher into `MCP_DISPATCH_CWD` before it execs
+  `uv run --directory <repo>` — after that point `os.getcwd()` inside the server
+  is this repo for every agent on the box, identical and so useless for telling
+  two apart.
+
+  The id is honest and can still leave a sender stuck. A session launched from
+  `~/Documents` is correctly named `documents`; the name just answers *where was
+  this started* when every address answers *which project*. Those were the same
+  string until someone launched one directory up. A live session showing
+  `~/Documents` next to its name is something a sender can act on; `documents-3556967`
+  on its own is not, especially beside a `documents-4125273` from another host.
 
 ### Fixed
+- **Inbox inheritance could cross hosts.** `_inherit_orphan_inbox` adopts pending
+  mail from dead sessions sharing a nick, which is right for `stope-3218326` →
+  `stope-4471002` and wrong when the donor is on another machine. It checked
+  presence and uid but never the `.remote` roster, so a name shared by accident
+  of launch directory was enough — a local session started in `~/Documents`
+  matched `documents-<pid>` inboxes belonging to a different project on a
+  different host. Now a donor with a `.remote/` record is skipped.
+
+  Found while tracing a message that went to the right name and nowhere:
+  ten sessions across two hosts and two uids have used `documents`.
 - **A woken agent could come up before its tools did, and burn a start saying
   so.** The first wake of two real nicks started both in the same tick on a box
   at 12 GiB used and 9.7 GiB swapped. The dispatch server took 57 seconds to

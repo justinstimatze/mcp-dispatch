@@ -269,6 +269,23 @@ def _initial_channels() -> list[str]:
     return sorted(out)
 
 
+def _session_cwd() -> str:
+    """Where the session was launched, not where this process happens to run.
+
+    The launcher execs `uv run --directory <repo>`, so os.getcwd() here is this
+    repo for every agent on the box — identical, and therefore useless for
+    telling two sessions apart. The launcher stamps the real directory into the
+    environment before that exec.
+
+    Worth recording because the id alone can be honest and still unhelpful. A
+    session started in ~/Documents is correctly named `documents`: that is where
+    it was launched. It says nothing about which project it is working on, and
+    every session launched from that folder answers to the same name. A sender
+    looking at who() sees the directory and can tell them apart.
+    """
+    return os.environ.get("MCP_DISPATCH_CWD", "").strip() or os.getcwd()
+
+
 def _write_presence() -> None:
     """Persist _PRESENCE_DATA through the held, locked handle.
 
@@ -305,6 +322,7 @@ def _try_lock_presence(pf: Path, agent_id: str) -> bool:
     _PRESENCE_DATA = {
         "agent_id": agent_id,
         "pid": os.getpid(),
+        "cwd": _session_cwd(),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "channels": _initial_channels(),
     }
@@ -596,6 +614,12 @@ def _inherit_orphan_inbox(agent_id: str) -> int:
       - same ``<project>-`` prefix and a numeric pid suffix, so unrelated agents
         never inherit from each other;
       - the donor must hold no presence lock (a live peer is not a corpse);
+      - the donor must not be in the .remote roster: a session on another host
+        is never a previous incarnation of this one, however alike the names
+        look. Container-ish directory names make that collision easy — every
+        session launched from a projects folder is `documents-<pid>` on every
+        host, and inheriting across that boundary would hand one machine's mail
+        to an unrelated project on another;
       - same uid, so group_mode can't siphon another account's mail.
 
     Claiming is the rename, not the read: two successors racing the same corpse
@@ -618,6 +642,8 @@ def _inherit_orphan_inbox(agent_id: str) -> int:
         # to `publicai` waited because no session of it was live at the time.
         if not (sibling.match(d.name) or d.name == base):
             continue
+        if (DISPATCH_DIR / ".remote" / f"{d.name}.json").exists():
+            continue  # another host's session, not a dead predecessor of mine
         pf = DISPATCH_DIR / ".presence" / f"{d.name}.json"
         if pf.exists() and _presence_is_live(pf):
             continue  # live peer, not a corpse

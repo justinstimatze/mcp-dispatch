@@ -109,3 +109,23 @@ def test_inherit_can_be_disabled(server_factory, tmp_path):
     s = server_factory("proj-222", config_path=cfg)
     assert s._read_inbox("proj-222") == []
     assert list((dd / "proj-111").glob("*.json"))
+
+
+def test_a_remote_session_is_not_a_dead_predecessor(server_factory):
+    """Another host's session, however alike the names look.
+
+    Container-ish directory names make this collision easy: every session
+    launched from a projects folder is `documents-<pid>`, on every host. Without
+    this guard the first local one to start would claim an unrelated project's
+    mail from another machine, and the sender would never learn where it went.
+    """
+    dd = server_factory.dispatch_dir
+    (dd / ".remote").mkdir(parents=True, exist_ok=True)
+    _plant(dd, "documents-111", mid="msg-elsewhere")
+    (dd / ".remote" / "documents-111.json").write_text(
+        json.dumps({"agent_id": "documents-111", "via": "git", "last_seen": "2026-07-25T04:18:19Z"})
+    )
+
+    s = server_factory("documents-222")
+    assert s._read_inbox("documents-222") == []
+    assert list((dd / "documents-111").glob("*.json")), "left where it was, not laundered"

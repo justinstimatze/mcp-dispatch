@@ -22,4 +22,12 @@ if [[ -z "${MCP_DISPATCH_AGENT_ID:-}" ]]; then
   export MCP_DISPATCH_AGENT_ID="${base}-$$"
 fi
 
+# Stamp the launch directory before the exec below replaces it. `uv run
+# --directory` puts the server in the repo, so os.getcwd() there is the same
+# string for every agent on the box and cannot tell them apart. The name alone
+# often can't either: a session started in ~/Documents is honestly called
+# "documents", which says nothing about the project it is working on and
+# collides with every other session launched from that folder.
+export MCP_DISPATCH_CWD="$PWD"
+
 exec uv run --directory "$REPO_DIR" python server.py

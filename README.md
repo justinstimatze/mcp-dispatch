@@ -105,6 +105,13 @@ a `<project>-<pid>` id from the working directory:
 A session started in `~/code/webapp` then becomes agent `webapp-<pid>`. An
 explicit `MCP_DISPATCH_AGENT_ID` always wins.
 
+Launch from the folder your projects live in rather than from a project, and the
+rule still holds — `~/Documents` gives you `documents-<pid>`, an accurate name
+for where the session started and a poor one for addressing it, shared with
+every other session launched from there. The launcher records the directory
+alongside the id so `who()` can tell them apart, but if a session is going to be
+written to by name, set `MCP_DISPATCH_AGENT_ID` and skip the ambiguity.
+
 </details>
 
 ### 3. Send messages
@@ -240,6 +247,7 @@ default_ttl = 604800
 | `MCP_DISPATCH_AGENT_ID` | Agent identity (required in dynamic mode) |
 | `MCP_DISPATCH_CHANNELS` | Channels to auto-subscribe on startup (comma/space separated, `#` optional) so standing rooms survive restarts without a manual `subscribe()` |
 | `MCP_DISPATCH_CONFIG` | Config file path (default: `~/.config/mcp-dispatch/config.toml`) |
+| `MCP_DISPATCH_CWD` | Launch directory, reported by `who()`. Set by the launcher; the server's own `os.getcwd()` is the repo, so it cannot stand in |
 | `MCP_DISPATCH_DIR` | Override dispatch directory from config |
 
 A fuller annotated example lives in [`config.example.toml`](config.example.toml),

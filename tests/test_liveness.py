@@ -76,3 +76,45 @@ def test_broadcast_targets_only_live_agents(server):
         assert "ghost" not in sent["queued_to"]
     finally:
         fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Launch directory
+# ---------------------------------------------------------------------------
+
+
+def test_presence_records_the_launch_directory(server_factory):
+    """Two sessions can share a name honestly; the directory tells them apart.
+
+    A session started in ~/Documents is correctly called `documents` — that is
+    where it was launched. It just doesn't say which project it is working on,
+    and every session launched from that folder answers to the same name.
+    """
+    s = server_factory("documents-111", extra_env={"MCP_DISPATCH_CWD": "/home/x/Documents"})
+    pf = s.DISPATCH_DIR / ".presence" / "documents-111.json"
+    assert json.loads(pf.read_text())["cwd"] == "/home/x/Documents"
+
+
+def test_the_launch_directory_beats_the_process_directory(server_factory):
+    """The launcher execs `uv run --directory <repo>`, so os.getcwd() inside the
+    server is this repo for every agent on the box — the same string each time,
+    which distinguishes nothing. The env var is stamped before that exec."""
+    import os
+
+    s = server_factory("proj-111", extra_env={"MCP_DISPATCH_CWD": "/home/x/Documents/stope"})
+    assert s._session_cwd() == "/home/x/Documents/stope"
+    assert s._session_cwd() != os.getcwd()
+
+
+def test_a_server_started_by_hand_falls_back_to_its_own_directory(server_factory):
+    import os
+
+    s = server_factory("proj-111")  # no MCP_DISPATCH_CWD, i.e. not via the launcher
+    assert s._session_cwd() == os.getcwd()
+
+
+def test_who_shows_where_each_live_session_was_launched(server_factory):
+    s = server_factory("documents-111", extra_env={"MCP_DISPATCH_CWD": "/home/x/Documents"})
+    me = [a for a in s.who_tool()["agents"] if a["agent_id"] == "documents-111"]
+    assert me, "self must be live in who()"
+    assert me[0]["cwd"] == "/home/x/Documents"
