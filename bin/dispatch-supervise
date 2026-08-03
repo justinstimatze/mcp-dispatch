@@ -96,8 +96,12 @@ def cmd_check(argv: list[str]) -> int:
         return 1
 
     print(f"agents:  {len(cfg.agents)} allowlisted")
-    # A nick the relay has never seen is usually a typo in the section header —
-    # the entry is valid, it just can never match a real teammate.
+    # A nick the relay has never seen is usually a typo in the section header.
+    # It is not inert, though: the trigger is mail sitting in the nick's inbox,
+    # and dispatching to an unknown name creates that inbox on demand. So a
+    # correctly-spelled new nick fires the first time anyone writes to it, and a
+    # typo simply never gets written to. Say which, rather than implying the
+    # entry cannot fire at all.
     known = {p.stem for p in (relay / ".agents").glob("*.json")} if relay.is_dir() else set()
     bad = bool(warn)
     for nick, spec in cfg.agents.items():
@@ -108,8 +112,9 @@ def cmd_check(argv: list[str]) -> int:
             print(f"      ✗ {p}")
         if not problems and nick not in known:
             print(
-                f"      ! no nick '{nick}' in the registry yet — it will only ever fire "
-                "once some session has used that id (check the spelling)"
+                f"      ! no session has ever used the nick '{nick}' here — check the "
+                "spelling. It will still start the first time anyone dispatches to that "
+                "exact name; the trigger is the inbox, not the registry."
             )
         bad = bad or bool(problems)
 

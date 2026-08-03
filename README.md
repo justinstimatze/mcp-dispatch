@@ -520,8 +520,8 @@ the git bus. So the sender never influences what runs:
 enabled = true
 
 [supervisor.agents.publicai]
-command = ["/home/you/bin/start-publicai"]   # argv, never a shell string
-cwd = "/home/you/code/publicai"
+command = ["/abs/path/to/mcp-dispatch/bin/dispatch-agent-claude",
+           "/home/you/code/publicai"]        # argv, never a shell string
 ```
 
 - **A nick with no block is never started**, whatever it is sent. There is no
@@ -536,10 +536,33 @@ cwd = "/home/you/code/publicai"
   of spawns; so does a runtime that starts, dies without reading its mail, and
   would otherwise be restarted forever.
 
-`dispatch-supervise check` resolves every command, flags a nick the relay has
-never seen (almost always a typo in the section header), and refuses a config
-file other accounts can write — it is now an execution allowlist, so `chmod 600`
-it.
+`dispatch-supervise check` resolves every command, flags a nick no session has
+ever used (almost always a typo in the section header — though the trigger is
+the inbox rather than the registry, so a correctly-spelled new nick does start
+the first time anyone writes to it), and refuses a config file other accounts
+can write — it is now an execution allowlist, so `chmod 600` it.
+
+### What actually gets started
+
+`bin/dispatch-agent-claude <project-dir>` is the runtime referenced above: a
+headless Claude Code session for one project, which reads its mail, replies, and
+exits. The supervisor decides *whether* to start something; this decides *what*,
+and it is a separate file because that answer is local policy — which model,
+which tools, how much a woken agent is trusted to do.
+
+It comes up **stripped**: `--strict-mcp-config` with dispatch as the only server,
+and an `--allowed-tools` list holding only the dispatch tools. A full session
+here loads ten MCP servers; a triage session needs one. That gap is most of the
+reason to run agents on demand instead of leaving them resident, so waking a
+fully-loaded session would spend the win back on arrival. A woken agent has no
+file or shell tools, and is told to say so rather than improvise if a message
+asks for real work. Widen it per nick with `DISPATCH_AGENT_TOOLS` in the
+allowlist's `env` table if you want one that can act; the defaults assume you
+do not.
+
+The prompt is a constant in the script. Nothing from the message reaches it —
+the woken agent finds out what it was sent by asking the relay, exactly as a
+human-started session does.
 
 Two config interactions worth knowing. With `inherit_inbox = false` a successor
 session adopts nothing, so the trigger narrows to the nick's own inbox — the one

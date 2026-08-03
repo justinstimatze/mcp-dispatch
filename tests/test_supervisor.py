@@ -605,8 +605,12 @@ def test_check_passes_a_good_config(tmp_path):
     assert "OK." in r.stdout
 
 
-def test_check_warns_about_a_nick_the_relay_has_never_seen(tmp_path):
-    """Almost always a typo in the section header — a valid entry that can't fire."""
+def test_check_warns_about_a_nick_no_session_has_ever_used(tmp_path):
+    """Almost always a typo in the section header — but say so without claiming
+    the entry is inert. It is not: the trigger is the inbox, and dispatching to
+    an unknown name creates that inbox, so a correctly-spelled new nick fires the
+    first time anyone writes to it. A warning that over-claims here sends an
+    operator hunting for a bug in a working config."""
     relay = tmp_path / "relay"
     relay.mkdir()
     config = tmp_path / "config.toml"
@@ -616,7 +620,20 @@ def test_check_warns_about_a_nick_the_relay_has_never_seen(tmp_path):
     config.chmod(0o600)
     r = _run(["check"], config, relay)
     assert r.returncode == 0
-    assert "no nick 'typoo' in the registry" in r.stdout
+    assert "no session has ever used the nick 'typoo'" in r.stdout
+    assert "check the spelling" in r.stdout
+    assert "the trigger is the inbox, not the registry" in r.stdout
+
+
+def test_a_never_seen_nick_still_has_a_trigger(tmp_path):
+    """The claim the warning above now makes, tested rather than left in prose.
+
+    A nick with no registry entry and no session history still counts its mail,
+    because the trigger reads inboxes and a sender creates the inbox on demand.
+    That is the pilot case, and the reason the old warning was wrong."""
+    _plant(tmp_path, "typoo", mid="m1")
+    assert not (tmp_path / ".agents").exists()
+    assert supervisor.waiting_mail(tmp_path, "typoo") == 1
 
 
 def test_disabled_is_the_default_and_once_says_so(tmp_path):
@@ -692,3 +709,106 @@ def test_service_show_renders_a_unit_that_spares_the_children(tmp_path):
     # The sandbox stays light on purpose: the child inherits it.
     assert "SystemCallFilter" not in r.stdout
     assert "RestrictAddressFamilies" not in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# the runtime the supervisor starts
+#
+# `dispatch-agent-claude` is the other half of the security story: the supervisor
+# guarantees nothing from a message reaches argv, and this script is what that
+# argv turns into. It is also where a quiet CLI-shaped mistake cost a failed
+# start during the first pilot — see the separator test.
+# ---------------------------------------------------------------------------
+
+RUNTIME = REPO_ROOT / "bin" / "dispatch-agent-claude"
+
+
+def _stub_claude(tmp_path: Path) -> tuple[Path, Path]:
+    """A fake `claude` that records the argv it was handed, and exits.
+
+    NUL-separated, not newline-separated: the prompt is a multi-line string, and
+    a line-based recording would silently split it into several 'arguments' —
+    a fake that lies about the shape of what it received.
+    """
+    argv_out = tmp_path / "argv.bin"
+    stub = tmp_path / "claude-stub"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\0" "$@" > {argv_out}\n')
+    stub.chmod(0o755)
+    return stub, argv_out
+
+
+def _run_runtime(project: Path, tmp_path: Path, **env):
+    stub, argv_out = _stub_claude(tmp_path)
+    r = subprocess.run(
+        [str(RUNTIME), str(project)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DISPATCH_AGENT_CLAUDE": str(stub), **env},
+    )
+    raw = argv_out.read_text() if argv_out.exists() else ""
+    return r, [a for a in raw.split("\0") if a]
+
+
+def test_the_prompt_is_separated_from_the_variadic_flags(tmp_path):
+    """`--allowed-tools` and `--mcp-config` both take unlimited values, so a
+    trailing prompt is swallowed as one more value unless `--` ends the list.
+
+    This is not hypothetical: the first supervised start failed with
+    ENAMETOOLONG because claude tried to open the entire prompt as a config file
+    path. The failure was loud, but a start that dies before claiming presence
+    only shows up as a counted failure — so pin the separator here."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    r, argv = _run_runtime(project, tmp_path)
+    assert r.returncode == 0
+    assert argv[-2] == "--", f"prompt not separated from variadic flags: {argv[-3:]}"
+    assert argv[-1].startswith("You were started by the mcp-dispatch lifecycle supervisor")
+
+
+def test_a_woken_agent_comes_up_stripped(tmp_path):
+    """Only the dispatch server, only the dispatch tools.
+
+    Waking a fully-loaded session would spend back the memory that running
+    agents on demand was meant to save, and hand a remote-triggered process file
+    and shell tools it was never meant to have."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    _, argv = _run_runtime(project, tmp_path)
+    assert "--strict-mcp-config" in argv
+    cfg = json.loads(argv[argv.index("--mcp-config") + 1])
+    assert list(cfg["mcpServers"]) == ["dispatch"]
+    tools = argv[argv.index("--allowed-tools") + 1 : argv.index("--strict-mcp-config")]
+    assert tools and all(t.startswith("mcp__dispatch__") for t in tools)
+
+
+def test_a_wider_runtime_is_opt_in_per_nick(tmp_path):
+    """Both widenings come from the allowlist's env table — operator-set, never
+    message-set — and neither is the default."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    _, argv = _run_runtime(project, tmp_path, DISPATCH_AGENT_FULL_MCP="1")
+    assert "--strict-mcp-config" not in argv
+    assert "--mcp-config" not in argv
+
+    _, argv = _run_runtime(project, tmp_path, DISPATCH_AGENT_TOOLS="Read Bash")
+    assert argv[argv.index("--allowed-tools") + 1 : argv.index("--strict-mcp-config")] == [
+        "Read",
+        "Bash",
+    ]
+
+
+def test_the_runtime_refuses_a_project_that_is_not_there(tmp_path):
+    """A typo'd path must fail before starting anything, not start claude in
+    whatever directory the daemon happened to be in — the cwd decides the nick."""
+    r, argv = _run_runtime(tmp_path / "nope", tmp_path)
+    assert r.returncode == 66
+    assert argv == []
+
+    stub, _ = _stub_claude(tmp_path)
+    r = subprocess.run(
+        [str(RUNTIME)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "DISPATCH_AGENT_CLAUDE": str(stub)},
+    )
+    assert r.returncode == 64

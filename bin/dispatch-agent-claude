@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# The runtime the supervisor starts: a headless Claude Code session for one
+# project, brought up because dispatch mail was waiting and nobody was home.
+#
+# `dispatch-supervise` decides *whether* to start something. This decides *what*
+# that something is. It is a separate file because the answer is a local policy
+# choice — model, tools, how much a woken agent is trusted to do — and the
+# supervisor must never learn any of it from a message.
+#
+# Wire it into the allowlist, one line per project:
+#
+#   [supervisor.agents.test1]
+#   command = ["/abs/path/to/mcp-dispatch/bin/dispatch-agent-claude",
+#              "/home/you/Documents/test1"]
+#
+# The directory is an argument rather than `cwd` so the same script serves every
+# nick, and so an operator reading the config sees which project each entry
+# wakes without cross-referencing a second field.
+#
+# Two properties this script is responsible for:
+#
+#   * It reads no message. Its only input is argv from the config file, written
+#     by you. A woken agent learns what it was sent by *asking the relay*, which
+#     is the same path a human-started session uses.
+#   * It comes up stripped. Only the dispatch MCP server is loaded, and only the
+#     dispatch tools are allowed. A full session on this host loads ten servers;
+#     a triage session needs one. That difference is most of the reason to run
+#     agents on demand rather than leave them resident, so spending it back by
+#     waking a fully-loaded session would defeat the point.
+#
+# Knobs, all set from the allowlist's `env` table (operator-controlled, never
+# message-controlled):
+#
+#   DISPATCH_AGENT_MODEL      model alias; default is whatever `claude` defaults to
+#   DISPATCH_AGENT_MAX_TURNS  turn ceiling for one wake-up (default 12)
+#   DISPATCH_AGENT_TOOLS      space-separated tool allowlist (default: dispatch only)
+#   DISPATCH_AGENT_FULL_MCP   set to 1 to load the host's full MCP config instead
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $(basename "$0") <project-dir>" >&2
+  exit 64
+fi
+
+project="$1"
+if [[ ! -d "$project" ]]; then
+  echo "$(basename "$0"): not a directory: $project" >&2
+  exit 66
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER="$SCRIPT_DIR/dispatch-launcher"
+if [[ ! -x "$LAUNCHER" ]]; then
+  echo "$(basename "$0"): missing launcher: $LAUNCHER" >&2
+  exit 69
+fi
+
+CLAUDE="${DISPATCH_AGENT_CLAUDE:-$HOME/.local/bin/claude}"
+if [[ ! -x "$CLAUDE" ]]; then
+  # A systemd unit's PATH is minimal, so fall back to a lookup only if the
+  # expected absolute path is wrong — and fail loudly rather than silently
+  # starting nothing.
+  CLAUDE="$(command -v claude || true)"
+  [[ -x "$CLAUDE" ]] || { echo "$(basename "$0"): claude not found" >&2; exit 69; }
+fi
+
+# The agent id is derived by the launcher from $PWD, so the nick this session
+# claims is the project directory's name — the same id a human-started session
+# in that directory would get, which is what makes the supervisor's trigger and
+# this script agree on who is being woken.
+cd "$project"
+
+read -r -d '' PROMPT <<'EOF' || true
+You were started by the mcp-dispatch lifecycle supervisor: messages are waiting
+for this project's agent and no session of it was live.
+
+Call digest() for what moved while you were away, then peek() to read the mail.
+Reply with dispatch() where a reply is warranted, ack() what you have handled,
+and stop. Be brief; you are a triage session, not a work session.
+
+You deliberately have no file or shell tools here. If a message asks for actual
+work, say so in your reply and leave it for a full session rather than
+improvising around the missing tools.
+EOF
+
+args=(--print
+      --max-turns "${DISPATCH_AGENT_MAX_TURNS:-12}"
+      --allowed-tools ${DISPATCH_AGENT_TOOLS:-mcp__dispatch__peek mcp__dispatch__ack mcp__dispatch__dispatch mcp__dispatch__who mcp__dispatch__digest})
+
+[[ -n "${DISPATCH_AGENT_MODEL:-}" ]] && args+=(--model "$DISPATCH_AGENT_MODEL")
+
+if [[ "${DISPATCH_AGENT_FULL_MCP:-0}" != "1" ]]; then
+  args+=(--strict-mcp-config --mcp-config
+         "{\"mcpServers\":{\"dispatch\":{\"command\":\"$LAUNCHER\"}}}")
+fi
+
+echo "[$(date -u +%FT%TZ)] waking $(basename "$project") in $project" >&2
+# `--` is load-bearing: --allowed-tools and --mcp-config are both variadic, so
+# without it the prompt is swallowed as one more value and claude tries to open
+# it as a config file.
+exec "$CLAUDE" "${args[@]}" -- "$PROMPT"

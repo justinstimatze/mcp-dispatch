@@ -125,8 +125,35 @@ change under a running install:
   perform one, and the unit would die at spawn with `218/CAPABILITIES`. Ordering
   on `network-online.target` only when a TCP listener is configured; `PrivateTmp`
   dropped for the documented `/var/tmp` group-mode relay layout.
+- **`bin/dispatch-agent-claude` — the runtime the supervisor actually starts.**
+  The supervisor shipped with an allowlist whose example pointed at a script
+  nobody had written, which made the feature complete in the sense that mattered
+  least. This is that script: a headless Claude Code session for one project,
+  which reads its mail, replies, and exits.
+
+  It comes up **stripped** — `--strict-mcp-config` with dispatch as the only
+  server, and an allowed-tools list holding only the dispatch tools. A full
+  session on a developer box loads every MCP server configured; a triage session
+  needs one. That difference is most of the reason to start agents on demand
+  rather than leave them resident, so waking a fully-loaded session would spend
+  the win back on arrival. A woken agent therefore has no file or shell tools,
+  and is told to say so rather than improvise if a message asks for real work.
+  `DISPATCH_AGENT_TOOLS`, `DISPATCH_AGENT_MODEL`, `DISPATCH_AGENT_MAX_TURNS` and
+  `DISPATCH_AGENT_FULL_MCP` widen it per nick from the allowlist's `env` table —
+  operator-set, never message-set, and none of them the default.
+
+  The prompt is a constant in the script. A woken agent learns what it was sent
+  by asking the relay, which is the same path a human-started session takes.
 
 ### Fixed
+- **`dispatch-supervise check` claimed a never-seen nick could not fire.** The
+  warning read "it will only ever fire once some session has used that id",
+  which is false: the trigger reads inboxes, and dispatching to an unknown name
+  creates that inbox on demand, so a correctly-spelled new nick starts the first
+  time anyone writes to it. Found during the first pilot, where `check` warned
+  about the entry and `--dry-run` started it thirty seconds later. The advice was
+  right (it is usually a typo) and the mechanism was wrong, which is the worse
+  half to get wrong — it sends an operator hunting for a bug in a working config.
 - **The IRC gateway ignored the cross-host git bus unless `read_git` was set
   explicitly**, though every doc gave its default as `true`. It was a plain Go
   bool, so an omitted key took the zero value and silently disabled the remote
