@@ -91,48 +91,6 @@ def _block_count(agent_id: str, *, reset: bool = False, bump: bool = False) -> i
     return n
 
 
-def _waiter_path() -> str:
-    return str(Path(__file__).resolve().parent.parent / "bin" / "dispatch-wait")
-
-
-def _git_liveness_note(cfg: dict, dispatch_dir: Path) -> str:
-    """When cross-host git comms are enabled, tell the model whether the bridge
-    daemon is actually pulling — an armed watch alone won't surface remote
-    messages if the gitsync daemon isn't running."""
-    raw = cfg.get("git")
-    git = raw if isinstance(raw, dict) else {}
-    if not (git.get("enabled") or os.environ.get("MCP_DISPATCH_GIT_ENABLED")):
-        return ""
-    lock = common.state_dir() / f"gitsync-{common.md5_key(str(dispatch_dir))}.lock"
-    if common.flock_held(lock):  # daemon holds this flock while running
-        return (
-            "\n\nCross-host git bridge: LIVE — messages from other hosts arrive in "
-            "this same inbox, so this one watch covers both local and remote."
-        )
-    return (
-        "\n\n⚠ Cross-host git bridge is ENABLED but its daemon is NOT running — "
-        "remote messages won't arrive until it is. Start it as a detached shell "
-        f"task:\n\n    {Path(_waiter_path()).parent / 'dispatch-gitsync'}\n\n"
-        "or check `dispatch-gitsync status`."
-    )
-
-
-def _instruction(agent_id: str, git_note: str = "") -> str:
-    return (
-        f"[mcp-dispatch] No message watch is armed for '{agent_id}'. While parked "
-        "you won't see new messages until one is. Start a PERSISTENT watch NOW with "
-        "the Monitor tool (load it via ToolSearch first if it isn't already "
-        "available) — one registration streams an event per incoming message for "
-        "the whole session, so there is NOTHING to re-arm after each one:\n\n"
-        f'    Monitor(command="{_waiter_path()} --follow", '
-        f'description="dispatch inbox for {agent_id}", persistent=true, '
-        "timeout_ms=3600000)\n\n"
-        "It costs zero tokens while idle and wakes you the instant a qualifying "
-        "message (local OR cross-host) lands. This hook goes quiet once the watch "
-        "holds its lock." + git_note
-    )
-
-
 def _desktop_warn(cfg: dict, agent_id: str) -> None:
     """Best-effort loud alert when auto-arm keeps failing, so a wedged launch is
     never silent. Uses the same notify_command the server/waiter use."""
@@ -175,7 +133,10 @@ def main() -> int:
         _block_count(agent_id, reset=True)  # armed → clear the wedge guard
         return 0
 
-    git_note = _git_liveness_note(cfg, dispatch_dir)
+    # Shared with the server, which says the same thing on a tool result when the
+    # model never reaches a hook — one wording, so a session seeing both notices
+    # can tell they are one problem.
+    instruction = common.arm_instruction(agent_id, cfg, dispatch_dir)
 
     # Unarmed. SessionStart just injects; Stop must block so we don't park unarmed.
     if event == "Stop":
@@ -183,13 +144,13 @@ def main() -> int:
             # Launch keeps failing — don't wedge, but don't go silent either: warn
             # loudly (desktop + text) so a persistently-unarmed session is visible.
             _desktop_warn(cfg, agent_id)
-            print(_instruction(agent_id, git_note))
+            print(instruction)
             return 0
         _block_count(agent_id, bump=True)
-        print(json.dumps({"decision": "block", "reason": _instruction(agent_id, git_note)}))
+        print(json.dumps({"decision": "block", "reason": instruction}))
         return 0
 
-    print(_instruction(agent_id, git_note))
+    print(instruction)
     return 0
 
 

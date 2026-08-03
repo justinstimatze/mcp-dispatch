@@ -686,16 +686,16 @@ class Supervisor:
     def _sweep_deaf(self) -> None:
         """Say when a session is running, holding mail, and unable to hear about it.
 
-        Nothing inside such a session can repair it. The hook that arms a message
-        watch is loaded at session start, so a window that was already open when
-        the hooks were wired never runs it and never will — and a parked session
-        emits no event that could trigger a retry. The repair mechanism is inside
-        the thing that is broken.
+        A parked session emits no event, so nothing inside it can notice this and
+        nothing outside it can reach in — the arm hook only runs on a turn, and a
+        session in this state is not taking turns. Its own operator typing
+        anything at all fixes it; the difficulty is that they have no reason to
+        suspect there is anything to fix.
 
-        The supervisor cannot reach in either. What it can do is refuse to let the
-        condition stay silent: it is the only process watching the relay that is
-        not itself a session. Not gated on the allowlist — an unreachable session
-        is worth naming whether or not the operator ever chose to auto-start it.
+        So what the supervisor can do is refuse to let the condition stay silent:
+        it is the only process watching the relay that is not itself a session.
+        Not gated on the allowlist — an unreachable session is worth naming
+        whether or not the operator ever chose to auto-start it.
         """
         current = dict(deaf_sessions(self.dispatch_dir))
         for aid, waiting in current.items():
@@ -704,8 +704,8 @@ class Supervisor:
             self._deaf_alerted.add(aid)
             why = (
                 f"{aid} is running but holds no message watch — {waiting} message(s) "
-                "waiting that nothing will wake it to read. Type in that window, or "
-                "restart it so its hooks load."
+                "waiting that nothing will wake it to read. Type anything in that "
+                "window; its next turn arms the watch."
             )
             self.log(f"[supervise] {why}")
             dispatch_common.notify("mcp-dispatch: a session cannot hear you", why)

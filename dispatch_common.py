@@ -280,6 +280,90 @@ def armed_for(rec: dict, presence_file: Path) -> bool | None:
     return armed(aid)
 
 
+ARM_NUDGE_INTERVAL = 600  # seconds between repeats of the same unarmed notice
+
+
+def waiter_path() -> Path:
+    """``bin/dispatch-wait``, absolute, because the model has to type it."""
+    return Path(__file__).resolve().parent / "bin" / "dispatch-wait"
+
+
+def git_bridge_note(cfg: dict, relay: Path) -> str:
+    """Whether the cross-host bridge is actually pulling, when it is enabled.
+
+    An armed watch alone won't surface remote messages: those arrive in this
+    inbox only because the gitsync daemon puts them there. Arming while the
+    daemon is down looks identical to arming while it is up, right until a
+    message from another host doesn't come."""
+    raw = cfg.get("git")
+    git = raw if isinstance(raw, dict) else {}
+    if not (git.get("enabled") or os.environ.get("MCP_DISPATCH_GIT_ENABLED")):
+        return ""
+    lock = state_dir() / f"gitsync-{md5_key(str(relay))}.lock"
+    if flock_held(lock):  # daemon holds this flock while running
+        return (
+            "\n\nCross-host git bridge: LIVE — messages from other hosts arrive in "
+            "this same inbox, so this one watch covers both local and remote."
+        )
+    return (
+        "\n\n⚠ Cross-host git bridge is ENABLED but its daemon is NOT running — "
+        "remote messages won't arrive until it is. Start it as a detached shell "
+        f"task:\n\n    {waiter_path().parent / 'dispatch-gitsync'}\n\n"
+        "or check `dispatch-gitsync status`."
+    )
+
+
+def arm_instruction(agent_id: str, cfg: dict | None = None, relay: Path | None = None) -> str:
+    """What to tell a session that holds no message watch.
+
+    Two callers now say this: the arm hook, at session start and on the way to
+    parking, and the server, on a tool result the model was already getting. They
+    have to say the same thing — a session acting on one wording and then seeing
+    another has no way to tell they describe one problem."""
+    conf = load_config() if cfg is None else cfg
+    root = dispatch_dir(conf) if relay is None else relay
+    return (
+        f"[mcp-dispatch] No message watch is armed for '{agent_id}'. While parked "
+        "you won't see new messages until one is. Start a PERSISTENT watch NOW with "
+        "the Monitor tool (load it via ToolSearch first if it isn't already "
+        "available) — one registration streams an event per incoming message for "
+        "the whole session, so there is NOTHING to re-arm after each one:\n\n"
+        f'    Monitor(command="{waiter_path()} --follow", '
+        f'description="dispatch inbox for {agent_id}", persistent=true, '
+        "timeout_ms=3600000)\n\n"
+        "It costs zero tokens while idle and wakes you the instant a qualifying "
+        "message (local OR cross-host) lands. This notice goes quiet once the watch "
+        "holds its lock." + git_bridge_note(conf, root)
+    )
+
+
+def arm_nudge_due(
+    agent_id: str, interval: float = ARM_NUDGE_INTERVAL, state: Path | None = None
+) -> bool:
+    """True at most once per ``interval``, and stamps the clock when it says yes.
+
+    The cap is for harnesses with no Monitor tool, where the instruction can
+    never be carried out: without it the notice would ride along on every single
+    tool result for the life of the session. A session that *can* arm does so on
+    the first one and never asks again.
+
+    An unwritable state directory means we can't remember having asked, so we ask
+    again — the notice is advisory text on a result the caller wanted anyway, and
+    repeating beats going quiet about a session nothing can reach."""
+    stamp = (state or state_dir()) / f"armnudge-{md5_key(agent_id)}.txt"
+    try:
+        if time.time() - stamp.stat().st_mtime < interval:
+            return False
+    except OSError:
+        pass
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(int(time.time())))
+    except OSError:
+        pass
+    return True
+
+
 def flock_held(path: Path) -> bool:
     """True if some live process holds an exclusive flock on ``path``. We probe by
     trying to take it: success (we got it) means nobody holds it — release and

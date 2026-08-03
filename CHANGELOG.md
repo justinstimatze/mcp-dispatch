@@ -28,6 +28,36 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Added
+- **The server tells its own session when nothing is listening for it.** Every
+  dispatch tool result already carries whatever mail arrived while the model was
+  mid-turn — the model was getting an answer anyway, so delivery rides along. The
+  same seam now carries one more fact: if this session holds no message watch,
+  the result gains `_arm_required` with the instruction for starting one.
+
+  This exists because the hook that would otherwise prevent it has a blind spot.
+  `dispatch-arm.py` blocks a session from parking unarmed, but first it has to
+  work out *which* session it is running in — nick prefix, presence flock,
+  process ancestry — and when that comes back ambiguous it exits 0 without a
+  word, because it also runs in every session that has nothing to do with
+  dispatch and cannot be loud there. The one hook that could refuse to let a
+  session go deaf is the one that cannot say when it declined to try. The server
+  has no such problem: it *is* the session, so its id needs no discovery.
+
+  It is prevention, not rescue. A session already parked and unarmed takes no
+  turn and calls no tool; nothing here reaches it, and the supervisor's sweep
+  remains the only thing that will say so. What this closes is the window
+  beforehand, while the session is still awake and can still fix itself.
+
+  Wired at every tool, not just the ones that piggyback mail: `peek` drains the
+  inbox itself and `who` and `digest` never touched `_with_pending`, and those
+  three are exactly what a session reaches for when it suspects it is missing
+  something. Capped at one notice per ten minutes per agent, since a harness with
+  no Monitor tool can never carry the instruction out and would otherwise be told
+  so on every call for the life of the session. Silent when the watch is armed,
+  when `auto_arm` is off, and when the arm state is unreadable. The instruction
+  text moved to `dispatch_common.arm_instruction` so the hook and the server say
+  the same thing — a session acting on one wording and then meeting another has
+  no way to tell they describe one problem.
 - **`who()` and `dispatch-status` distinguish live from listening.** A session
   holds its presence lock for as long as the process runs, which is what made
   liveness trustworthy — and it says nothing about whether anyone will *notice*
@@ -37,8 +67,11 @@ change under a running install:
   has no event left to re-arm it. It goes on holding its lock, answering to its
   name, and collecting mail nobody wakes it to read.
 
-  Found by counting: every unread message on this host sat in a session that
-  `who()` reported as live and addressable. Each local agent now carries
+  Found by counting: every unread message on this host sat in a session `who()`
+  named as reachable, with no field distinguishing the ones that would act on it.
+  (Two of those turned out to be a dead session and another account's — see the
+  retraction under Fixed. The distinction is what surfaced that; without it the
+  answer would still read as confidently wrong.) Each local agent now carries
   `armed`, and a relay with any deaf session gets an `unarmed` list — enough for
   a sender to tell that silence is a parked window rather than a decision.
   `dispatch-status` marks the same sessions `NOT LISTENING` and summarizes them
@@ -223,24 +256,30 @@ change under a running install:
   race the first for the same inbox — so the nick looks handled while its mail
   goes unread indefinitely.
 
-  Nothing inside such a session can repair it, which is the part that makes this
-  worth external machinery. Claude Code reads hook config at session start, so a
-  window that was already open when `dispatch-arm.py` was wired into
-  `settings.json` never runs it and never will; and a parked session emits no
-  event that would trigger a retry. The repair mechanism lives inside the thing
-  that is broken. On this host that was two sessions, both from the hour before
-  the hook was wired, silently unreachable for three days — their arm-lock files
-  had never been created at all, and their Stop-block counters had never been
-  incremented, which is what distinguishes "never armed" from "armed and lost it".
+  Nothing inside such a session can repair it *while it is parked*, which is the
+  part that makes this worth external machinery: `dispatch-arm.py` runs on a
+  turn, and a parked session is not taking turns. The cure is trivial and
+  unguessable — type anything in that window and the turn it starts ends in a
+  Stop that arms the watch — so the useful thing an outside process can supply is
+  knowing which window to type in.
+
+  (An earlier draft of this entry blamed Claude Code freezing hook config at
+  session start, and cited two locally unreachable sessions as evidence. Both
+  were probe artefacts: one session was dead, and the other belonged to a second
+  account whose arm locks live under a `~/.cache` this one cannot read — the case
+  `armed_for` reports as unknown. Hook config is re-read per prompt; a sibling
+  agent measured it on 2.1.220 by having a three-minute-old hook fire in a
+  session that had never restarted. The sweep below is unchanged and was already
+  correct: run against the real liveness code it reports nothing here, which is
+  the right answer.)
 
   `Supervisor.tick` now sweeps for live sessions that hold no watch and have mail
   waiting, logging and notifying once per occurrence rather than every five
   seconds. Not gated on the allowlist: an unreachable session is worth naming
   whether or not the operator ever chose to auto-start that nick. Sessions with
   an empty inbox are skipped — latent, not current, and an alert nobody needs to
-  act on is training to ignore the one they do. The cure is still manual (type in
-  the window, or restart it so its hooks load); what changes is that the
-  condition can no longer be silent.
+  act on is training to ignore the one they do. The cure is still manual — type
+  anything in that window — but the condition can no longer be silent.
 
   `notify_command` had three copies of the same subprocess call. Two of them now
   share `dispatch_common.notify`; `server.py` keeps its own, which notifies per

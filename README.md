@@ -48,7 +48,7 @@ backup of `~/.claude/settings.json` before touching it. Preview without writing:
 python3 install.py --dry-run
 ```
 
-Then restart your Claude Code sessions so the new config loads, and jump to
+Then restart your Claude Code sessions so the MCP server loads, and jump to
 [Send messages](#3-send-messages). The manual steps below are what the installer
 automates — read them if you want to wire things by hand or understand what it
 did.
@@ -535,12 +535,15 @@ session holding its presence lock is never started for, correctly, since a secon
 session would race the first for the same inbox — so the nick looks handled while
 its mail sits unread. It logs and notifies once per occurrence.
 
-It cannot fix such a session, and neither can the session itself. Claude Code
-reads hook config at session start, so a window that was already open when the
-hooks were wired never runs `dispatch-arm.py` and never will; and a parked
-session emits no event that would retry. **After changing hook config, restart
-your open sessions** — otherwise they stay reachable by name and deaf in
-practice, which is the one state that looks healthy from every other angle.
+It cannot fix such a session, and while parked neither can the session itself:
+`dispatch-arm.py` runs on a turn, and a parked session is not taking turns. The
+cure is trivial and unguessable — **type anything in that window**, and the turn
+it starts ends in a Stop that arms the watch. What the daemon buys you is knowing
+which window to type in, since from every other angle the session looks healthy.
+
+(Hook config itself is *not* frozen: Claude Code re-reads it per prompt, so a
+newly-wired hook is live in already-open sessions from their next turn. Measured
+on 2.1.220. Only the MCP server needs a restart to pick up config.)
 
 ### The command is an allowlist, and that is the whole security model
 

@@ -1054,6 +1054,45 @@ def _with_pending(result: dict) -> dict:
         clean = [_public_msg(m) for m in messages]
         result["_dispatches"] = clean
         result["_dispatch_count"] = len(clean)
+    return _arm_nudge(result)
+
+
+# The raw config, not CONFIG: _load_config keeps only keys present in
+# _DEFAULT_CONFIG, and both `auto_arm` and the `[git]` table are outside it. Read
+# once — the arm hook resolves the same two the same way, and a session's config
+# is fixed at start regardless.
+_ARM_CFG = dispatch_common.load_config()
+
+
+def _arm_nudge(result: dict) -> dict:
+    """Tell an unarmed session so, on a tool result it was already getting.
+
+    The Stop hook is what normally keeps a session from parking unarmed, but it
+    has to work out *which* session it is running in — by nick prefix, presence
+    flock and process ancestry — and when that comes back ambiguous it exits
+    silently, because it also runs in every session that has nothing to do with
+    dispatch. So the one hook that could refuse to let a session go deaf is also
+    the one that cannot say when it declined to try.
+
+    This seam has no such problem: the server *is* the session, so AGENT_ID needs
+    no discovery. And the model is awake — it just called a tool — so the answer
+    can carry the news that nobody is listening for it. It cannot rescue a
+    session that has already parked; a session only becomes unreachable by
+    parking unarmed, and this is a chance to catch that beforehand.
+
+    Silent when the watch is armed, when the operator opted out, and when the arm
+    state is unreadable — `None` is not `False`, and claiming a healthy session is
+    deaf is the worse error.
+    """
+    if not isinstance(result, dict):
+        return result
+    if dispatch_common.auto_arm_disabled(_ARM_CFG):
+        return result
+    if dispatch_common.armed(AGENT_ID) is not False:
+        return result
+    if not dispatch_common.arm_nudge_due(AGENT_ID):
+        return result
+    result["_arm_required"] = dispatch_common.arm_instruction(AGENT_ID, _ARM_CFG, DISPATCH_DIR)
     return result
 
 
@@ -1321,7 +1360,10 @@ def peek_tool(
     }
     if receipts:
         result["sent_receipts"] = receipts
-    return result
+    # Not _with_pending — this already drained the inbox. The arm notice still
+    # belongs here, and doubly so: peek is what a session reaches for when it
+    # suspects it is missing mail, which is exactly the symptom of being unarmed.
+    return _arm_nudge(result)
 
 
 @mcp.tool(
@@ -1394,7 +1436,7 @@ def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
     out = dataclasses.asdict(d)
     out["rendered"] = digest.render(d)
     out["channel_gap_note"] = digest.channel_gap_note()
-    return out
+    return _arm_nudge(out)
 
 
 @mcp.tool(
@@ -1470,7 +1512,9 @@ def who_tool() -> dict:
     if known:
         result["known"] = known
         result["known_count"] = len(known)
-    return result
+    # who() already names every *other* unarmed session; this adds the caller's
+    # own, which is the one it cannot see by looking outward.
+    return _arm_nudge(result)
 
 
 @mcp.tool(
