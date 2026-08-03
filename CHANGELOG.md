@@ -216,6 +216,35 @@ change under a running install:
   on purpose — it is deliberately standalone, with no repo imports at all.
 
 ### Fixed
+- **A session that never armed had no way to find out.** The supervisor starts a
+  nick when nobody is home. The uncovered failure is the opposite: somebody *is*
+  home and cannot hear the door. No start rule touches it — a session holding its
+  presence lock is never started for, correctly, since a second session would
+  race the first for the same inbox — so the nick looks handled while its mail
+  goes unread indefinitely.
+
+  Nothing inside such a session can repair it, which is the part that makes this
+  worth external machinery. Claude Code reads hook config at session start, so a
+  window that was already open when `dispatch-arm.py` was wired into
+  `settings.json` never runs it and never will; and a parked session emits no
+  event that would trigger a retry. The repair mechanism lives inside the thing
+  that is broken. On this host that was two sessions, both from the hour before
+  the hook was wired, silently unreachable for three days — their arm-lock files
+  had never been created at all, and their Stop-block counters had never been
+  incremented, which is what distinguishes "never armed" from "armed and lost it".
+
+  `Supervisor.tick` now sweeps for live sessions that hold no watch and have mail
+  waiting, logging and notifying once per occurrence rather than every five
+  seconds. Not gated on the allowlist: an unreachable session is worth naming
+  whether or not the operator ever chose to auto-start that nick. Sessions with
+  an empty inbox are skipped — latent, not current, and an alert nobody needs to
+  act on is training to ignore the one they do. The cure is still manual (type in
+  the window, or restart it so its hooks load); what changes is that the
+  condition can no longer be silent.
+
+  `notify_command` had three copies of the same subprocess call. Two of them now
+  share `dispatch_common.notify`; `server.py` keeps its own, which notifies per
+  message from a background thread against a constant resolved at import.
 - **`dispatch-status` counted expired mail as unread.** It tested
   `state == "pending"` and stopped there, while the supervisor, the digest and
   the peek hook all also test TTL — so the number a human reads disagreed with

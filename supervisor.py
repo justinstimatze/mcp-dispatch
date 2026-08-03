@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import dispatch_common
 import dispatch_fs
 
 # The window the starts-per-hour ceiling is measured over. Fixed rather than
@@ -386,6 +387,37 @@ def waiting_mail(dispatch_dir: Path, nick: str, *, inherit: bool = True) -> int:
     )
 
 
+def deaf_sessions(dispatch_dir: Path) -> list[tuple[str, int]]:
+    """Live sessions holding no message watch, and how much mail waits in each.
+
+    The supervisor starts a nick when nobody is home. This is the other failure:
+    somebody *is* home, and cannot hear the door. It is not covered by any start
+    rule — a session holding its presence lock will never be started for, and
+    correctly so, since a second session would race the first for the same inbox.
+
+    Only sessions with mail waiting are reported. A deaf session with an empty
+    inbox is a latent problem, not a current one, and an alert for it would be
+    noise that teaches the operator to ignore the alert that matters.
+
+    Sessions whose armed state cannot be read — another account's, whose lock
+    lives in a cache directory that is not ours — are left out entirely rather
+    than assumed deaf.
+    """
+    out: list[tuple[str, int]] = []
+    for pf in dispatch_fs.live_presence_files(dispatch_dir):
+        try:
+            rec = json.loads(pf.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        aid = str(rec.get("agent_id") or "")
+        if not aid or dispatch_common.armed_for(rec, pf) is not False:
+            continue
+        waiting = dispatch_fs.count_pending(dispatch_dir / aid)
+        if waiting:
+            out.append((aid, waiting))
+    return out
+
+
 def is_live(dispatch_dir: Path, nick: str) -> bool:
     """True if any live session's durable nick is ``nick``."""
     return nick in dispatch_fs.live_nicks(dispatch_dir)
@@ -553,6 +585,9 @@ class Supervisor:
         self.dry_run = dry_run
         self.log = log
         self.states: dict[str, NickState] = {n: NickState() for n in cfg.agents}
+        # Sessions already alerted about, so a standing condition is said once and
+        # not every five seconds. Dropped when it clears, so a recurrence speaks up.
+        self._deaf_alerted: set[str] = set()
 
     # -- outcome bookkeeping ------------------------------------------------
 
@@ -645,7 +680,36 @@ class Supervisor:
             if decision.action == "start":
                 self._start(spec, state, decision, now)
 
+        self._sweep_deaf()
         return decisions
+
+    def _sweep_deaf(self) -> None:
+        """Say when a session is running, holding mail, and unable to hear about it.
+
+        Nothing inside such a session can repair it. The hook that arms a message
+        watch is loaded at session start, so a window that was already open when
+        the hooks were wired never runs it and never will — and a parked session
+        emits no event that could trigger a retry. The repair mechanism is inside
+        the thing that is broken.
+
+        The supervisor cannot reach in either. What it can do is refuse to let the
+        condition stay silent: it is the only process watching the relay that is
+        not itself a session. Not gated on the allowlist — an unreachable session
+        is worth naming whether or not the operator ever chose to auto-start it.
+        """
+        current = dict(deaf_sessions(self.dispatch_dir))
+        for aid, waiting in current.items():
+            if aid in self._deaf_alerted:
+                continue
+            self._deaf_alerted.add(aid)
+            why = (
+                f"{aid} is running but holds no message watch — {waiting} message(s) "
+                "waiting that nothing will wake it to read. Type in that window, or "
+                "restart it so its hooks load."
+            )
+            self.log(f"[supervise] {why}")
+            dispatch_common.notify("mcp-dispatch: a session cannot hear you", why)
+        self._deaf_alerted &= set(current)
 
     def _start(self, spec: AgentSpec, state: NickState, decision: Decision, now: float) -> None:
         if self.dry_run:

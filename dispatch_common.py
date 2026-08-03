@@ -21,6 +21,10 @@ import fcntl
 import hashlib
 import json
 import os
+import shlex
+
+# Runs only the operator's own notify_command, as an argv list with shell=False.
+import subprocess  # nosec B404
 import time
 from pathlib import Path
 
@@ -83,6 +87,34 @@ def auto_arm_disabled(cfg: dict) -> bool:
 
 def md5_key(text: str) -> str:
     return hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()[:8]
+
+
+def notify(summary: str, body: str = "", cfg: dict | None = None) -> bool:
+    """Fire the operator's ``notify_command``, if they set one. False if not.
+
+    Argv list, never a shell, and ``--`` stops a body beginning with a hyphen
+    from being read as options. Best-effort by design: a desktop that isn't
+    there must never be able to fail a caller doing real work.
+
+    (``server.py`` keeps its own call — it notifies per message from a background
+    thread against a constant resolved at import, and re-reading config on that
+    path would buy nothing.)
+    """
+    conf = load_config() if cfg is None else cfg
+    cmd = str(flat(conf, "notify_command") or "").strip()
+    if not cmd:
+        return False
+    try:
+        subprocess.run(  # nosec B603 - argv from local trusted config, shell=False
+            [*shlex.split(cmd), "--", summary, body],
+            timeout=5,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return True
 
 
 def process_chain(pid: int | None = None, depth: int = 8) -> list[int]:

@@ -529,6 +529,19 @@ for it to find, and a successful start clears the trigger by itself (the new
 session claims those files by rename). A message that is already `read`, or
 expired, never wakes anyone.
 
+The daemon also watches for the opposite failure: a session that *is* running
+and holds no message watch, with mail waiting. No start rule covers that one — a
+session holding its presence lock is never started for, correctly, since a second
+session would race the first for the same inbox — so the nick looks handled while
+its mail sits unread. It logs and notifies once per occurrence.
+
+It cannot fix such a session, and neither can the session itself. Claude Code
+reads hook config at session start, so a window that was already open when the
+hooks were wired never runs `dispatch-arm.py` and never will; and a parked
+session emits no event that would retry. **After changing hook config, restart
+your open sessions** — otherwise they stay reachable by name and deaf in
+practice, which is the one state that looks healthy from every other angle.
+
 ### The command is an allowlist, and that is the whole security model
 
 An inbound message causing a process to run is remote-triggered execution, and

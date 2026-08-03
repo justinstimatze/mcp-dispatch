@@ -41,11 +41,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
-
-# subprocess only runs the opt-in, local-config notify_command as an argv list
-# (no shell), mirroring server.py's notify path.
-import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path
@@ -141,23 +136,12 @@ def _instruction(agent_id: str, git_note: str = "") -> str:
 def _desktop_warn(cfg: dict, agent_id: str) -> None:
     """Best-effort loud alert when auto-arm keeps failing, so a wedged launch is
     never silent. Uses the same notify_command the server/waiter use."""
-    cmd = cfg.get("notify_command")
-    if not cmd:
-        return
-    msg = (
-        f"mcp-dispatch: message watch NOT armed for {agent_id} after {MAX_BLOCKS} "
-        "tries — incoming messages may be missed until it starts."
+    common.notify(
+        "mcp-dispatch: message watch not armed",
+        f"{agent_id} gave up arming after {MAX_BLOCKS} tries — incoming messages "
+        "may be missed until it starts.",
+        cfg,
     )
-    try:
-        # argv list, no shell — same shape as server.py's notify_command call.
-        subprocess.run(  # nosec B603
-            [*shlex.split(str(cmd)), "--", msg],
-            timeout=3,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
 
 
 def main() -> int:

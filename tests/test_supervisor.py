@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import dispatch_common  # noqa: E402
 import supervisor  # noqa: E402
 
 SUPERVISE = REPO_ROOT / "bin" / "dispatch-supervise"
@@ -82,6 +83,22 @@ def _spec(nick="proj", command=None, cwd="", env=()):
         cwd=cwd,
         env=tuple(env),
     )
+
+
+@pytest.fixture
+def no_desktop(monkeypatch):
+    """Capture notifications instead of firing them.
+
+    Without this a local `pytest` run pops real desktop toasts — the repo's own
+    config sets notify_command, and the sweep calls it for real.
+    """
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.dispatch_common,
+        "notify",
+        lambda summary, body="", cfg=None: bool(sent.append((summary, body))) or True,
+    )
+    return sent
 
 
 def _cfg(**kw):
@@ -963,3 +980,127 @@ def test_the_park_says_why_when_the_directory_is_the_reason(tmp_path):
     assert any("registers as 'documents'" in line for line in lines), (
         "a park with a knowable cause must name it"
     )
+
+
+# ---------------------------------------------------------------------------
+# The deaf session: somebody is home and cannot hear the door.
+#
+# No start rule covers it. A session holding its presence lock is never started
+# for — correctly, since a second one would race the same inbox — so the nick
+# looks handled while its mail goes unread. Nothing inside the session can fix
+# it either: the hook that arms a watch loads at session start, so a window that
+# was already open when the hooks were wired never runs it, and a parked session
+# emits no event that would retry. The supervisor is the only process watching
+# the relay that is not itself a session.
+# ---------------------------------------------------------------------------
+
+
+def _live_session(dd: Path, agent_id: str, state: Path, *, armed: bool):
+    """A session holding its presence lock, optionally holding an arm lock too."""
+    (dd / ".presence").mkdir(parents=True, exist_ok=True)
+    pf = dd / ".presence" / f"{agent_id}.json"
+    pf.write_text(json.dumps({"agent_id": agent_id, "pid": os.getpid(), "state_dir": str(state)}))
+    handles = [dispatch_common.acquire_flock(pf)]
+    if armed:
+        state.mkdir(parents=True, exist_ok=True)
+        handles.append(dispatch_common.acquire_flock(dispatch_common.arm_lock(agent_id, state)))
+    return handles
+
+
+def test_a_live_session_with_no_watch_and_waiting_mail_is_reported(tmp_path):
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    _plant(dd, "proj-42", mid="m1")
+    handles = _live_session(dd, "proj-42", tmp_path / "state", armed=False)
+    try:
+        assert supervisor.deaf_sessions(dd) == [("proj-42", 1)]
+    finally:
+        for h in handles:
+            if h is not None:
+                h.close()
+
+
+def test_a_listening_session_is_not_reported(tmp_path):
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    _plant(dd, "proj-42", mid="m1")
+    handles = _live_session(dd, "proj-42", tmp_path / "state", armed=True)
+    try:
+        assert supervisor.deaf_sessions(dd) == []
+    finally:
+        for h in handles:
+            if h is not None:
+                h.close()
+
+
+def test_a_deaf_session_with_an_empty_inbox_is_not_an_alert(tmp_path):
+    """Latent, not current. Alerting here trains the operator to ignore alerts."""
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    handles = _live_session(dd, "proj-42", tmp_path / "state", armed=False)
+    try:
+        assert supervisor.deaf_sessions(dd) == []
+    finally:
+        for h in handles:
+            if h is not None:
+                h.close()
+
+
+def test_expired_mail_does_not_make_a_session_deaf(tmp_path):
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    _plant(dd, "proj-42", mid="m1", ttl=60, timestamp="2020-01-01T00:00:00Z")
+    handles = _live_session(dd, "proj-42", tmp_path / "state", armed=False)
+    try:
+        assert supervisor.deaf_sessions(dd) == []
+    finally:
+        for h in handles:
+            if h is not None:
+                h.close()
+
+
+def test_the_sweep_says_it_once_and_again_only_if_it_recurs(tmp_path, no_desktop):
+    """A standing condition on a five-second tick must not become a firehose,
+    and a cleared-then-returned one must not be swallowed."""
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    _plant(dd, "proj-42", mid="m1")
+    handles = _live_session(dd, "proj-42", tmp_path / "state", armed=False)
+    lines: list[str] = []
+    sup = supervisor.Supervisor(dd, _cfg(agents={}), log=lines.append)
+    try:
+        sup.tick()
+        sup.tick()
+        said = [ln for ln in lines if "no message watch" in ln]
+        assert len(said) == 1, f"one alert for one condition, got {said}"
+        assert "proj-42" in said[0] and "1 message" in said[0]
+
+        for f in (dd / "proj-42").glob("*.json"):  # operator reads the mail
+            f.unlink()
+        sup.tick()
+        _plant(dd, "proj-42", mid="m2")  # and a new message arrives
+        sup.tick()
+        assert len([ln for ln in lines if "no message watch" in ln]) == 2
+        assert len(no_desktop) == 2, "the operator is told, not just the log"
+    finally:
+        for h in handles:
+            if h is not None:
+                h.close()
+
+
+def test_the_sweep_covers_sessions_outside_the_allowlist(tmp_path, no_desktop):
+    """An unreachable session is worth naming whether or not the operator ever
+    chose to auto-start that nick."""
+    dd = tmp_path / "relay"
+    dd.mkdir()
+    _plant(dd, "stranger-9", mid="m1")
+    handles = _live_session(dd, "stranger-9", tmp_path / "state", armed=False)
+    lines: list[str] = []
+    sup = supervisor.Supervisor(dd, _cfg(agents={}), log=lines.append)
+    try:
+        sup.tick()
+        assert any("stranger-9" in ln for ln in lines)
+    finally:
+        for h in handles:
+            if h is not None:
+                h.close()
