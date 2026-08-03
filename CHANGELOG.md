@@ -216,6 +216,19 @@ change under a running install:
   on purpose — it is deliberately standalone, with no repo imports at all.
 
 ### Fixed
+- **`dispatch-status` counted expired mail as unread.** It tested
+  `state == "pending"` and stopped there, while the supervisor, the digest and
+  the peek hook all also test TTL — so the number a human reads disagreed with
+  the number the supervisor acts on. Caught on the live relay: a self-addressed
+  routing probe sent with `ttl=300` was still being reported as unread a day and
+  a half after it expired, and had been inherited across two session generations
+  on the way. That number now decides whether someone walks over to a window,
+  which is a poor moment to be counting mail nobody will ever read.
+
+  The scan is one implementation, `dispatch_fs.iter_pending`, used by the status
+  readout, the supervisor's `waiting_mail` and the digest's mail collector — the
+  fourth copy was where the missing test was. `hooks/dispatch-peek.py` keeps its
+  own by design; it imports nothing from the repo.
 - **A second window on a project disarmed both.** Identity discovery matched
   live presence records against the nick the working directory produces and
   accepted the answer only `if len(matches) == 1`. Two Claude Code windows open

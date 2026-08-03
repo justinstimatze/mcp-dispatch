@@ -381,19 +381,9 @@ def waiting_mail(dispatch_dir: Path, nick: str, *, inherit: bool = True) -> int:
     Reads message JSON *only* to test state and TTL. No field of any message
     influences whether or what the supervisor spawns — see the module docstring.
     """
-    total = 0
-    for d in inherit_sources(dispatch_dir, nick, inherit=inherit):
-        for f in sorted(d.glob("*.json")):
-            try:
-                msg = json.loads(f.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("state", "pending") != "pending" or dispatch_fs.is_expired(msg):
-                continue
-            total += 1
-    return total
+    return sum(
+        dispatch_fs.count_pending(d) for d in inherit_sources(dispatch_dir, nick, inherit=inherit)
+    )
 
 
 def is_live(dispatch_dir: Path, nick: str) -> bool:

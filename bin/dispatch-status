@@ -22,19 +22,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
 
 
 def _pending(inbox: Path) -> int:
-    if not inbox.is_dir():
-        return 0
-    n = 0
-    for f in inbox.glob("*.json"):
-        try:
-            if json.loads(f.read_text()).get("state", "pending") == "pending":
-                n += 1
-        except (json.JSONDecodeError, OSError):
-            pass
-    return n
+    # Shared with the supervisor and the digest, so "unread: 4" here means the
+    # same four messages they would act on. This used to count expired mail.
+    return dispatch_fs.count_pending(inbox)
 
 
 def main() -> int:

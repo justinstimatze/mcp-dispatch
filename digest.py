@@ -121,15 +121,7 @@ def _collect_mail(dispatch_dir: Path, nick: str) -> list[MailItem]:
     """
     by_sender: dict[str, MailItem] = {}
     for d in _nick_inboxes(dispatch_dir, nick):
-        for f in sorted(d.glob("*.json")):
-            try:
-                msg = json.loads(f.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("state", "pending") != "pending" or dispatch_fs.is_expired(msg):
-                continue
+        for msg in dispatch_fs.iter_pending(d):
             sender = str(msg.get("from") or "?")
             item = by_sender.setdefault(sender, MailItem(sender=sender, count=0))
             item.count += 1

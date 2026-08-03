@@ -21,6 +21,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,38 @@ def is_expired(msg: dict) -> bool:
     if sent_at <= 0:
         return False
     return time.time() > sent_at + ttl
+
+
+def iter_pending(inbox: Path) -> Iterator[dict]:
+    """Every message in ``inbox`` still waiting to be read, oldest first.
+
+    "Waiting" means pending *and* unexpired. Four places had written this loop
+    and one of them left out the expiry test, so `dispatch-status` reported mail
+    that every other consumer had already written off — including a five-minute
+    routing probe it still called unread a day and a half later. A count a human
+    acts on has to mean the same thing as the count the supervisor acts on.
+
+    Unreadable and malformed files are skipped rather than raising: an inbox is
+    written concurrently by other processes, and a half-written file is a
+    momentary state, not a reason to fail the whole scan.
+    """
+    if not inbox.is_dir():
+        return
+    for f in sorted(inbox.glob("*.json")):
+        try:
+            msg = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("state", "pending") != "pending" or is_expired(msg):
+            continue
+        yield msg
+
+
+def count_pending(inbox: Path) -> int:
+    """How many messages in ``inbox`` are actually waiting. See `iter_pending`."""
+    return sum(1 for _ in iter_pending(inbox))
 
 
 def presence_is_live(pf: Path) -> bool:

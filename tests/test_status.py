@@ -112,3 +112,58 @@ def test_a_session_older_than_the_field_still_reports(tmp_path):
         fh.close()
 
     assert "legacy-1" in out and "unread:2" in out
+
+
+# ---------------------------------------------------------------------------
+# The unread count has to mean what the supervisor and digest mean by it.
+#
+# This readout used to count raw `state == "pending"` and ignore TTL, so a
+# five-minute routing probe was still being reported as unread a day and a half
+# after it expired — while every other consumer had written it off.
+# ---------------------------------------------------------------------------
+
+
+def _msg(inbox: Path, name: str, **fields):
+    inbox.mkdir(parents=True, exist_ok=True)
+    base = {"id": name, "state": "pending", "timestamp": "2020-01-01T00:00:00Z", "ttl": None}
+    (inbox / f"{name}.json").write_text(json.dumps({**base, **fields}))
+
+
+def test_expired_mail_is_not_counted_as_unread(tmp_path):
+    relay, state = tmp_path / "relay", tmp_path / "state"
+    state.mkdir()
+    inbox = relay / "probe-1"
+    _msg(inbox, "stale", ttl=300)  # a 2020 message with a 5-minute TTL
+    _msg(inbox, "fresh")  # no TTL → waits forever
+    fh = _session(relay, "probe-1", state)
+    try:
+        out = _run(relay, state)
+    finally:
+        fh.close()
+
+    line = [ln for ln in out.splitlines() if "probe-1" in ln][0]
+    assert "unread:1" in line, f"only the unexpired message counts: {line}"
+
+
+def test_an_expired_message_never_makes_an_inbox_look_orphaned(tmp_path):
+    """Orphan reporting is driven by the same count, so an expired-only inbox
+    must not appear as messages stranded by a departed owner."""
+    relay, state = tmp_path / "relay", tmp_path / "state"
+    state.mkdir()
+    (relay / ".presence").mkdir(parents=True)
+    _msg(relay / "ghost-9", "stale", ttl=60)
+    assert "ghost-9" not in _run(relay, state)
+
+
+def test_must_read_outlives_its_ttl(tmp_path):
+    """must_read is the escape hatch from expiry; the readout has to honour it
+    or the one class of message that must not be dropped goes uncounted."""
+    relay, state = tmp_path / "relay", tmp_path / "state"
+    state.mkdir()
+    _msg(relay / "probe-1", "important", ttl=60, must_read=True)
+    fh = _session(relay, "probe-1", state)
+    try:
+        out = _run(relay, state)
+    finally:
+        fh.close()
+    assert "unread:1" in [ln for ln in out.splitlines() if "probe-1" in ln][0]
