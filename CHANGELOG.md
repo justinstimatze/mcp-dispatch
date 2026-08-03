@@ -216,6 +216,33 @@ change under a running install:
   on purpose — it is deliberately standalone, with no repo imports at all.
 
 ### Fixed
+- **A second window on a project disarmed both.** Identity discovery matched
+  live presence records against the nick the working directory produces and
+  accepted the answer only `if len(matches) == 1`. Two Claude Code windows open
+  on the same project — an ordinary thing to do — produce two sessions with the
+  same nick, the same cwd and the same everything else in the record, so the
+  match was ambiguous and both the arm hook and `dispatch-wait` returned `None`
+  and exited 0. Neither session could arm a watch, neither could be told it was
+  deaf, and the older one stayed armed only because it got there first.
+
+  They do differ in one place: they hang off different `claude` processes, and a
+  hook or waiter running inside one of them hangs off the same one. Discovery
+  now breaks the tie on ancestry, walking `/proc` from the pid in each presence
+  record and picking the candidate sharing our nearest ancestor. Unrelated
+  sessions meet at the terminal and the desktop shell, so proximity is what
+  carries it. An equidistant tie still returns `None` — arming a stranger's
+  session is worse than arming none.
+
+  The ancestry is walked at read time rather than stamped at startup, so this
+  works for sessions that were already running when it shipped: the held flock
+  proves the recorded pid is still that process. Verified against the two live
+  `cope` sessions that surfaced it.
+
+  Both copies of this resolver are gone. `bin/dispatch-wait` had its own regex
+  for the nick rule that no longer matched the launcher's; there is now one
+  implementation in `dispatch_common.resolve_agent_id`. `hooks/dispatch-peek.py`
+  keeps its own on purpose — it is standalone by design, and a peek that fails
+  to resolve degrades to showing nothing rather than to silence.
 - **Inbox inheritance could cross hosts.** `_inherit_orphan_inbox` adopts pending
   mail from dead sessions sharing a nick, which is right for `stope-3218326` →
   `stope-4471002` and wrong when the donor is on another machine. It checked

@@ -52,7 +52,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dispatch_common as common  # noqa: E402
-import dispatch_fs  # noqa: E402
 
 MAX_BLOCKS = 2  # consecutive Stop blocks before degrading, so a bad launch can't wedge
 # On SessionStart the MCP server may not have claimed presence yet, so id
@@ -67,24 +66,7 @@ START_RESOLVE_SLEEP = 0.2
 
 
 def _resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
-    explicit = (os.environ.get("MCP_DISPATCH_AGENT_ID") or "").strip().lower()
-    if explicit:
-        return explicit
-
-    prefix = dispatch_fs.nick_for_dir(cwd)
-    if not prefix:
-        return None
-    presence = dispatch_dir / ".presence"
-    matches = []
-    for pf in presence.glob("*.json"):
-        try:
-            data = json.loads(pf.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        aid = data.get("agent_id", "")
-        if aid.startswith(f"{prefix}-") and common.flock_held(pf):
-            matches.append(aid)
-    return matches[0] if len(matches) == 1 else None
+    return common.resolve_agent_id(dispatch_dir, cwd)
 
 
 def _is_armed(agent_id: str) -> bool:

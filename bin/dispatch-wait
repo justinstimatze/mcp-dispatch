@@ -54,7 +54,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -87,24 +86,7 @@ def _notify_on(cli_value: str | None) -> str:
 
 
 def _resolve_agent_id(dispatch_dir: Path) -> str | None:
-    explicit = (os.environ.get("MCP_DISPATCH_AGENT_ID") or "").strip().lower()
-    if explicit:
-        return explicit
-
-    prefix = re.sub(r"^-*", "", re.sub(r"[^a-z0-9-]", "", os.path.basename(os.getcwd()).lower()))
-    if not prefix:
-        return None
-    presence = dispatch_dir / ".presence"
-    matches = []
-    for pf in presence.glob("*.json"):
-        try:
-            data = json.loads(pf.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        aid = data.get("agent_id", "")
-        if aid.startswith(f"{prefix}-") and common.flock_held(pf):
-            matches.append(aid)
-    return matches[0] if len(matches) == 1 else None
+    return common.resolve_agent_id(dispatch_dir, os.getcwd())
 
 
 def _my_channels(dispatch_dir: Path, agent_id: str) -> list[str]:

@@ -9,6 +9,7 @@ so no consumer can drift again.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sys
 from pathlib import Path
@@ -208,3 +209,146 @@ def test_armed_for_will_not_guess_about_another_account(tmp_path, monkeypatch):
 
 def test_armed_for_without_an_id_is_unknown(tmp_path):
     assert common.armed_for({}, tmp_path / "presence.json") is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_agent_id(): two windows on one project
+#
+# Same directory → same nick → same prefix, and the presence records agree on
+# every other field too. Before ancestry the resolver saw two matches and
+# returned None, which meant neither session could arm a watch and neither could
+# be told it was deaf. The processes hang off different `claude` parents, and so
+# does the hook doing the asking.
+# ---------------------------------------------------------------------------
+
+
+def _presence(relay: Path, agent_id: str, pid=0, *, lock=True):
+    """A presence record. `pid` is what resolve_agent_id walks the ancestry of,
+    so the tests stub process_chain to map these fake pids to fake chains."""
+    (relay / ".presence").mkdir(parents=True, exist_ok=True)
+    pf = relay / ".presence" / f"{agent_id}.json"
+    pf.write_text(json.dumps({"agent_id": agent_id, "pid": pid}))
+    if not lock:
+        return None
+    return common.acquire_flock(pf)
+
+
+def _chains(mapping, mine):
+    """Stub process_chain: a pid argument looks up a candidate's chain, no
+    argument means "our own", which is what pick_by_ancestry asks for."""
+    return lambda pid=None, **kw: mine if pid is None else mapping.get(pid, [])
+
+
+def test_process_chain_starts_at_our_parent(tmp_path):
+    chain = common.process_chain()
+    assert chain, "/proc should be readable on the host running these tests"
+    assert chain[0] == os.getppid()
+    assert os.getpid() not in chain, "our own pid is not our ancestor"
+
+
+def test_process_chain_survives_a_comm_containing_spaces(tmp_path):
+    """`tmux: server` broke the field-counting parse — its comm holds a space,
+    so counting whitespace fields reads the state letter as the ppid."""
+    proc = tmp_path / "proc" / "4242"
+    proc.mkdir(parents=True)
+    (proc / "stat").write_text("4242 (tmux: server) S 99 4242 4242 0 -1 0 " + "0 " * 40)
+    # Parse the same way process_chain does, on the pathological line.
+    fields = (proc / "stat").read_text().rpartition(")")[2].split()
+    assert fields[0] == "S" and int(fields[1]) == 99
+
+
+def test_two_windows_on_one_project_resolve_to_the_right_one(tmp_path, monkeypatch):
+    relay = tmp_path / "relay"
+    monkeypatch.delenv("MCP_DISPATCH_AGENT_ID", raising=False)
+    mine = [500, 400, 300]  # our claude is 500; 300 is the terminal we share
+    a = _presence(relay, "cope-1", pid=11)
+    b = _presence(relay, "cope-2", pid=22)
+    chains = {11: [500, 400, 300], 22: [900, 800, 300]}  # 22 hangs off another claude
+    try:
+        monkeypatch.setattr(common, "process_chain", _chains(chains, mine))
+        assert common.resolve_agent_id(relay, "/home/x/cope") == "cope-1"
+    finally:
+        for fh in (a, b):
+            if fh is not None:
+                fh.close()
+
+
+def test_a_lone_session_needs_no_ancestry(tmp_path, monkeypatch):
+    """The common case must not start depending on /proc."""
+    relay = tmp_path / "relay"
+    monkeypatch.delenv("MCP_DISPATCH_AGENT_ID", raising=False)
+    monkeypatch.setattr(common, "process_chain", _chains({}, []))
+    fh = _presence(relay, "cope-1")  # /proc unreadable, single match anyway
+    try:
+        assert common.resolve_agent_id(relay, "/home/x/cope") == "cope-1"
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_an_equidistant_tie_is_not_guessed(tmp_path, monkeypatch):
+    """Two candidates sharing the same nearest ancestor carry no evidence.
+    Arming a stranger's session is worse than arming none."""
+    relay = tmp_path / "relay"
+    monkeypatch.delenv("MCP_DISPATCH_AGENT_ID", raising=False)
+    a = _presence(relay, "cope-1", pid=11)
+    b = _presence(relay, "cope-2", pid=22)
+    try:
+        monkeypatch.setattr(common, "process_chain", _chains({11: [777], 22: [777]}, [777, 300]))
+        assert common.resolve_agent_id(relay, "/home/x/cope") is None
+    finally:
+        for fh in (a, b):
+            if fh is not None:
+                fh.close()
+
+
+def test_a_dead_sibling_does_not_create_ambiguity(tmp_path, monkeypatch):
+    relay = tmp_path / "relay"
+    monkeypatch.delenv("MCP_DISPATCH_AGENT_ID", raising=False)
+    _presence(relay, "cope-dead", pid=99, lock=False)  # no flock → not live
+    fh = _presence(relay, "cope-1", pid=11)
+    try:
+        assert common.resolve_agent_id(relay, "/home/x/cope") == "cope-1"
+    finally:
+        if fh is not None:
+            fh.close()
+
+
+def test_an_explicit_id_skips_discovery_entirely(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_DISPATCH_AGENT_ID", "Stated-1")
+    assert common.resolve_agent_id(tmp_path, "/home/x/cope") == "stated-1"
+
+
+def test_a_candidate_whose_process_is_gone_loses_to_one_that_is_there(tmp_path, monkeypatch):
+    """A pid that no longer resolves yields an empty chain and cannot win — it
+    must not drag its live sibling down with it into an unresolvable tie."""
+    relay = tmp_path / "relay"
+    monkeypatch.delenv("MCP_DISPATCH_AGENT_ID", raising=False)
+    gone = _presence(relay, "cope-gone", pid=98)
+    here = _presence(relay, "cope-here", pid=11)
+    try:
+        monkeypatch.setattr(common, "process_chain", _chains({11: [500]}, [500, 300]))
+        assert common.resolve_agent_id(relay, "/home/x/cope") == "cope-here"
+    finally:
+        for fh in (gone, here):
+            if fh is not None:
+                fh.close()
+
+
+def test_ancestry_resolves_against_real_proc(tmp_path, monkeypatch):
+    """No stubs: the live walk, on this machine's /proc.
+
+    The decoy claims pid 1, whose walk terminates immediately and yields no
+    ancestors, so it can never share one with us. The candidate claiming this
+    test process has exactly our chain.
+    """
+    relay = tmp_path / "relay"
+    monkeypatch.delenv("MCP_DISPATCH_AGENT_ID", raising=False)
+    decoy = _presence(relay, "cope-decoy", pid=1)
+    ours = _presence(relay, "cope-ours", pid=os.getpid())
+    try:
+        assert common.resolve_agent_id(relay, "/home/x/cope") == "cope-ours"
+    finally:
+        for fh in (decoy, ours):
+            if fh is not None:
+                fh.close()
