@@ -57,6 +57,15 @@ change under a running install:
   across 12 directories permanently ineligible for adoption by any code path,
   and 47 of 84 `.remote` entries naming a spool that exists locally.
 
+  The registry fix is forward-looking — it protects sessions from the moment
+  they start — so a relay that has been running the old code has stranded mail
+  it cannot recover on its own. `scripts/recover-stranded-mail.py` moves those
+  messages into their nick's inbox, where the next session inherits them
+  normally. It dry-runs by default and only touches `pending` messages in dead,
+  same-uid spools that the roster had marked remote. Run on the development
+  host: 18 messages re-homed, the oldest from 23 June; five more were left
+  alone as another account's mail.
+
   Ownership is now recorded in the `.agents` registry, which is never reaped, as
   a `local_sessions` list per nick — per session id rather than per nick, since
   `documents-<pid>` collides across hosts, and pruned by inbox existence rather
