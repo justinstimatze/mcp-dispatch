@@ -496,15 +496,24 @@ called `publicai`. Nicks are recorded in `{dispatch_dir}/.agents/<nick>.json`
 (first seen, last seen, session count, last session id, standing channels) and
 are never reaped — a nick you have talked to once stays addressable forever.
 
-Three things follow:
+Four things follow:
 
 - **`who()` reports offline teammates** under a `known` key, alongside the live
   `agents` and cross-host `remote` lists. A nick with a live session isn't
-  listed there — it's already in `agents`.
+  listed there — it's already in `agents`. `remote` is reachability rather than
+  liveness (it comes from git lane activity, not a heartbeat), so its entries
+  carry the `nick` that resolves correctly, an `age`, and `stale: true` once
+  they have gone quiet for an hour.
 - **`dispatch(target="publicai")` resolves.** With live sessions, it reaches
   *all* of them (`queued_to` says which) — picking one arbitrarily is how a
-  message ends up in the window nobody is watching. Addressing a concrete
+  message ends up in the window nobody is watching. Addressing a concrete *live*
   session id (`publicai-1767991`) is unchanged and never fans out.
+- **A dead session id resolves to its nick.** Addressing one specific window
+  only means something while that window is open; once it has exited, the
+  message goes to whatever session of `publicai` is live instead, or waits in
+  the nick's inbox. A cross-host session id is the exception and is never
+  degraded — `documents-<pid>` is what every session launched from a projects
+  folder is called on every machine.
 - **Mail sent to an offline nick waits.** It goes to the nick's own inbox, and
   the next session of that nick inherits it at startup — the same mechanism that
   already adopted a dead session's unread mail, widened to cover the drop box.

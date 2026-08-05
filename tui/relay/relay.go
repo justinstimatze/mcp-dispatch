@@ -452,17 +452,27 @@ type outMessage struct {
 //   - a nick with live sessions ("publicai", whose sessions are publicai-<pid>)
 //     → all of them, because addressing the teammate must not land in whichever
 //     window happens to be unwatched;
+//   - another host's session id → itself, since its inbox here is the gitsync
+//     daemon's pickup point and stripping the suffix would hand the message to a
+//     same-named local session instead;
+//   - a *dead* session id → the nick behind it, resolved again. Addressing one
+//     window only means something while that window is open; writing to a spool
+//     whose session exited is how a reply reaches a corpse;
 //   - nothing live → the nick's own inbox, where its next session inherits it.
 func resolveRecipients(target string, snap Snapshot) []string {
 	var live []string
+	remote := false
 	for _, a := range snap.Agents {
-		if !a.Live || !ValidID(a.ID) {
+		if !ValidID(a.ID) {
 			continue
 		}
 		if a.ID == target {
-			return []string{target} // a concrete session id addresses itself
+			if a.Live {
+				return []string{target} // a concrete live session addresses itself
+			}
+			remote = remote || a.Remote
 		}
-		if Project(a.ID) == target {
+		if a.Live && Project(a.ID) == target {
 			live = append(live, a.ID)
 		}
 	}
@@ -470,7 +480,20 @@ func resolveRecipients(target string, snap Snapshot) []string {
 		sort.Strings(live)
 		return live
 	}
-	return []string{target}
+	nick := Project(target)
+	if remote || nick == target {
+		return []string{target}
+	}
+	for _, a := range snap.Agents {
+		if a.Live && ValidID(a.ID) && Project(a.ID) == nick {
+			live = append(live, a.ID)
+		}
+	}
+	if len(live) > 0 {
+		sort.Strings(live)
+		return live
+	}
+	return []string{nick}
 }
 
 // Send delivers a message from `from` to `target` (an agent id, "#channel", or

@@ -354,3 +354,54 @@ func TestSendToAConcreteSessionIsUnchanged(t *testing.T) {
 		t.Fatal("the sibling should have nothing")
 	}
 }
+
+// The TUI and the IRC gateway write the same files the server does, so a
+// disagreement about a dead session id would strand mail from this side too.
+func TestSendToADeadSessionReachesTheLiveOne(t *testing.T) {
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{
+		{ID: "winze-3932373", Live: false}, // exited an hour ago
+		{ID: "winze-348403", Live: true},
+	}}
+	n, err := Send(relay, "console-1", "winze-3932373", "reply to your report", snap, "normal")
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "winze-348403", "*.json")); len(fs) != 1 {
+		t.Fatal("a closed window must resolve to the open one")
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "winze-3932373", "*.json")); len(fs) != 0 {
+		t.Fatal("nothing may be written to the corpse")
+	}
+}
+
+func TestSendToADeadSessionWaitsUnderTheNickWhenNothingIsLive(t *testing.T) {
+	relay := t.TempDir()
+	snap := Snapshot{Agents: []Agent{{ID: "winze-3932373", Live: false}}}
+	if _, err := Send(relay, "console-1", "winze-3932373", "later", snap, "normal"); err != nil {
+		t.Fatal(err)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "winze", "*.json")); len(fs) != 1 {
+		t.Fatal("with nothing live it belongs to the nick")
+	}
+}
+
+func TestSendToARemoteSessionIsNotDegradedToALocalNick(t *testing.T) {
+	relay := t.TempDir()
+	// documents-<pid> is what every session launched from a projects folder is
+	// called on every host, so stripping the suffix hands another machine's mail
+	// to a local stranger.
+	snap := Snapshot{Agents: []Agent{
+		{ID: "documents-999", Remote: true},
+		{ID: "documents-3099918", Live: true},
+	}}
+	if _, err := Send(relay, "console-1", "documents-999", "for elsewhere", snap, "normal"); err != nil {
+		t.Fatal(err)
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "documents-999", "*.json")); len(fs) != 1 {
+		t.Fatal("a remote id keeps its own inbox, which the gitsync daemon drains")
+	}
+	if fs, _ := filepath.Glob(filepath.Join(relay, "documents-3099918", "*.json")); len(fs) != 0 {
+		t.Fatal("the local session of the same name must not receive it")
+	}
+}

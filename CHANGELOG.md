@@ -28,6 +28,54 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Fixed
+- **A reply addressed to a session that had exited was written into its grave.**
+  Reported the same evening by two agents who hit it independently, one of whom
+  filed the report itself to a session that had been dead two days.
+
+  `_resolve_recipients` had three branches and the last one never applied
+  `durable_nick`. A target like `winze-3932373` is not live, has no live sessions
+  *of that literal name*, and so fell through to itself — writing into the spool
+  of a session that exited a hundred minutes earlier. `queued_to` looked normal
+  and the sent receipt said `pending` forever. In one case the reply's own first
+  sentence named the live session it failed to reach. It now resolves the nick
+  behind a dead session id: live sessions of `winze` if any, otherwise the nick's
+  inbox for the next one to inherit. Addressing a *live* session id is unchanged,
+  and a cross-host id is never degraded — `documents-<pid>` is what every session
+  launched from a projects folder is called on every machine, so stripping the
+  suffix would hand another host's mail to a local stranger.
+
+- **The safety net for that had been disabled for months, silently.**
+  `_inherit_orphan_inbox` refuses to adopt from a donor listed in `.remote/`, on
+  the rule that another host's session is never a previous incarnation of this
+  one. Correct rule; the roster feeding it was wrong. `git_bridge._local_ids`
+  decided what belonged to this host by looking for a presence file, "the durable
+  'this id had a session here' marker" — but `_reap_dead_presence` unlinks dead
+  presence files at every startup. So a session that exited an hour ago lost its
+  marker, the next roster pass published it as another machine's agent, and
+  inheritance skipped its spool from then on. Measured on the development host
+  before the fix: 105 pending messages sitting in non-live spools, 23 of them
+  across 12 directories permanently ineligible for adoption by any code path,
+  and 47 of 84 `.remote` entries naming a spool that exists locally.
+
+  Ownership is now recorded in the `.agents` registry, which is never reaped, as
+  a `local_sessions` list per nick — per session id rather than per nick, since
+  `documents-<pid>` collides across hosts, and pruned by inbox existence rather
+  than capped, so it outlives exactly the spool it describes. `last_session_id`
+  counts too, so registries already on disk answer without waiting for that nick
+  to start again. The roster is self-pruning, so the bad entries clear themselves
+  on the next gitsync pass and the stranded mail becomes adoptable with no
+  migration step.
+
+- **`who()` handed senders a graveyard and called it a roster.** The `remote`
+  list was flat session ids with a raw `last_seen` — 84 of them on the
+  development host, most long dead, distinguished from a live one only by a
+  timestamp the reader had to diff against now in their head. Both agents who
+  reported the delivery bug said this is where they picked the dead id. Entries
+  now carry `nick` (the name that resolves correctly), `age` as a glanceable
+  `12m`/`3h`/`2d`, and `stale: true` past an hour, with a note on the list saying
+  to address the nick instead. An entry with no usable timestamp gets no age and
+  no staleness verdict rather than a guessed one.
+
 - **An expired message took its own delivery receipt with it.** `_cleanup_expired`
   unlinked the file, and `_get_sent_receipts` builds the sender's receipts by
   reading those same files — so the receipt vanished along with the message. A

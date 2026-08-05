@@ -206,6 +206,36 @@ def live_nicks(dispatch_dir: Path) -> set[str]:
     return {durable_nick(aid) for aid in live_agents(dispatch_dir)}
 
 
+def local_session_ids(dispatch_dir: Path) -> set[str]:
+    """Every session id the ``.agents`` registry records as claimed on this host.
+
+    The answer to "did this id ever run *here*?", asked long after it exited. The
+    registry is never reaped, which is what makes it usable for the question;
+    presence is not, so a dead session loses its presence file at the next startup
+    and stops being recognisable as ours. See server._local_session_ids for what
+    goes wrong when the caller has to fall back on presence.
+
+    ``last_session_id`` counts too. It predates ``local_sessions`` and is written
+    by the same claim, so records already on disk answer for their most recent
+    session without waiting for that nick to start again.
+    """
+    out: set[str] = set()
+    reg = dispatch_dir / ".agents"
+    if not reg.is_dir():
+        return out
+    for f in reg.glob("*.json"):
+        try:
+            rec = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        recorded = list(rec.get("local_sessions") or [])
+        recorded.append(rec.get("last_session_id"))
+        out.update(a for a in recorded if isinstance(a, str) and ID_RE.match(a))
+    return out
+
+
 def channel_subscribers(dispatch_dir: Path, channel: str) -> list[str]:
     """Live agents currently subscribed to a channel, by presence record."""
     subs: list[str] = []

@@ -322,13 +322,26 @@ class GitBridge:
     # -- remote roster (churn-free cross-host presence) ----------------------
 
     def _local_ids(self) -> set[str]:
-        """Ids that belong to THIS host: anything with a presence file (live or
-        not). A presence file is the durable 'this id had a session here' marker —
-        unlike an inbox dir, which a remote recipient also gets from _send."""
+        """Ids that belong to THIS host — the roster's exclusion list.
+
+        A presence file was the whole answer here, on the reasoning that it is the
+        durable 'this id had a session here' marker (unlike an inbox dir, which a
+        remote recipient also gets from _send). It is not durable: server.py's
+        _reap_dead_presence unlinks dead presence files at startup, so a session
+        that exited an hour ago drops out of this set, gets published to .remote/
+        as another machine's agent, and — because _inherit_orphan_inbox skips any
+        donor listed there — takes its unread mail out of reach of every code path
+        that could still have delivered it.
+
+        The .agents registry is never reaped, so its record of locally-claimed
+        session ids is the marker presence was standing in for. Presence stays in
+        the union: it still covers ids too new or too odd to have registered.
+        """
         pres = self.dispatch_dir / ".presence"
-        if not pres.is_dir():
-            return set()
-        return {p.stem for p in pres.glob("*.json") if ID_RE.match(p.stem)}
+        ids = set()
+        if pres.is_dir():
+            ids = {p.stem for p in pres.glob("*.json") if ID_RE.match(p.stem)}
+        return ids | dispatch_fs.local_session_ids(self.dispatch_dir)
 
     def _write_remote_roster(self) -> None:
         """Materialize cross-host reachability into DISPATCH_DIR/.remote/ so who()

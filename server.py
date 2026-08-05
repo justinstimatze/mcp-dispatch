@@ -164,6 +164,11 @@ TOMBSTONE_PREVIEW = 120
 # the cost of noticing late is a delay, while the cost of noticing never is the
 # message. See _start_sweeper.
 SWEEP_SECONDS = 120
+# Past this, who() marks a cross-host roster entry stale. The roster tracks lane
+# activity rather than heartbeats, so this is a claim about the *session id* going
+# cold, not about the machine being unreachable — a stale entry's nick is still
+# the right thing to address.
+REMOTE_STALE_SECONDS = 3600
 GROUP_MODE = bool(CONFIG["group_mode"])
 # Directory mode: setgid + group-rwx when sharing, else owner-only. The setgid
 # bit makes inboxes created by any participant inherit the relay's group.
@@ -437,6 +442,34 @@ def _agent_record_path(nick: str) -> Path:
     return DISPATCH_DIR / ".agents" / f"{nick}.json"
 
 
+def _local_session_ids(rec: dict, agent_id: str) -> list[str]:
+    """The session ids this nick has claimed *on this host*, newest first.
+
+    The git bridge needs a marker for "this id had a session here" that outlives
+    the session. Presence was that marker and is not durable enough for the job:
+    _reap_dead_presence unlinks a dead session's presence file at the next
+    startup, after which git_bridge._local_ids() stops recognising this host's own
+    corpse, the roster pass publishes it under .remote/ as another machine's
+    agent, and _inherit_orphan_inbox then skips its spool forever — so whatever
+    unread mail landed there before it died is unreachable by any code path.
+
+    Keyed per session id rather than per nick, because `documents-<pid>` is what
+    every session launched from a projects folder is called on every host, and
+    matching by nick would claim a stranger's inbox across that boundary.
+
+    Pruned by inbox existence rather than capped at a count: the list only has to
+    outlive the spool it describes, and once the spool is gone there is nothing
+    left to misattribute.
+    """
+    out = [agent_id]
+    for aid in rec.get("local_sessions") or []:
+        if aid == agent_id or not isinstance(aid, str):
+            continue
+        if (DISPATCH_DIR / aid).is_dir():
+            out.append(aid)
+    return out
+
+
 def _register_agent(agent_id: str) -> dict:
     """Upsert this session's nick in the registry. Returns the record.
 
@@ -478,6 +511,7 @@ def _register_agent(agent_id: str) -> dict:
         rec["previous_seen"] = rec.get("last_seen") or rec.get("first_seen") or now
     rec["last_seen"] = now
     rec["last_session_id"] = agent_id
+    rec["local_sessions"] = _local_session_ids(rec, agent_id)
     try:
         _atomic_write(path, rec)
     except OSError:
@@ -531,16 +565,40 @@ def _live_sessions_of(nick: str) -> list[str]:
     return sorted(aid for aid in _live_agents() if _durable_nick(aid) == nick)
 
 
+def _age_label(seen: float) -> str:
+    """How long ago, at a glance: `12m`, `3h`, `2d`.
+
+    A reader comparing an ISO timestamp against now does the subtraction in their
+    head and gets it wrong, which is the mistake this exists to remove.
+    """
+    secs = max(0, int(time.time() - seen))
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
 def _resolve_recipients(target: str) -> list[str]:
     """Map a DM target to the inbox ids it should actually be written to.
 
-    Three cases, in order:
+    Cases, in order:
 
       - the target is itself a live session id → deliver to it, unchanged;
       - the target is a *nick* with live sessions → deliver to all of them,
         because addressing `publicai` means addressing that teammate, and
         picking one of its sessions arbitrarily is how a message reaches the
         window nobody is watching. `queued_to` reports exactly where it went;
+      - the target is another host's session id → deliver to it unchanged. Its
+        inbox here is the git bridge's pickup point, not a local mailbox, and
+        stripping the suffix would hand the message to a same-named session on
+        *this* host instead — `documents-<pid>` is what every session launched
+        from a projects folder is called on every machine;
+      - the target is a *dead* session id of a local nick → resolve the nick
+        behind it. Addressing one specific window only means something while
+        that window exists; once it has exited, writing to its inbox is how a
+        reply reaches a corpse — the sender picked the id off a `who()` list
+        minutes stale, and nobody finds out until they go looking on disk;
       - nothing live → deliver to the nick's own inbox and leave it there. It
         is not lost: the next session of that nick inherits it on startup
         (see _inherit_orphan_inbox). This is what makes an offline teammate
@@ -549,7 +607,19 @@ def _resolve_recipients(target: str) -> list[str]:
     if target in _live_agents():
         return [target]
     live = _live_sessions_of(target)
-    return live if live else [target]
+    if live:
+        return live
+    nick = _durable_nick(target)
+    if nick == target:
+        return [target]  # no pid suffix — an ordinary name, possibly never seen
+    # The roster is only a safe "somewhere else" signal because git_bridge tells
+    # this host's own corpses apart from other machines' sessions by the .agents
+    # registry rather than by presence, which gets reaped. If that ever regresses
+    # this branch starts stranding local mail again, which is where it began.
+    if (DISPATCH_DIR / ".remote" / f"{target}.json").exists():
+        return [target]
+    live = _live_sessions_of(nick)
+    return live if live else [nick]
 
 
 _presence_is_live = dispatch_fs.presence_is_live
@@ -642,7 +712,12 @@ def _inherit_orphan_inbox(agent_id: str) -> int:
         look. Container-ish directory names make that collision easy — every
         session launched from a projects folder is `documents-<pid>` on every
         host, and inheriting across that boundary would hand one machine's mail
-        to an unrelated project on another;
+        to an unrelated project on another. This guard is only as good as the
+        roster: while git_bridge classified by presence, this host's own dead
+        sessions were published as remote and their mail became unreachable —
+        105 pending messages sat in dead spools, 23 of them permanently
+        ineligible here. git_bridge._local_ids now classifies by the .agents
+        registry, which is never reaped;
       - same uid, so group_mode can't siphon another account's mail.
 
     Claiming is the rename, not the read: two successors racing the same corpse
@@ -859,7 +934,10 @@ def _send(
             # In dynamic mode any name is accepted, but it becomes a path
             # segment, so it must still be a safe single segment.
             _validate_id(target, "target")
-        (DISPATCH_DIR / target).mkdir(exist_ok=True)
+        # No mkdir here. _deliver_one creates whatever inbox resolution actually
+        # chose, and creating the *named* one first resurrects the directory of a
+        # dead session we are about to route away from — an empty spool that reads
+        # like a real mailbox to anyone listing the relay.
 
     def _deliver_one(target: str) -> None:
         (DISPATCH_DIR / target).mkdir(exist_ok=True)
@@ -1599,6 +1677,17 @@ def who_tool() -> dict:
                 continue
             if data.get("agent_id") in local_ids:
                 continue  # a live local session wins over a git roster entry
+            # The roster is derived from lane activity, not from a heartbeat, so
+            # a session id here can be hours dead and look identical to one that
+            # is answering. Two senders in one evening picked a dead id off this
+            # list by diffing `last_seen` against now in their heads and getting
+            # it wrong. Say the age, and name the nick that resolves correctly.
+            data["nick"] = _durable_nick(str(data.get("agent_id") or ""))
+            seen = _parse_timestamp(str(data.get("last_seen") or ""))
+            if seen > 0:
+                data["age"] = _age_label(seen)
+                if time.time() - seen > REMOTE_STALE_SECONDS:
+                    data["stale"] = True
             remote.append(data)
 
     # Durable identities with nothing live behind them right now. Addressable
@@ -1629,6 +1718,15 @@ def who_tool() -> dict:
     if remote:
         result["remote"] = remote
         result["remote_count"] = len(remote)
+        if any(r.get("stale") for r in remote):
+            result["remote_note"] = (
+                "`remote` is reachability, not liveness: it is built from git lane "
+                "activity, so an entry marked stale has not been heard from in over "
+                f"{REMOTE_STALE_SECONDS // 3600}h and its session has most likely "
+                "exited. Address the `nick`, not the session id — a nick resolves to "
+                "whatever session is live now, and waits in that teammate's inbox "
+                "when none is."
+            )
     if known:
         result["known"] = known
         result["known_count"] = len(known)
