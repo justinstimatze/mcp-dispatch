@@ -1702,6 +1702,14 @@ def who_tool() -> dict:
 
     result = {
         "self": AGENT_ID,
+        # The one path an agent needs to check any of this on disk. Every other
+        # path here is per-agent `state_dir`, which is where that session's arm
+        # lock lives and holds none of the relay's state — so an agent going to
+        # verify something finds no .agents/, .presence/ or .remote/ under the
+        # only directory who() had named, and reasonably concludes it has the
+        # wrong relay. That happened: a correct diagnosis of the .remote
+        # inheritance guard was filed as "couldn't verify" over this.
+        "relay": str(DISPATCH_DIR),
         "agents": agents,
         "count": len(agents),
     }

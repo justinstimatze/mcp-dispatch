@@ -132,7 +132,7 @@ Agent bob:   ack(["msg-abc12345"])  →  message removed
 | `dispatch(message, target, ...)` | Send to one agent (`id`), a channel (`#name`), or `all` |
 | `peek(thread_id?, include_read?)` | Read messages and delivery receipts for sent messages |
 | `ack(message_ids)` | Acknowledge and delete processed messages |
-| `who()` | List connected agents, whether each is listening, and their channel subscriptions |
+| `who()` | List connected agents, whether each is listening, their channel subscriptions, and the `relay` path they all share |
 | `subscribe(channel)` / `unsubscribe(channel)` | Join / leave a channel |
 | `task(action, ...)` | Claimable work items — `create`, `claim`, `done`, `list` |
 

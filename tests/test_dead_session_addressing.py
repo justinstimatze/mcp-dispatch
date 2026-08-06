@@ -18,6 +18,7 @@ from __future__ import annotations
 import fcntl
 import json
 import time
+from pathlib import Path
 
 import dispatch_fs
 
@@ -314,6 +315,18 @@ def test_who_leaves_a_warm_remote_entry_unflagged(server_factory):
     assert "stale" not in entry
     assert entry["age"] == "0m"
     assert "remote_note" not in out, "the note is for a list with something wrong in it"
+
+
+def test_who_names_the_relay_it_is_talking_about(server_factory):
+    """An agent that goes to check something on disk needs this path. Without it
+    the only directory who() named was the per-session `state_dir`, which holds
+    arm locks and none of the relay's state — so the check comes back empty and
+    reads as "wrong relay" rather than as an answer."""
+    dd = server_factory.dispatch_dir
+    s = server_factory("alpha")
+    out = s.who_tool()
+    assert out["relay"] == str(dd)
+    assert (Path(out["relay"]) / ".presence").is_dir(), "and it is the one with the state under it"
 
 
 def test_a_roster_entry_with_no_timestamp_is_not_guessed_at(server_factory):

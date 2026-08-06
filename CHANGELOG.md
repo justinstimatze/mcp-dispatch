@@ -75,6 +75,13 @@ change under a running install:
   on the next gitsync pass and the stranded mail becomes adoptable with no
   migration step.
 
+- **`who()` never said which relay it was talking about.** Every path in the
+  output was a per-agent `state_dir` — where that session's arm lock lives, and
+  none of the relay's state. An agent that went to check something on disk found
+  no `.agents/`, `.presence/` or `.remote/` under the only directory `who()` had
+  named, concluded it had the wrong relay, and filed a correct diagnosis as
+  "couldn't verify". `who()` now returns `relay`.
+
 - **`who()` handed senders a graveyard and called it a roster.** The `remote`
   list was flat session ids with a raw `last_seen` — 84 of them on the
   development host, most long dead, distinguished from a live one only by a
