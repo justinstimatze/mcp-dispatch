@@ -21,14 +21,15 @@ import time
 from pathlib import Path
 
 import dispatch_fs
+import notify_policy
 
 
-def _hold_presence(dd, agent_id):
+def _hold_presence(dd, agent_id, channels=()):
     """Make `agent_id` read as live. Caller keeps the handle or it dies."""
     pdir = dd / ".presence"
     pdir.mkdir(parents=True, exist_ok=True)
     pf = pdir / f"{agent_id}.json"
-    pf.write_text(json.dumps({"agent_id": agent_id, "pid": 1, "channels": []}))
+    pf.write_text(json.dumps({"agent_id": agent_id, "pid": 1, "channels": list(channels)}))
     fh = open(pf, "a+")
     fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     return fh
@@ -134,6 +135,64 @@ def test_an_unsuffixed_unknown_name_is_untouched(server_factory):
     s = server_factory("alpha")
     assert s._send("alpha", "never-seen", "hello?")["queued_to"] == ["never-seen"]
     assert _files(dd, "never-seen")
+
+
+# ---------------------------------------------------------------------------
+# Wake: the stored `to` matches the reading session's own id, not the typed nick
+# ---------------------------------------------------------------------------
+
+
+def test_a_nick_addressed_dm_stamps_the_resolved_id(server_factory):
+    """A firecrawl session reported this from a live incident: a message
+    addressed to the nick delivered into the right inbox but was never seen as
+    addressed to anyone, because notify_policy's "direct" check is exact-string
+    equality and the stored file still said `to: "firecrawl"` while the reading
+    session's id was `firecrawl-750492`."""
+    dd = server_factory.dispatch_dir
+    s = server_factory("alpha")
+    fh = _hold_presence(dd, "firecrawl-750492")
+    try:
+        result = s._send("alpha", "firecrawl", "reply to your bug report")
+        assert result["queued_to"] == ["firecrawl-750492"]
+        stored = json.loads(_files(dd, "firecrawl-750492")[0].read_text())
+        assert stored["to"] == "firecrawl-750492", (
+            "the copy in the live session's own inbox must name that session, "
+            "or its own direct-policy watch never fires on it"
+        )
+        assert notify_policy.should_notify(stored, "direct", "firecrawl-750492")
+    finally:
+        fh.close()
+
+
+def test_a_dm_that_waits_under_the_nick_stamps_the_nick(server_factory):
+    """With nothing live, the resolved target *is* the nick — there is no
+    session id yet to stamp instead."""
+    dd = server_factory.dispatch_dir
+    s = server_factory("alpha")
+    s._send("alpha", "winze", "for whenever you're back")
+    stored = json.loads(_files(dd, "winze")[0].read_text())
+    assert stored["to"] == "winze"
+
+
+def test_broadcast_and_channel_deliveries_keep_the_original_to(server_factory):
+    """ "all" and "#channel" are not nick resolution — should_notify's channel
+    branch keys off that literal prefix, so stamping would break it instead
+    of fixing anything."""
+    dd = server_factory.dispatch_dir
+    s = server_factory("alpha")
+    fh = _hold_presence(dd, "beta-1", channels=["eng"])
+    try:
+        s._send("alpha", "all", "hi everyone")
+        before = {f.name for f in _files(dd, "beta-1")}
+        stored = json.loads(next(iter(_files(dd, "beta-1"))).read_text())
+        assert stored["to"] == "all"
+
+        s._send("alpha", "#eng", "channel post")
+        new_file = next(f for f in _files(dd, "beta-1") if f.name not in before)
+        stored = json.loads(new_file.read_text())
+        assert stored["to"] == "#eng"
+    finally:
+        fh.close()
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,25 @@ change under a running install:
   the fix, but it *is* a behaviour change to an existing call.
 
 ### Fixed
+- **A nick-addressed DM was delivered correctly but never woke a `direct`-policy
+  watch.** Reported by a `firecrawl` session: `dispatch(target="firecrawl")`
+  landed in `firecrawl-750492`'s live inbox, `peek()` showed it the moment
+  anyone called it, and the sender gave up after 30 minutes and reassigned the
+  work to a third agent — the receiving session never woke.
+
+  `_resolve_recipients` maps a nick to the session id actually running and uses
+  that id only as a filesystem path; the message body's `to` field still held
+  whatever string the sender typed. `notify_policy.should_notify`'s `"direct"`
+  check is exact-string equality against the reading session's own id, so a
+  stored `to: "firecrawl"` never matched `firecrawl-750492` — not for
+  `dispatch-wait --follow`'s watch, not for the desktop-notifier thread. Both
+  read the same file that delivery had written correctly and both silently
+  declined to count it as addressed to anyone. `_send` now stamps each
+  recipient's copy with the id delivery actually resolved to, so the two
+  watchers and the inbox agree. Broadcast (`to: "all"`) and channel posts
+  (`to: "#name"`) are unaffected — those aren't nick resolution, and
+  `should_notify`'s channel branch keys off that literal.
+
 - **A reply addressed to a session that had exited was written into its grave.**
   Reported the same evening by two agents who hit it independently, one of whom
   filed the report itself to a session that had been dead two days.

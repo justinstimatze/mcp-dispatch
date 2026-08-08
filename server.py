@@ -939,9 +939,20 @@ def _send(
         # dead session we are about to route away from — an empty spool that reads
         # like a real mailbox to anyone listing the relay.
 
-    def _deliver_one(target: str) -> None:
+    def _deliver_one(target: str, resolved_to: str | None = None) -> None:
+        # resolved_to overrides the stored `to` for this copy only. Needed for the
+        # nick-resolution path: notify_policy's "direct" check is exact-string
+        # equality against the *reading* session's own id, so a copy still
+        # carrying the typed nick never matches `<nick>-<pid>` and never wakes a
+        # direct-policy watch, even though it landed in the right inbox — see
+        # docs/feedback-2026-08-08-nick-addressed-dm-never-wakes-a-direct-watch.md.
+        # "all" and "#channel" deliveries keep the original `to`; should_notify's
+        # channel/broadcast branches key off that literal, not off exact-id match.
+        payload = dict(msg)
+        if resolved_to is not None:
+            payload["to"] = resolved_to
         (DISPATCH_DIR / target).mkdir(exist_ok=True)
-        _atomic_write(DISPATCH_DIR / target / _filename(), dict(msg))
+        _atomic_write(DISPATCH_DIR / target / _filename(), payload)
 
     if to == "all":
         # Broadcast: live agents in dynamic mode (a dead <project>-<pid> id never
@@ -965,7 +976,7 @@ def _send(
         # for the next one to inherit instead of rotting in a dead pid's.
         delivered = _resolve_recipients(to)
         for target in delivered:
-            _deliver_one(target)
+            _deliver_one(target, target)
 
     result: dict = dict(msg)
     # `queued_to`, not `delivered_to`: this is the set of inboxes written, i.e.
