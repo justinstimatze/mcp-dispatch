@@ -6,6 +6,15 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-08-07
+
+### Security
+- **`cryptography` bumped 48.0.1 → 50.0.0** (pulled in transitively via
+  `mcp[cli]` → `pyjwt[crypto]`), closing a Bleichenbacher oracle in PKCS#7
+  `EnvelopedData` decryption disclosed through distinguishable errors and
+  timing (GHSA-g6cj-pr64-35w5 / CVE-2026-69247). Lockfile-only change; nothing
+  in this project calls the affected code path directly.
+
 ### Upgrading an existing relay
 
 Nothing to migrate — the new state is created on demand — but three things
@@ -891,7 +900,8 @@ change under a running install:
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.9.0...v0.10.0
