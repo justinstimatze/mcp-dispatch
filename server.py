@@ -1186,6 +1186,12 @@ def _public_msg(m: dict) -> dict:
     clean = {k: v for k, v in m.items() if not k.startswith("_")}
     if m.get("_via") == "git":
         clean["via"] = "remote"
+    elif m.get("_via") == "native-bridge":
+        # Arrived over Claude Code's own inter-session socket protocol, bridged
+        # by bridge_native.py — say so, because its `from` is always the fixed
+        # NATIVE_FROM_ID placeholder rather than a verified dispatch identity
+        # (see that module's docstring for why).
+        clean["via"] = "native-bridge"
     # Adopted from a dead predecessor session: it was addressed to an id that no
     # longer exists, so say so rather than let it look like fresh mail to me.
     if m.get("_inherited_from"):
@@ -1251,12 +1257,23 @@ def _arm_nudge(result: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _bridge_trust_wake() -> bool:
+    raw = _ARM_CFG.get("bridge")
+    return bool(raw.get("trust_wake")) if isinstance(raw, dict) else False
+
+
 def _should_notify(msg: dict) -> bool:
     # Delegates to the shared predicate (notify_policy.py) so the OS-notification
     # poll here and the bin/dispatch-wait model-wake long-poll apply identical rules.
     # Channels come from the live in-memory record; the waiter re-reads the same
     # field off the presence file, so both see the same subscription set.
-    return should_notify(msg, NOTIFY_ON, AGENT_ID, _PRESENCE_DATA.get("channels", []))
+    return should_notify(
+        msg,
+        NOTIFY_ON,
+        AGENT_ID,
+        _PRESENCE_DATA.get("channels", []),
+        native_bridge_trusted=_bridge_trust_wake(),
+    )
 
 
 def _notify(msg: dict) -> None:

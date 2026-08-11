@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Bridge an allowlist of dispatch nicks to Claude Code's own built-in
+inter-session protocol (Unix sockets in /tmp/cc-socks/), per
+https://github.com/chrismo/claude-rig/blob/main/docs/inter-claude-protocol.md.
+
+    dispatch-ucbridge             # run the daemon (bridges [bridge].nicks)
+    dispatch-ucbridge --once      # a single outbound pass and exit (smoke test)
+    dispatch-ucbridge --check     # validate config, print what would be bridged
+    dispatch-ucbridge status      # is it configured, and what's visible right now
+
+OFF unless [bridge] enabled = true AND a non-empty nicks = [...] are both set —
+the same allowlist-only posture as [supervisor]: a nick with no entry is never
+exposed on the native bus, whatever it is sent.
+
+Read docs/native-bridge.md before enabling it: every message this bridge
+delivers into a dispatch inbox is tagged `_via: "native-bridge"` and attributed
+to a fixed placeholder id, never to whatever the wire claims — the native
+protocol's own spec says that attribution is sender-composed text, not a
+verified fact. See that document for the full threat model and the
+notify_on/must_read interaction (`[bridge] trust_wake`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import sys
+from pathlib import Path
+
+# bridge_native.py, dispatch_fs.py and dispatch_common.py live at the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
+from bridge_native import (  # noqa: E402
+    DEFAULT_SESSIONS_DIR,
+    DEFAULT_SOCKET_DIR,
+    NativeBridge,
+    list_native_sessions,
+)
+
+
+def _bridge_section(cfg: dict) -> dict:
+    raw = cfg.get("bridge")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _nicks(section: dict) -> list[str]:
+    raw = section.get("nicks") or []
+    return [str(n) for n in raw if isinstance(n, str)]
+
+
+def _sessions_dir(section: dict) -> Path:
+    return Path(os.path.expanduser(str(section.get("sessions_dir") or DEFAULT_SESSIONS_DIR)))
+
+
+def _socket_dir(section: dict) -> Path:
+    return Path(os.path.expanduser(str(section.get("socket_dir") or DEFAULT_SOCKET_DIR)))
+
+
+def _build(section: dict, dispatch_dir: Path) -> NativeBridge:
+    return NativeBridge(
+        dispatch_dir,
+        _nicks(section),
+        socket_dir=_socket_dir(section),
+        sessions_dir=_sessions_dir(section),
+    )
+
+
+def _cmd_status(section: dict) -> int:
+    enabled = bool(section.get("enabled"))
+    nicks = _nicks(section)
+    print(f"enabled: {enabled}")
+    print(f"nicks:   {', '.join(nicks) or '(none configured)'}")
+    if not enabled or not nicks:
+        print("bridge is OFF (needs [bridge] enabled = true and a non-empty nicks list)")
+        return 0
+    live = list_native_sessions(_sessions_dir(section))
+    print(f"native sessions visible: {len(live)} ({sum(1 for s in live if s.get('live'))} live)")
+    return 0
+
+
+def _cmd_check(section: dict) -> int:
+    nicks = _nicks(section)
+    if not nicks:
+        print("[ucbridge] no [bridge].nicks configured — nothing would be bridged", file=sys.stderr)
+        return 1
+    for n in nicks:
+        try:
+            dispatch_fs.validate_id(n, "bridge nick")
+        except ValueError as e:
+            print(f"[ucbridge] {e}", file=sys.stderr)
+            return 1
+    print(f"[ucbridge] config OK — would bridge: {', '.join(nicks)}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "command", nargs="?", choices=["status"], help="status: report config/liveness and exit"
+    )
+    parser.add_argument("--once", action="store_true", help="run a single outbound pass and exit")
+    parser.add_argument("--check", action="store_true", help="validate config and exit")
+    parser.add_argument(
+        "--interval", type=float, default=2.0, help="seconds between outbound passes (default 2.0)"
+    )
+    args = parser.parse_args()
+
+    cfg = common.load_config()
+    section = _bridge_section(cfg)
+    dispatch_dir = common.dispatch_dir(cfg)
+
+    if args.command == "status":
+        return _cmd_status(section)
+    if args.check:
+        return _cmd_check(section)
+
+    if not section.get("enabled"):
+        print("[ucbridge] [bridge].enabled is not true — refusing to start", file=sys.stderr)
+        return 1
+    nicks = _nicks(section)
+    if not nicks:
+        print(
+            "[ucbridge] [bridge].nicks is empty — nothing to bridge, refusing to start",
+            file=sys.stderr,
+        )
+        return 1
+
+    bridge = _build(section, dispatch_dir)
+    if args.once:
+        bridge.start()
+        try:
+            sent = bridge.tick()
+        finally:
+            bridge.stop()
+        print(f"[ucbridge] one pass: {sent} message(s) sent")
+        return 0
+
+    print(f"[ucbridge] bridging: {', '.join(nicks)}", file=sys.stderr)
+    # SIGTERM has no default Python handler (unlike SIGINT/KeyboardInterrupt),
+    # so systemctl stop / a plain `kill` would otherwise skip run()'s cleanup
+    # finally block and leave a stale socket + registry file behind.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(0)))
+    try:
+        bridge.run(args.interval)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    return 0  # pragma: no cover - run() only returns on interrupt
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

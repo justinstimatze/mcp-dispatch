@@ -77,3 +77,36 @@ def test_unresolved_identity_fails_closed_under_direct():
     assert not should_notify(DM, "direct", "")
     # ...but must_read still pierces regardless of identity.
     assert should_notify({"to": "all", "must_read": True}, "direct", None)
+
+
+NATIVE_MUST_READ = {"to": "all", "must_read": True, "_via": "native-bridge"}
+
+
+def test_untrusted_native_bridge_must_read_does_not_pierce():
+    # A message that only crossed the untrusted native-protocol bridge cannot
+    # force a wake purely by claiming must_read — that would let any local
+    # process able to open a socket escalate itself into attention.
+    assert not should_notify(NATIVE_MUST_READ, "direct", "alpha")
+    assert not should_notify(NATIVE_MUST_READ, "important", "alpha")
+    assert not should_notify(NATIVE_MUST_READ, "none", "alpha")
+
+
+def test_untrusted_native_bridge_still_notifies_via_normal_policy():
+    # The carve-out only removes the must_read override — ordinary policy
+    # matching is untouched.
+    assert should_notify(NATIVE_MUST_READ, "all", "alpha")
+    dm = {"to": "alpha", "must_read": True, "_via": "native-bridge"}
+    assert should_notify(dm, "direct", "alpha")  # addressed to me either way
+
+
+def test_trust_wake_opt_in_restores_the_pierce():
+    assert should_notify(NATIVE_MUST_READ, "direct", "alpha", native_bridge_trusted=True)
+    assert should_notify(NATIVE_MUST_READ, "important", "alpha", native_bridge_trusted=True)
+
+
+def test_git_transport_must_read_is_unaffected_by_the_native_carveout():
+    # The carve-out is scoped to `_via == "native-bridge"` specifically — a
+    # cross-host git message's must_read still pierces as before.
+    git_msg = {"to": "all", "must_read": True, "_via": "git"}
+    assert should_notify(git_msg, "direct", "alpha")
+    assert should_notify(git_msg, "important", "alpha")

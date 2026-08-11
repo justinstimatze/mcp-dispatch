@@ -18,6 +18,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **Durable nicks** — the id behind the pid (`publicai`, not `publicai-1767991`) is registered and never reaped, so a teammate stays discoverable and addressable while offline. A DM to a nick reaches its live sessions, or waits for the next one. See [durable identity](#durable-identity-nicks-that-outlive-a-session).
 - **TUI** — `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick. It needs no listener and no configuration: it is the way to look at the bus without opening a port.
 - **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, TLS required on every TCP listener (loopback included), and a hard refusal to serve a public address at all without asking. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
+- **Native-protocol bridge** — `bin/dispatch-ucbridge` exposes an explicit allowlist of dispatch nicks on Claude Code's own built-in inter-session protocol (Unix sockets, zero setup, no MCP server required on the other end), so any local Claude Code session can reach them by name. Off by default; everything it delivers is provenance-tagged and never granted a trusted identity — see [docs/native-bridge.md](docs/native-bridge.md) before enabling it.
 - **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
 - **Lifecycle** — `bin/dispatch-supervise` starts an agent's runtime when mail is waiting for a nick with no live session, so an offline teammate answers instead of accumulating. What runs comes only from an operator-written allowlist — never from the message — and is bounded by a cooldown, an hourly ceiling and a failure breaker. See [lifecycle](#lifecycle-starting-an-agent-that-has-mail).
 - **Away digest** — `digest()` (or `bin/dispatch-digest`) reports what changed while a nick had no session: unread mail by sender, task activity since its last session ended, open tasks addressed to it, and who was around. Reading never consumes, so asking twice gives the same answer. See [the digest](#the-digest-what-happened-while-i-was-away).
@@ -936,6 +937,34 @@ restart-per-quiet-period problem entirely.
 toward `[git] max_fetch_interval` (30s) while the bus is silent and snap back to
 `interval` on any traffic, so the *first* message after a lull can lag. Sends are
 never delayed. Set `max_fetch_interval = 0` to fetch on every pass.
+
+## Native-protocol bridge
+
+Claude Code ships its own built-in inter-session messaging, independent of
+mcp-dispatch — Unix sockets in `/tmp/cc-socks/`, no MCP server required, every
+session gets one for free. `bin/dispatch-ucbridge` bridges an explicit
+allowlist of dispatch nicks onto that bus, so any local Claude Code session can
+reach one by name, not just sessions wired into the dispatch relay:
+
+```toml
+[bridge]
+enabled = true
+nicks = ["publicai"]     # allowlist — nothing else in your fleet is exposed
+```
+
+```bash
+bin/dispatch-ucbridge --check   # validate config
+bin/dispatch-ucbridge           # run it
+```
+
+There is deliberately no wildcard — a nick with no entry in `nicks` gets no
+socket and is never reachable this way, the same allowlist-only posture as
+`[supervisor]`. Read [docs/native-bridge.md](docs/native-bridge.md) before
+enabling it: that protocol's own spec says sender attribution on the wire is
+composed text, not a verified fact, so everything this bridge delivers lands
+tagged `via: "native-bridge"` and attributed to a fixed placeholder id, never
+to whatever the wire claims — and by default it cannot force a wake by merely
+claiming `must_read` (`[bridge] trust_wake` opts back in).
 
 ## Security
 

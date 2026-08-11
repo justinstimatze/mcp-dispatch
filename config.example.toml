@@ -292,3 +292,44 @@ Available targets: {agent_list}.
 # session into reading a file and putting it on the bus. Bash and Write are a
 # different question again, and the answer here is no; if you want them, you want
 # a full session, not a woken one.
+
+# ---------------------------------------------------------------------------
+# [bridge] — the native-protocol bridge (dispatch-ucbridge). OFF by default.
+#
+# Claude Code ships its own built-in inter-session messaging (Unix sockets in
+# /tmp/cc-socks/, no MCP server required — see
+# https://github.com/chrismo/claude-rig/blob/main/docs/inter-claude-protocol.md).
+# This bridges an explicit allowlist of dispatch nicks onto that bus, so ANY
+# local Claude Code session can reach them — not just ones with the dispatch
+# MCP server wired in.
+#
+# Same allowlist-only posture as [supervisor]: a nick with no entry in `nicks`
+# is never exposed, whatever it is sent. Read docs/native-bridge.md before
+# enabling — that protocol's own spec says sender attribution is composed text,
+# not a verified fact, so every inbound message lands tagged
+# `via: "native-bridge"` and attributed to a fixed placeholder id, never to
+# whatever the wire claims.
+# ---------------------------------------------------------------------------
+[bridge]
+# The master switch. Enabling it with an empty `nicks` bridges nothing — there
+# is deliberately no "expose every dispatch agent" setting.
+# enabled = false
+
+# The nicks to expose on the native bus. Each gets its own socket + registry
+# entry under sessions_dir, so any local Claude Code session can address it by
+# name — exactly like a native peer.
+# nicks = ["publicai"]
+
+# Where Claude Code's own session registry and this bridge's sockets live.
+# Defaults match the spec; only override for a nonstandard harness install.
+# sessions_dir = "~/.claude/sessions"
+# socket_dir = "/tmp/cc-socks"
+
+# Whether a message that arrived over this bridge may force a wake purely by
+# claiming must_read=true. Default false: must_read is a locally-trusted
+# override everywhere else in the relay, but here it would let any local
+# process that can open a socket escalate itself into your attention on its own
+# say-so. A native-bridge message still notifies normally under
+# notify_on = "all" / "direct" / "important" — this only gates the must_read
+# override specifically. See notify_policy.py.
+# trust_wake = false
