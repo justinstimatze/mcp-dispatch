@@ -14,35 +14,6 @@ import (
 	"github.com/muesli/termenv"
 )
 
-func write(t *testing.T, path string, v any) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	data, _ := json.Marshal(v)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func writeInbox(t *testing.T, relay, owner, fname string, m map[string]any) {
-	t.Helper()
-	write(t, filepath.Join(relay, owner, fname), m)
-}
-
-func laneLine(mid, frm, to, content string) string {
-	env := map[string]any{
-		"type": "message", "from": frm, "to": to, "chan": nil, "key": nil,
-		"id": "env-" + mid, "ts": "2026-07-10T18:00:00Z", "seq": 0, "version": 1,
-		"body": map[string]any{
-			"id": mid, "from": frm, "to": to, "timestamp": "2026-07-10T18:00:00Z",
-			"priority": "normal", "content": content, "state": "pending",
-		},
-	}
-	b, _ := json.Marshal(env)
-	return string(b)
-}
-
 func TestMessageMatches(t *testing.T) {
 	m := Message{From: "carol", To: "#eng"}
 	if !matches(Message{From: "carol", To: "dave"}, target{kind: targetAgent, value: "carol"}) {
