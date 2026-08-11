@@ -209,3 +209,30 @@ def test_follow_marks_remote_provenance(tmp_path):
     finally:
         proc.kill()
         holder.close()
+
+
+def test_follow_marks_native_bridge_provenance(tmp_path):
+    """A native-bridge-materialized message (_via='native-bridge') is flagged
+    in the stream too — server.py's peek()/who() already distinguish it (the
+    `from` field is always a fixed placeholder, never a verified identity, see
+    bridge_native.py), so the wake line a parked session actually reads must
+    not render it identically to an ordinary trusted local message."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir)
+    proc = _launch(
+        dispatch_dir, state_dir, "--follow", agent="alice", MCP_DISPATCH_NOTIFY_ON="direct"
+    )
+    try:
+        _write_msg(
+            dispatch_dir,
+            "alice",
+            to="alice",
+            content="from a native peer",
+            mid="n1",
+            _via="native-bridge",
+        )
+        line = _readline(proc, 4)
+        assert "n1" in line and "«native-bridge»" in line
+    finally:
+        proc.kill()
+        holder.close()

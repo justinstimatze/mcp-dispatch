@@ -162,8 +162,21 @@ def _bus(tmp_path: Path) -> tuple[Path, Path]:
     dispatch_dir = tmp_path / "messages"
     (dispatch_dir / "alice").mkdir(parents=True)
     cfg = tmp_path / "config.toml"
+    # socket_dir MUST be overridden: the default (/tmp/cc-socks) is a
+    # host-global, security-sensitive path (see bridge_native.py's own
+    # docstring), not scoped by dispatch_dir or by the HOME override _launch
+    # sets below. A test that let bridge.start() bind the real default would
+    # leave a live peer-dispatch-alice.sock on the actual machine running the
+    # suite — worse, proc.kill() (SIGKILL) in every test's cleanup bypasses
+    # the finally: bridge.stop() that would normally remove it, so the file
+    # leaks permanently and could collide with a genuine dispatch-ucbridge
+    # instance later, exactly the cross-relay collision
+    # NativeInboundListener.start() now refuses to let happen.
+    socket_dir = tmp_path / "cc-socks"
     cfg.write_text(
-        f'dispatch_dir = "{dispatch_dir}"\n\n[bridge]\nenabled = true\nnicks = ["alice"]\n'
+        f'dispatch_dir = "{dispatch_dir}"\n\n'
+        '[bridge]\nenabled = true\nnicks = ["alice"]\n'
+        f'socket_dir = "{socket_dir}"\n'
     )
     return dispatch_dir, cfg
 

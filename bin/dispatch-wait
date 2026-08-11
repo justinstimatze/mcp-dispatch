@@ -147,8 +147,18 @@ def _oneline(agent_id: str, m: dict) -> str:
         flags += " ‼"
     elif m.get("priority") == "high":
         flags += " !"
-    # Surface cross-host provenance: a git-materialized message is tagged _via.
-    via = " «remote»" if m.get("_via") == "git" else ""
+    # Surface provenance across a trust boundary: a git-materialized message
+    # or one that crossed the native-protocol bridge is tagged _via — server.py's
+    # _public_msg exposes the same distinction to peek()/who(), so the wake
+    # line must agree rather than rendering a native-bridge message (`from` is
+    # always a fixed placeholder, see bridge_native.py) identically to an
+    # ordinary trusted local one.
+    if m.get("_via") == "git":
+        via = " «remote»"
+    elif m.get("_via") == "native-bridge":
+        via = " «native-bridge»"
+    else:
+        via = ""
     preview = (m.get("content", "") or "")[:140].replace("\n", " ")
     return (
         f"[mcp-dispatch] {m.get('from', '?')} → {agent_id}{flags}{via}: {preview}  "

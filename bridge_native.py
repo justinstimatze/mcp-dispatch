@@ -408,6 +408,12 @@ class NativeInboundListener:
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Each connection gets its own thread (_accept_loop), so these two
+        # counters are incremented concurrently — a bare `+= 1` is a
+        # non-atomic read-modify-write that can lose an increment when two
+        # connections land at once. Observability-only (nothing branches on
+        # the exact count), but a wrong count is still a wrong count.
+        self._counts_lock = threading.Lock()
         self.delivered = 0
         self.control_seen = 0
 
@@ -418,6 +424,27 @@ class NativeInboundListener:
         except OSError:
             pass
         if self.socket_path.exists():
+            # peer-dispatch-<nick>.sock lives in a HOST-GLOBAL namespace
+            # (/tmp/cc-socks/ by default), not scoped to this relay's own
+            # DISPATCH_DIR — the host-level lock in bin/dispatch-ucbridge only
+            # ever prevents two daemons for the SAME DISPATCH_DIR from racing
+            # each other, so two independently-configured relays that happen
+            # to both bridge a nick named e.g. "publicai" are not stopped by
+            # it. Without this probe, whichever one starts second would
+            # silently unlink and rebind the first's live socket, and
+            # atomic_write below would overwrite its registry entry — routing
+            # every future native message addressed to that name into the
+            # SECOND relay's dispatch_dir instead of the first's, defeating
+            # the provenance/allowlist guarantees this whole module exists
+            # for. Refuse instead of stealing.
+            if _probe_socket(self.socket_path):
+                raise RuntimeError(
+                    f"{self.socket_path} is already live — another process "
+                    f"(a different dispatch-ucbridge instance?) already owns "
+                    f"nick {self.nick!r} on the native bus. Bridged nick names "
+                    "are a host-wide namespace: refusing to steal a live "
+                    "socket out from under whoever already holds it."
+                )
             self.socket_path.unlink()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         # Narrow the process umask around bind(), then still chmod explicitly
@@ -509,14 +536,16 @@ class NativeInboundListener:
             inbox = self.dispatch_dir / self.nick
             inbox.mkdir(parents=True, exist_ok=True)
             dispatch_fs.atomic_write(inbox / dispatch_fs.message_filename(NATIVE_FROM_ID), msg)
-            self.delivered += 1
+            with self._counts_lock:
+                self.delivered += 1
             return
         if parse_control_line(raw) is not None:
             # Recognized (rename / peer_message_status) but deliberately not
             # acted on — see parse_control_line's docstring. Counted so an
             # operator can tell "peers are talking to me and I'm ignoring
             # control frames" apart from "nothing is reaching this socket".
-            self.control_seen += 1
+            with self._counts_lock:
+                self.control_seen += 1
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +645,14 @@ class NativeBridge:
         current liveness regardless of outbound traffic: who()'s ``native`` key
         should reflect who's reachable right now, not lag until the next
         dispatch() happens to target one of them.
+
+        A message whose native target isn't live YET is deliberately left
+        un-ledgered (see ``_publish_one``'s three-way return) so it is
+        reconsidered every tick until either it's sent or a native session by
+        that name actually shows up — rather than being permanently written
+        off the moment it's first seen, which would silently drop any message
+        that arrives before its bridged nick's native session happens to
+        start.
         """
         sessions = list_native_sessions(self.sessions_dir)
         self._write_native_roster(sessions)
@@ -626,8 +663,11 @@ class NativeBridge:
             mid = msg.get("id")
             if not mid or mid in self._ledger:
                 continue
+            result = self._publish_one(msg, sessions=sessions, live_local=live_local)
+            if result is None:
+                continue  # not yet deliverable — leave un-ledgered, retry next tick
             touched = True
-            if self._publish_one(msg, sessions=sessions, live_local=live_local):
+            if result:
                 sent += 1
             self._ledger[mid] = time.time()
         if touched:
@@ -669,7 +709,26 @@ class NativeBridge:
 
     def _publish_one(
         self, msg: dict[str, Any], *, sessions: list[dict[str, Any]], live_local: set[str]
-    ) -> bool:
+    ) -> bool | None:
+        """Try to deliver one message. Three-way result, not a plain bool —
+        the caller (tick()) uses this to decide whether the message is done
+        with forever or must be looked at again next tick:
+
+          True  — sent. Done.
+          False — PERMANENTLY not applicable (broadcast/channel, not one of
+                  our nicks, malformed `to`, or already delivered by the local
+                  bus). None of these become true later, so the caller may
+                  ledger it and never look again.
+          None  — NOT YET deliverable, but might become so: no live native
+                  session currently answers to this name, or the one that
+                  does didn't accept the write this tick. Both are ordinary,
+                  expected states for an ephemeral local process — the native
+                  session simply hasn't started yet, or was momentarily slow
+                  to accept — not a reason to give up. The caller must NOT
+                  ledger these, or a message that arrives before its native
+                  target happens to be running is silently dropped forever
+                  the instant that target finally starts.
+        """
         to = msg.get("to")
         if not isinstance(to, str) or not to or to == "all" or to.startswith("#"):
             return False  # broadcast/channels have no native equivalent
@@ -681,9 +740,9 @@ class NativeBridge:
             return False  # the local bus already delivered it
         session = find_live_session(to, sessions)
         if session is None:
-            return False
+            return None  # no live native peer yet — retry next tick
         envelope = build_envelope(msg, from_path=str(self.socket_dir / "dispatch-ucbridge.sock"))
-        return send_native(Path(str(session["messagingSocketPath"])), envelope)
+        return send_native(Path(str(session["messagingSocketPath"])), envelope) or None
 
     # -- native-bus visibility for who() -----------------------------------------
 

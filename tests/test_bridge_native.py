@@ -437,6 +437,43 @@ def test_bridge_tick_delivers_to_a_live_native_only_recipient(tmp_path):
         srv.close()
 
 
+def test_bridge_tick_never_ledgers_a_message_whose_target_is_not_live_yet(tmp_path):
+    # Regression: _publish_one used to return a plain bool, and tick()
+    # ledgered "already attempted" regardless of *why* it wasn't sent. A
+    # message queued before its native-bus target happens to start was
+    # ledgered on the very first tick that saw it — a permanent, silent drop,
+    # since every later tick then skips it via `mid in self._ledger` even
+    # after the target genuinely comes online.
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    bridge = NativeBridge(
+        dispatch_dir, ["carol"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+    )
+    inbox = dispatch_dir / "carol"
+    inbox.mkdir(parents=True)
+    dispatch_fs.atomic_write(
+        inbox / "1.json",
+        {"id": "msg-late", "from": "alice", "to": "carol", "content": "ping", "state": "pending"},
+    )
+
+    # No native session named "carol" exists yet.
+    assert bridge.tick() == 0
+    assert "msg-late" not in bridge._ledger  # must stay a candidate, not written off
+
+    # "carol" starts up later.
+    sock_path = tmp_path / "cc-socks" / "carol.sock"
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(4)
+    try:
+        _write_registry(sessions_dir, "carol", os.getpid(), sock_path)
+        assert bridge.tick() == 1  # delivered now that the target is reachable
+        assert "msg-late" in bridge._ledger
+    finally:
+        srv.close()
+
+
 def test_bridge_tick_skips_broadcast_channel_and_locally_live_targets(tmp_path):
     dispatch_dir = tmp_path / "messages"
     # Both messages live in "alice"'s OWN inbox (a broadcast/channel fan-out
@@ -623,13 +660,17 @@ def test_ledger_survives_roster_pruning_across_many_ticks(tmp_path):
     # which is why this needs a *new* NativeBridge instance to catch).
     dispatch_dir = tmp_path / "messages"
     sessions_dir = tmp_path / "sessions"
-    sock_path = tmp_path / "cc-socks" / "dave.sock"
+    sock_path = tmp_path / "cc-socks" / "alice.sock"
     sock_path.parent.mkdir(parents=True)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(sock_path))
     srv.listen(4)
     try:
-        _write_registry(sessions_dir, "dave", os.getpid(), sock_path)  # a live roster entry
+        # A live roster entry for "alice" — the message's own recipient, so
+        # it's actually deliverable and gets ledgered (not left pending for
+        # retry, which is a separate, deliberate behavior covered by
+        # test_bridge_tick_never_ledgers_a_message_whose_target_is_not_live_yet).
+        _write_registry(sessions_dir, "alice", os.getpid(), sock_path)
         bridge = NativeBridge(
             dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
         )
