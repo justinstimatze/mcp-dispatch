@@ -109,6 +109,7 @@ def _build(section: dict, dispatch_dir: Path) -> NativeBridge:
         _nicks(section),
         socket_dir=_socket_dir(section),
         sessions_dir=_sessions_dir(section),
+        allow_outbound=bool(section.get("allow_outbound")),
     )
 
 
@@ -194,6 +195,7 @@ def cmd_status(argv: list[str]) -> int:
 
     print(f"enabled:          {bool(section.get('enabled'))}")
     print(f"nicks:            {', '.join(nicks) or '(none configured)'}")
+    print(f"allow_outbound:   {bool(section.get('allow_outbound'))} (default off)")
     print(f"daemon running:   {common.flock_held(_host_lock_path(dispatch_dir))}")
     print(f"dispatch_dir:     {dispatch_dir}")
     print(f"socket_dir:       {_socket_dir(section)}")

@@ -301,6 +301,21 @@ def test_cli_flag_overrides_config(tmp_path):
     assert "startup grace" in out
 
 
+# ── allow_outbound wiring ────────────────────────────────────────────────────
+
+
+def test_build_defaults_allow_outbound_off(tmp_path):
+    uc = _ucbridge_module()
+    bridge = uc._build({"nicks": ["alice"]}, tmp_path / "messages")
+    assert bridge.allow_outbound is False
+
+
+def test_build_honors_allow_outbound_true(tmp_path):
+    uc = _ucbridge_module()
+    bridge = uc._build({"nicks": ["alice"], "allow_outbound": True}, tmp_path / "messages")
+    assert bridge.allow_outbound is True
+
+
 # ── failure backoff ──────────────────────────────────────────────────────────
 
 

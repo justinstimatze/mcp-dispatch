@@ -26,6 +26,8 @@ trust a normal local dispatch message gets.
 [bridge]
 enabled = true
 nicks = ["publicai"]     # allowlist — nothing else in your fleet is exposed
+# allow_outbound = true  # opt-in; see Threat model — outbound has no
+                          # authentication to check the destination against
 ```
 
 ```bash
@@ -55,22 +57,31 @@ passes `--no-presence-gate` for you; the equivalent by hand is
 
 Any Claude Code session on the host can now open a `SendMessage`/native-tool
 call addressed to `publicai` and land a message in that nick's dispatch inbox
-— and `dispatch(target="publicai", ...)` reaches `publicai` back over the
-native socket too, on the occasions dispatch itself has no live local delivery
-path to it (its only live session right now is the native one, not a dispatch
-session).
+— that direction (inbound) is on the moment `publicai` is in `nicks`, and it's
+the well-defended one (see [Threat model](#threat-model)).
+
+Outbound is a SEPARATE opt-in: `allow_outbound = true` is what lets
+`dispatch(target="publicai", ...)` reach `publicai` back over the native
+socket on the occasions dispatch itself has no live local delivery path to it.
+It defaults off because — unlike inbound — there is no way to authenticate
+*who* is currently answering to that name on the native bus; read
+[Threat model](#threat-model) before turning it on. With it off, such a
+message simply waits in `publicai`'s dispatch inbox exactly as it always did;
+nothing is lost, it just isn't ALSO mirrored to an unauthenticated
+destination.
 
 There is deliberately no wildcard, in **either** direction. A nick with no
-entry in `nicks` gets no socket, no registry entry, and is never a candidate
-for outbound delivery, whatever it is sent — the same allowlist-only posture
-as `[supervisor]`. Bridging `publicai` does not make `carol`'s pending mail
-reachable by anyone who registers a native session named `carol`, even though
-both live in the same `dispatch_dir`; the outbound scan only ever reads a
-bridged nick's own inbox.
+entry in `nicks` gets no socket, no registry entry, and (regardless of
+`allow_outbound`) is never a candidate for outbound delivery, whatever it is
+sent — the same allowlist-only posture as `[supervisor]`. Bridging `publicai`
+does not make `carol`'s pending mail reachable by anyone who registers a
+native session named `carol`, even though both live in the same
+`dispatch_dir`; the outbound scan only ever reads a bridged nick's own inbox.
 
 ## How it works
 
-**Outbound** (`dispatch(target=X)` → native socket, `X` a bridged nick): each
+**Outbound** (`dispatch(target=X)` → native socket, `X` a bridged nick,
+requires `allow_outbound = true`): each
 tick, the bridge scans only the bridged nicks' own inboxes for messages with
 no live *local* dispatch presence for their recipient. If the recipient (which
 by construction of the scan is always one of `nicks`) matches a currently-live
@@ -81,17 +92,22 @@ envelope (the same convention the spec says a compliant sender uses, with
 differently-attributed block) and written once to that session's socket.
 Delivery there has no receipt — the protocol returns nothing on the sending
 socket — so "sent" means only that the write succeeded, mirroring how
-`git_bridge.py` treats a push to a frozen remote. Already-attempted message ids
-are ledgered so a dead or slow peer isn't retried every tick — in
-`.native-state/ucbridge-outbound.json`, deliberately not inside `.native/`
-itself, which is glob-and-prune owned by the who()-roster writer below and
-would otherwise delete the ledger as a "stale" entry on the very next tick.
-Mirroring `git_bridge.py`'s identical first-run
-guard, messages already pending when the bridge is first enabled are seeded
-into that ledger unsent, so turning it on means "bridge from now on," not
-"dump the backlog." Broadcasts (`to = "all"`) and channel posts (`to = "#…"`)
-have no native equivalent and are never bridged, same as the git transport's
-DM-only outbound scope.
+`git_bridge.py` treats a push to a frozen remote. A message is only ledgered
+("done, don't look again") once it's actually sent or permanently doesn't
+apply (broadcast, not one of `nicks`, `allow_outbound` off); one with no live
+native session for its recipient YET is deliberately left un-ledgered and
+retried every tick, so a message that arrives before its native target
+happens to start is still delivered once that target comes online, rather
+than being silently written off the moment it's first seen. The ledger itself
+lives in `.native-state/ucbridge-outbound.json`, deliberately not inside
+`.native/` itself, which is glob-and-prune owned by the who()-roster writer
+below and would otherwise delete the ledger as a "stale" entry on the very
+next tick. Mirroring `git_bridge.py`'s identical first-run guard, messages
+already pending when the bridge is first enabled are seeded into that ledger
+unsent, so turning it on means "bridge from now on," not "dump the backlog."
+Broadcasts (`to = "all"`) and channel posts (`to = "#…"`) have no native
+equivalent and are never bridged, same as the git transport's DM-only
+outbound scope.
 
 **Inbound** (native socket → dispatch inbox): for each bridged nick, the
 daemon opens one Unix socket (`/tmp/cc-socks/peer-dispatch-<nick>.sock`, `0600`,
@@ -140,6 +156,11 @@ Both are still recognized (not silently indistinguishable from malformed
 input) and counted for observability.
 
 ## Threat model
+
+Inbound and outbound face genuinely different risks and get different
+defenses — read both halves before enabling either.
+
+### Inbound: tag provenance, never trust identity
 
 The Unix socket's `0700` directory and `0600` file permissions rule out
 cross-account forgery: a different OS user on a shared box cannot open
@@ -205,6 +226,41 @@ Concretely, everything that arrives over this bridge:
   enum or charset). Escaping only `from`/`content` and leaving a sibling field
   like `thread_id` raw would have reopened the identical hole through a
   different door, so none of them are treated as safe by omission.
+
+### Outbound: no destination authentication is possible — hence `allow_outbound`
+
+Inbound's defense (tag provenance, never trust identity) works because this
+bridge controls what it *writes* into the dispatch relay and can refuse to
+grant a claimed identity any trust. Outbound is the opposite shape of problem:
+this bridge has to *pick a destination* for real dispatch content, and the
+only information available to pick one is `~/.claude/sessions/*.json` —
+`name`, `pid`, `messagingSocketPath` — with no authentication of any kind
+behind any of those fields. `pid` merely has to belong to a living process
+(trivially the sender's own); `name` is whatever string that file's author
+chose to write; nothing here is signed, tokened, or otherwise bound to "the
+process that legitimately answers to this name." This is a property of the
+native protocol's own identity model (see the spec: presence in the registry
+doesn't even guarantee the socket answers, let alone who's behind it), not a
+gap this bridge could close by trying harder — there is no stronger primitive
+in the protocol being bridged to check against.
+
+Concretely: any local process running as you can create
+`~/.claude/sessions/anything.json` claiming `name: "publicai"` and open a
+listening socket, and the moment `publicai`'s own dispatch session isn't
+live — an ordinary, expected state, not an edge case — `find_live_session`
+has no way to prefer the real one over the impostor. Reproduced directly
+against this repo: a planted fake registry entry + socket received a real
+dispatch message's full plaintext content, unredacted, via an ordinary
+`NativeBridge.tick()` call.
+
+`allow_outbound` (default `false`) is the answer: outbound native delivery is
+a separate, explicit opt-in from being in `nicks`, so bridging a nick for
+inbound reach doesn't silently also hand its outbound content to whoever wins
+that name-matching race. With it off, `dispatch(target=X)` for a bridged `X`
+behaves exactly as it did before this bridge existed — the message waits in
+`X`'s dispatch inbox — it simply is never ALSO mirrored onto the native bus.
+Turn it on only when you've decided the reach is worth trusting the native
+protocol's own (weaker, unauthenticated) delivery guarantee for that content.
 
 What is **not** at additional risk: other users' messages (still `0600`/`0700`
 owner-only), cross-host traffic (gated separately by the git bus's own repo

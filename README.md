@@ -950,6 +950,9 @@ reach one by name, not just sessions wired into the dispatch relay:
 [bridge]
 enabled = true
 nicks = ["publicai"]     # allowlist — nothing else in your fleet is exposed
+# allow_outbound = true  # opt-in: mirror dispatch(target=X) to X's native
+                          # session too. Off by default — see docs/native-bridge.md,
+                          # the native session registry has no authentication.
 ```
 
 ```bash
@@ -964,7 +967,12 @@ enabling it: that protocol's own spec says sender attribution on the wire is
 composed text, not a verified fact, so everything this bridge delivers lands
 tagged `via: "native-bridge"` and attributed to a fixed placeholder id, never
 to whatever the wire claims — and by default it cannot force a wake by merely
-claiming `must_read` (`[bridge] trust_wake` opts back in).
+claiming `must_read` (`[bridge] trust_wake` opts back in). Outbound delivery
+gets the opposite treatment for the opposite reason: the native session
+registry has no authentication at all, so nothing can verify *who* is
+currently answering to a bridged nick's name — `allow_outbound` (default
+`false`) is a separate opt-in for accepting that risk, not a bug to route
+around.
 
 `who()` shows a `native` key — every other live native session currently
 visible on the host, informational reachability independent of send traffic,

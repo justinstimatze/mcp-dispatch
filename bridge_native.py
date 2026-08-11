@@ -565,6 +565,26 @@ class NativeBridge:
     future change to either one alone can't reopen the gap where an unrelated
     dispatch agent's private mail was reachable by anyone able to register a
     same-named entry in the native session roster.
+
+    ``allow_outbound`` is a SEPARATE opt-in from being in ``nicks``, default
+    False, and it exists because inbound and outbound carry categorically
+    different risk. Inbound is well-defended: everything that arrives is
+    provenance-tagged, attributed to a fixed placeholder, and the wrapper is
+    escaped — an attacker can inject noise, never a trusted identity. Outbound
+    has no equivalent defense available, because none exists to build:
+    ``find_live_session`` resolves a delivery target by matching ``name`` in
+    ``~/.claude/sessions/*.json``, and that registry has no authentication of
+    any kind — any same-uid local process can write a file claiming to be any
+    name and open a listening socket, and there is no secret, token, or
+    verified identity anywhere in the native protocol's own spec to check it
+    against (this is a property of the protocol being bridged, not a gap this
+    module could close by trying harder). So the moment a bridged nick's own
+    local dispatch session isn't live — an ordinary, expected state — real
+    dispatch content addressed to it would otherwise go straight to whoever
+    currently wins that name-matching race, with no cryptographic guarantee
+    it reaches who it's addressed to. Bridging a nick for inbound reach no
+    longer silently accepts that outbound exposure too; an operator has to
+    decide it's worth it. See docs/native-bridge.md's threat model.
     """
 
     def __init__(
@@ -575,6 +595,7 @@ class NativeBridge:
         sessions_dir: Path = DEFAULT_SESSIONS_DIR,
         socket_dir: Path = DEFAULT_SOCKET_DIR,
         state_dir: Path | None = None,
+        allow_outbound: bool = False,
     ) -> None:
         for n in nicks:
             ID_RE.match(n) or (_ for _ in ()).throw(ValueError(f"invalid nick {n!r}"))
@@ -582,6 +603,7 @@ class NativeBridge:
         self.nicks = sorted(set(nicks))
         self.sessions_dir = Path(sessions_dir)
         self.socket_dir = Path(socket_dir)
+        self.allow_outbound = allow_outbound
         # Deliberately NOT inside `.native/` (see _write_native_roster): that
         # directory is glob-and-prune owned by the roster writer, which
         # unlinks any *.json file it doesn't recognize as a currently-live
@@ -716,9 +738,10 @@ class NativeBridge:
 
           True  — sent. Done.
           False — PERMANENTLY not applicable (broadcast/channel, not one of
-                  our nicks, malformed `to`, or already delivered by the local
-                  bus). None of these become true later, so the caller may
-                  ledger it and never look again.
+                  our nicks, malformed `to`, outbound disabled for this
+                  bridge instance, or already delivered by the local bus).
+                  None of these become true later, so the caller may ledger
+                  it and never look again.
           None  — NOT YET deliverable, but might become so: no live native
                   session currently answers to this name, or the one that
                   does didn't accept the write this tick. Both are ordinary,
@@ -735,6 +758,13 @@ class NativeBridge:
         if to not in self.nicks:
             return False  # redundant with _local_messages' scope — see class docstring
         if not ID_RE.match(to):
+            return False
+        if not self.allow_outbound:
+            # Off by default — see the class docstring for why outbound
+            # can't be defended the way inbound is. A message addressed to a
+            # bridged nick still waits in its inbox exactly as it always did;
+            # this only stops it from ALSO being mirrored to an unauthenticated
+            # native-bus destination.
             return False
         if to in live_local:
             return False  # the local bus already delivered it

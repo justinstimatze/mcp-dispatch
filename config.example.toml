@@ -320,6 +320,15 @@ Available targets: {agent_list}.
 # name — exactly like a native peer.
 # nicks = ["publicai"]
 
+# Let dispatch(target=X) for a bridged X ALSO be mirrored out to X's native
+# session when dispatch has no live local session for it. Default false —
+# separate from `nicks` on purpose. Inbound (above) is well-defended: everything
+# arriving is provenance-tagged and never trusted as a real identity. Outbound
+# can't be: the native session registry has no authentication, so any local
+# process can claim to be X's native session and receive X's real message
+# content. Read docs/native-bridge.md's threat model before setting this true.
+# allow_outbound = false
+
 # Where Claude Code's own session registry and this bridge's sockets live.
 # Defaults match the spec; only override for a nonstandard harness install.
 # sessions_dir = "~/.claude/sessions"

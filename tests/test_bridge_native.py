@@ -399,7 +399,11 @@ def test_bridge_tick_delivers_to_a_live_native_only_recipient(tmp_path):
         # message present at construction time would never be "sent" here —
         # this test is about genuinely new traffic.
         bridge = NativeBridge(
-            dispatch_dir, ["carol"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+            dispatch_dir,
+            ["carol"],
+            sessions_dir=sessions_dir,
+            socket_dir=tmp_path / "cc-socks",
+            allow_outbound=True,
         )
 
         inbox = dispatch_dir / "carol"
@@ -447,7 +451,11 @@ def test_bridge_tick_never_ledgers_a_message_whose_target_is_not_live_yet(tmp_pa
     dispatch_dir = tmp_path / "messages"
     sessions_dir = tmp_path / "sessions"
     bridge = NativeBridge(
-        dispatch_dir, ["carol"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+        dispatch_dir,
+        ["carol"],
+        sessions_dir=sessions_dir,
+        socket_dir=tmp_path / "cc-socks",
+        allow_outbound=True,
     )
     inbox = dispatch_dir / "carol"
     inbox.mkdir(parents=True)
@@ -573,6 +581,70 @@ def test_bridge_tick_never_delivers_to_a_non_allowlisted_recipient(tmp_path):
         srv.close()
 
 
+def test_outbound_is_off_by_default_even_for_an_allowlisted_nick(tmp_path):
+    # Security regression: unlike the allowlist gap above (an unrelated,
+    # non-bridged nick), THIS nick genuinely IS in `nicks` — but outbound
+    # still must not fire without the separate allow_outbound opt-in, because
+    # the native session registry has no authentication: `find_live_session`
+    # trusts whatever process's registry file claims a given `name`, with no
+    # way to verify it's really the process that legitimately answers to it.
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    sock_path = tmp_path / "cc-socks" / "alice.sock"
+    sock_path.parent.mkdir(parents=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(4)
+    try:
+        _write_registry(sessions_dir, "alice", os.getpid(), sock_path)
+        bridge = NativeBridge(
+            dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+        )
+        assert bridge.allow_outbound is False
+        inbox = dispatch_dir / "alice"
+        inbox.mkdir(parents=True)
+        dispatch_fs.atomic_write(
+            inbox / "1.json",
+            {"id": "msg-1", "from": "bob", "to": "alice", "content": "secret", "state": "pending"},
+        )
+        assert bridge.tick() == 0
+
+        conn, _addr = srv.accept()  # the liveness probe only — never the content
+        conn.settimeout(2.0)
+        assert conn.recv(4096) == b""
+        conn.close()
+    finally:
+        srv.close()
+
+
+def test_outbound_delivers_once_explicitly_opted_in(tmp_path):
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    sock_path = tmp_path / "cc-socks" / "alice.sock"
+    sock_path.parent.mkdir(parents=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(4)
+    try:
+        _write_registry(sessions_dir, "alice", os.getpid(), sock_path)
+        bridge = NativeBridge(
+            dispatch_dir,
+            ["alice"],
+            sessions_dir=sessions_dir,
+            socket_dir=tmp_path / "cc-socks",
+            allow_outbound=True,
+        )
+        inbox = dispatch_dir / "alice"
+        inbox.mkdir(parents=True)
+        dispatch_fs.atomic_write(
+            inbox / "1.json",
+            {"id": "msg-1", "from": "bob", "to": "alice", "content": "hi", "state": "pending"},
+        )
+        assert bridge.tick() == 1
+    finally:
+        srv.close()
+
+
 def test_bridge_tick_seeds_preexisting_backlog_without_sending_it(tmp_path):
     # First-run guard: a message already pending before the bridge is ever
     # constructed is backlog, not new traffic — "bridge from now on."
@@ -593,7 +665,11 @@ def test_bridge_tick_seeds_preexisting_backlog_without_sending_it(tmp_path):
         )
 
         bridge = NativeBridge(
-            dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+            dispatch_dir,
+            ["alice"],
+            sessions_dir=sessions_dir,
+            socket_dir=tmp_path / "cc-socks",
+            allow_outbound=True,
         )
         assert bridge.tick() == 0  # the pre-existing message was seeded, not sent
 
@@ -672,7 +748,11 @@ def test_ledger_survives_roster_pruning_across_many_ticks(tmp_path):
         # test_bridge_tick_never_ledgers_a_message_whose_target_is_not_live_yet).
         _write_registry(sessions_dir, "alice", os.getpid(), sock_path)
         bridge = NativeBridge(
-            dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+            dispatch_dir,
+            ["alice"],
+            sessions_dir=sessions_dir,
+            socket_dir=tmp_path / "cc-socks",
+            allow_outbound=True,
         )
         inbox = dispatch_dir / "alice"
         inbox.mkdir(parents=True)
