@@ -164,6 +164,16 @@ def _resolve() -> tuple[dict | None, tuple[str, int] | None]:
     nicks = _nicks(section)
     if not nicks:
         return None, ("[bridge].nicks is empty — nothing to bridge.", 1)
+    for n in nicks:
+        try:
+            dispatch_fs.validate_id(n, "bridge nick")
+        except ValueError as e:
+            # Same class of problem as "not enabled" or "no relay yet" — a
+            # typo'd nick must WAIT for a config fix under supervision, not
+            # crash NativeBridge's constructor uncaught and crash-loop the
+            # unit past its start limit. cmd_check already validates this for
+            # a one-shot `--check`; this is the same rule on the live path.
+            return None, (str(e), 1)
     dispatch_dir = common.dispatch_dir(cfg)
     if not dispatch_dir.is_dir():
         return None, (f"no relay at {dispatch_dir} — nothing to bridge.", 0)

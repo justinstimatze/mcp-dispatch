@@ -227,8 +227,13 @@ def test_ungated_waits_for_the_lock_instead_of_exiting(tmp_path):
     [
         (lambda t: t.replace("enabled = true", "enabled = false"), "enabled is not true"),
         (lambda t: t.replace('nicks = ["alice"]', "nicks = []"), "nicks is empty"),
+        # Regression: an invalid nick used to reach NativeBridge's constructor
+        # unguarded, raising ValueError uncaught and crash-looping the unit
+        # instead of waiting for the same config fix every other problem here
+        # gets.
+        (lambda t: t.replace('nicks = ["alice"]', 'nicks = ["Not Valid!"]'), "Invalid"),
     ],
-    ids=["bridge-disabled", "no-nicks"],
+    ids=["bridge-disabled", "no-nicks", "invalid-nick"],
 )
 def test_supervised_daemon_waits_instead_of_exiting(tmp_path, mutate, expected):
     _, cfg = _bus(tmp_path)

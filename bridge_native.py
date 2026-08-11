@@ -195,23 +195,27 @@ def _wrap_content(msg: dict[str, Any]) -> str:
     inbound half of this module (``native_to_local_msg``) never trusts the same
     convention coming back: it's a display format, not proof of anything.
 
-    ``frm`` and ``body`` are both escaped before interpolation. ``body`` in
-    particular is the dispatch message's free-text content — fully controlled
-    by whoever sent it — and without escaping, a crafted body containing its
-    own literal ``</cross-session-message><cross-session-message from="…">``
-    could forge a second, differently-attributed block inside one envelope.
-    That would defeat the one thing this wrapper is supposed to preserve
-    truthfully: which *dispatch-validated* identity (``msg["from"]``, set
-    server-side by ``server.py``'s ``_send``, never attacker-chosen) actually
-    sent this. Escaping keeps the untrusted content inertly inside its own
-    element instead of letting it edit the markup around it.
+    EVERY field interpolated here is escaped — not just ``from``/``content``.
+    ``thread_id`` and ``priority`` are just as attacker-controlled as
+    ``content`` (``server.py``'s ``dispatch()`` accepts both as free-text
+    strings with no enum/charset validation), so leaving either unescaped
+    would reopen exactly the hole escaping ``content`` closes: a crafted
+    ``thread_id`` containing its own literal
+    ``</cross-session-message><cross-session-message from="…">`` can forge a
+    second, differently-attributed block just as effectively as a crafted
+    ``content`` can. That would defeat the one thing this wrapper is supposed
+    to preserve truthfully: which *dispatch-validated* identity
+    (``msg["from"]``, set server-side by ``server.py``'s ``_send``, never
+    attacker-chosen) actually sent this. Escaping keeps every piece of
+    untrusted content inertly inside its own element instead of letting it
+    edit the markup around it.
     """
     frm = html.escape(str(msg.get("from") or "?"), quote=True)
     meta = []
     if msg.get("thread_id"):
-        meta.append(f"thread={msg['thread_id']}")
+        meta.append(f"thread={html.escape(str(msg['thread_id']), quote=True)}")
     if msg.get("priority") and msg["priority"] != "normal":
-        meta.append(f"priority={msg['priority']}")
+        meta.append(f"priority={html.escape(str(msg['priority']), quote=True)}")
     tail = f" [{', '.join(meta)}]" if meta else ""
     body = html.escape(str(msg.get("content", "")), quote=True)
     return (
@@ -416,7 +420,19 @@ class NativeInboundListener:
         if self.socket_path.exists():
             self.socket_path.unlink()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.bind(str(self.socket_path))
+        # Narrow the process umask around bind(), then still chmod explicitly
+        # afterward — the same belt-and-suspenders dispatch-ircd's Go gateway
+        # uses (tui/ircd/listen.go): the umask closes the window between
+        # "socket exists" and "socket has safe permissions" (an ambient umask
+        # under group_mode, e.g. this daemon's own 0007 systemd UMask, would
+        # otherwise leave the socket group-writable for that window), and the
+        # chmod is the actual guarantee — the umask's effect on a socket
+        # inode isn't portable enough to rely on alone.
+        old_umask = os.umask(0o177)
+        try:
+            s.bind(str(self.socket_path))
+        finally:
+            os.umask(old_umask)
         os.chmod(self.socket_path, 0o600)
         s.listen(8)
         s.settimeout(0.5)  # lets the accept loop notice _stop promptly
@@ -537,7 +553,15 @@ class NativeBridge:
         self.nicks = sorted(set(nicks))
         self.sessions_dir = Path(sessions_dir)
         self.socket_dir = Path(socket_dir)
-        self._state = Path(state_dir) if state_dir else (self.dispatch_dir / ".native")
+        # Deliberately NOT inside `.native/` (see _write_native_roster): that
+        # directory is glob-and-prune owned by the roster writer, which
+        # unlinks any *.json file it doesn't recognize as a currently-live
+        # session. The ledger used to live there and was deleted as "stale"
+        # on the very next tick — silently breaking both the at-most-once
+        # send guarantee and the first-run backlog seed across every daemon
+        # restart. A sibling directory keeps the two concerns from colliding
+        # regardless of what either one's file-naming convention does later.
+        self._state = Path(state_dir) if state_dir else (self.dispatch_dir / ".native-state")
         self._ledger_path = self._state / "ucbridge-outbound.json"
         # "Bridge from now on": if no ledger exists yet (the bridge was just
         # enabled), messages already sitting in a bridged nick's inbox are
@@ -678,16 +702,22 @@ class NativeBridge:
         offline, flagged `stale` instead of removed — see git_bridge.py), a dead
         native session has no lane history to remain reachable through, so it's
         simply dropped rather than marked stale.
+
+        A third exclusion, for consistency rather than trust: a name with more
+        than one live match is ambiguous, and ``_publish_one``'s
+        ``find_live_session`` already declines to guess in that case (same
+        rule as ``dispatch_common.pick_by_ancestry``). Showing one of the two
+        anyway here — "last one wins" — would have who() confidently display a
+        session that an actual ``dispatch()`` to that name could never reach.
         """
         roster_dir = self.dispatch_dir / ".native"
-        current = {
-            s["name"]: s
-            for s in sessions
-            if s.get("live")
-            and s.get("kind") != "bridge"
-            and isinstance(s.get("name"), str)
-            and ID_RE.match(s["name"])
-        }
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for s in sessions:
+            name = s.get("name")
+            live_other = s.get("live") and s.get("kind") != "bridge"
+            if live_other and isinstance(name, str) and ID_RE.match(name):
+                by_name.setdefault(name, []).append(s)
+        current = {name: matches[0] for name, matches in by_name.items() if len(matches) == 1}
         roster_dir.mkdir(parents=True, exist_ok=True)
         existing = {p.stem: p for p in roster_dir.glob("*.json")}
         for name, sess in current.items():

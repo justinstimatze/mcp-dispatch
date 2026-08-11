@@ -82,9 +82,12 @@ differently-attributed block) and written once to that session's socket.
 Delivery there has no receipt — the protocol returns nothing on the sending
 socket — so "sent" means only that the write succeeded, mirroring how
 `git_bridge.py` treats a push to a frozen remote. Already-attempted message ids
-are ledgered (`.native/ucbridge-outbound.json`) so a dead or slow peer isn't
-retried every tick, and — mirroring `git_bridge.py`'s identical first-run
-guard — messages already pending when the bridge is first enabled are seeded
+are ledgered so a dead or slow peer isn't retried every tick — in
+`.native-state/ucbridge-outbound.json`, deliberately not inside `.native/`
+itself, which is glob-and-prune owned by the who()-roster writer below and
+would otherwise delete the ledger as a "stale" entry on the very next tick.
+Mirroring `git_bridge.py`'s identical first-run
+guard, messages already pending when the bridge is first enabled are seeded
 into that ledger unsent, so turning it on means "bridge from now on," not
 "dump the backlog." Broadcasts (`to = "all"`) and channel posts (`to = "#…"`)
 have no native equivalent and are never bridged, same as the git transport's
@@ -171,16 +174,20 @@ Concretely, everything that arrives over this bridge:
 - Is exposed to `peek()`/piggyback delivery with `via: "native-bridge"`, so a
   reading agent knows at a glance this one crossed an untrusted boundary — the
   same signal `via: "remote"` gives for git-transport messages.
-- Can never carry `must_read` from the wire (the native protocol has no such
-  field, and nothing here synthesizes one) — but it *can* be marked
-  `must_read` by a malicious sender's content trying to trigger the escalation
-  path anyway. By default, `notify_policy.should_notify` refuses to let a
-  `_via: "native-bridge"` message force a wake purely by claiming
-  `must_read=true`: it still notifies under `notify_on = "all"` / `"direct"` /
-  `"important"` exactly like any other message, it just can't pierce a policy
-  that would otherwise stay silent. Set `[bridge] trust_wake = true` only if
-  you have a reason to trust everything that can reach this socket as much as
-  you trust dispatch's own local relay.
+- Can never carry `must_read` from the wire: the native protocol has no such
+  field, and `native_to_local_msg` hardcodes `must_read: False` unconditionally
+  — no wire content, however crafted, currently reaches that field at all.
+  `notify_policy.should_notify` still carries a `_via: "native-bridge"` carve-out
+  that refuses to let such a message pierce a wake policy by claiming
+  `must_read=true`, as a second, independent line of defense keyed on
+  provenance rather than on trusting that hardcoded `False` never changes — a
+  future edit to `native_to_local_msg` that started deriving `must_read` from
+  wire content would still be caught here rather than silently reopening the
+  escalation this whole design exists to prevent. Set `[bridge] trust_wake =
+  true` only if you have a reason to trust everything that can reach this
+  socket as much as you trust dispatch's own local relay — today it's a no-op
+  either way, since nothing on this path ever sets `must_read=true` to trust
+  in the first place.
 - DOES carry a self-reported `priority`: the native envelope's own
   `"now"`/`"next"` maps to dispatch's `"urgent"`/`"normal"`. This is not a
   parallel escalation path to `must_read` — every dispatch sender could
@@ -192,10 +199,12 @@ Concretely, everything that arrives over this bridge:
 - Is never routed to task creation or claiming. Bridged content is a message
   like any other; nothing about arriving over this path grants it the ability
   to act on the task board.
-- On the way OUT, `from`/`content` are HTML-escaped before being spliced into
-  the `<cross-session-message>` wrapper, so a dispatch message's own content
-  can't close that element early and forge a second one claiming a different
-  `from-name` to the native peer reading it.
+- On the way OUT, **every** field spliced into the `<cross-session-message>`
+  wrapper is HTML-escaped — `from`, `content`, `thread_id` and `priority` alike
+  (all four are attacker-controlled: `dispatch()` validates none of them as an
+  enum or charset). Escaping only `from`/`content` and leaving a sibling field
+  like `thread_id` raw would have reopened the identical hole through a
+  different door, so none of them are treated as safe by omission.
 
 What is **not** at additional risk: other users' messages (still `0600`/`0700`
 owner-only), cross-host traffic (gated separately by the git bus's own repo
