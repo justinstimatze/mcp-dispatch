@@ -1186,6 +1186,12 @@ def _public_msg(m: dict) -> dict:
     clean = {k: v for k, v in m.items() if not k.startswith("_")}
     if m.get("_via") == "git":
         clean["via"] = "remote"
+    elif m.get("_via") == "native-bridge":
+        # Arrived over Claude Code's own inter-session socket protocol, bridged
+        # by bridge_native.py — say so, because its `from` is always the fixed
+        # NATIVE_FROM_ID placeholder rather than a verified dispatch identity
+        # (see that module's docstring for why).
+        clean["via"] = "native-bridge"
     # Adopted from a dead predecessor session: it was addressed to an id that no
     # longer exists, so say so rather than let it look like fresh mail to me.
     if m.get("_inherited_from"):
@@ -1251,12 +1257,23 @@ def _arm_nudge(result: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _bridge_trust_wake() -> bool:
+    raw = _ARM_CFG.get("bridge")
+    return bool(raw.get("trust_wake")) if isinstance(raw, dict) else False
+
+
 def _should_notify(msg: dict) -> bool:
     # Delegates to the shared predicate (notify_policy.py) so the OS-notification
     # poll here and the bin/dispatch-wait model-wake long-poll apply identical rules.
     # Channels come from the live in-memory record; the waiter re-reads the same
     # field off the presence file, so both see the same subscription set.
-    return should_notify(msg, NOTIFY_ON, AGENT_ID, _PRESENCE_DATA.get("channels", []))
+    return should_notify(
+        msg,
+        NOTIFY_ON,
+        AGENT_ID,
+        _PRESENCE_DATA.get("channels", []),
+        native_bridge_trusted=_bridge_trust_wake(),
+    )
 
 
 def _notify(msg: dict) -> None:
@@ -1655,7 +1672,11 @@ def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
         "the git transport (the 'remote' list — durable delivery, so they may be "
         "offline right now). dispatch(target=id) reaches either the same way. "
         "Each local agent carries 'armed': false means it is running but holds no "
-        "message watch, so nothing wakes it and a reply waits on its operator."
+        "message watch, so nothing wakes it and a reply waits on its operator. "
+        "'native' lists OTHER Claude Code sessions currently visible on Claude "
+        "Code's own built-in inter-session protocol — informational only unless "
+        "the dispatch-ucbridge daemon is running for a bridged nick; see "
+        "docs/native-bridge.md."
     ),
 )
 def who_tool() -> dict:
@@ -1667,6 +1688,11 @@ def who_tool() -> dict:
     Cross-host agents come from DISPATCH_DIR/.remote/, a roster the dispatch-gitsync
     daemon maintains from git lane activity (no heartbeat); who() stays git-agnostic
     and just reads it. A live-local agent shadows any remote entry of the same id.
+
+    Native-protocol sessions come from DISPATCH_DIR/.native/ the same way — a
+    roster dispatch-ucbridge maintains from a live-socket probe (bridge_native.py),
+    not a heartbeat. who() stays equally bridge-agnostic about it: no import of
+    bridge_native.py here, same separation as the git roster.
     """
     agents: list[dict] = []
     for pf in _live_presence_files():
@@ -1700,6 +1726,18 @@ def who_tool() -> dict:
                 if time.time() - seen > REMOTE_STALE_SECONDS:
                     data["stale"] = True
             remote.append(data)
+
+    native: list[dict] = []
+    native_dir = DISPATCH_DIR / ".native"
+    if native_dir.is_dir():
+        for nf in sorted(native_dir.glob("*.json")):
+            try:
+                data = json.loads(nf.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            if data.get("name") in local_ids:
+                continue  # a live local dispatch session wins over this entry
+            native.append(data)
 
     # Durable identities with nothing live behind them right now. Addressable
     # anyway: a DM waits in the nick's inbox and its next session inherits it.
@@ -1749,6 +1787,9 @@ def who_tool() -> dict:
     if known:
         result["known"] = known
         result["known_count"] = len(known)
+    if native:
+        result["native"] = native
+        result["native_count"] = len(native)
     # who() already names every *other* unarmed session; this adds the caller's
     # own, which is the one it cannot see by looking outward.
     return _arm_nudge(result)
