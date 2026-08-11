@@ -35,6 +35,24 @@ bin/dispatch-ucbridge status        # configured nicks + visible native sessions
 bin/dispatch-ucbridge               # run the daemon
 ```
 
+### Running it hands-free
+
+Two options, mirroring `dispatch-gitsync` exactly:
+
+- **Claude Code:** wire `hooks/dispatch-ucbridge-arm.py` into `SessionStart`
+  (`install.py` does this for you, unconditionally — it's a no-op unless
+  `[bridge].enabled` is set). It spawns the daemon detached on session start,
+  gated on a host-level lock so a redundant spawn exits immediately.
+- **Any other harness** (openclaw, Hermes, a script, cron): `bin/dispatch-ucbridge
+  service install` runs it as a systemd **user** service — started at login,
+  restarted on failure, independent of any agent runtime. `service uninstall` /
+  `service show` are the other two actions.
+
+By default the daemon is **presence-gated**: it exits once no dispatch agent is
+live on the host, so a hook-spawned daemon can't orphan. `service install`
+passes `--no-presence-gate` for you; the equivalent by hand is
+`--no-presence-gate` or `[bridge] presence_gate = false`.
+
 Any Claude Code session on the host can now open a `SendMessage`/native-tool
 call addressed to `publicai` and land a message in that nick's dispatch inbox
 — and `dispatch(target="publicai", ...)` reaches `publicai` back over the
@@ -80,10 +98,43 @@ session. A connecting peer's kernel-reported uid is checked against ours
 (`SO_PEERCRED`, unforgeable, fail-closed if unavailable — the same check
 `dispatch-ircd`'s gateway makes, see `tui/ircd/auth.go`) before a single byte
 is read; this is defense in depth on top of the `0700`/`0600` filesystem
-permissions, not the primary gate. Each valid NDJSON line is materialized into
-that nick's dispatch inbox as an ordinary message — see
+permissions, not the primary gate. Each valid NDJSON `type: "user"` line is
+materialized into that nick's dispatch inbox as an ordinary message — see
 [Threat model](#threat-model) for exactly what "materialized" does and does not
-mean for trust.
+mean for trust. A `type: "control"` line (`rename`, `peer_message_status`
+delivery receipts) is recognized and counted (`NativeInboundListener
+.control_seen`, surfaced in `status`) but never acted on — see
+[Control messages](#control-messages-rename--delivery-receipts) below.
+
+**who() visibility:** every tick, the daemon also live-probes the native
+session registry and writes what it finds to `DISPATCH_DIR/.native/` — read-only
+from `server.py`'s side, exactly like `git_bridge.py`'s `.remote/` roster keeps
+`who()` git-agnostic. `who()` then shows a `native` key: every OTHER live
+native session on the host (bridged nicks' own listeners are excluded — they're
+already visible as ordinary dispatch agents). This is independent of outbound
+send traffic and independent of whether that other session is itself bridged;
+it's informational reachability, the native-bus equivalent of `remote`.
+
+## Control messages (`rename` / delivery receipts)
+
+The spec defines two `type: "control"` messages: `rename` (change the
+receiving session's registered name) and `peer_message_status` (delivery
+receipts — held, denied, expired, delivered). Neither is acted on, deliberately:
+
+- **`rename`** would let whatever peer can reach the socket change how this
+  bridge's registered identity resolves. The bridge's identity is the
+  operator's `[bridge] nicks` config, not something a connecting peer gets to
+  negotiate — honoring a rename request from the wire would hand that control
+  to an untrusted sender.
+- **`peer_message_status`** (receipts) has no consumer here: `send_native` is
+  intentionally fire-and-forget (see its docstring), and this bridge doesn't
+  keep a sent-message log to correlate a receipt against. The reference
+  implementation this bridge is built from is in the same position — the spec
+  itself notes receipts exist on the wire but nothing there acts on
+  hold/denial notifications either.
+
+Both are still recognized (not silently indistinguishable from malformed
+input) and counted for observability.
 
 ## Threat model
 
@@ -152,15 +203,17 @@ ACLs), and any host running a single session with no adversarial input in its
 loop — for that case this whole bridge is optional and the risk it's built
 around doesn't apply.
 
-## What this does not do (yet)
+## What this deliberately does not do
 
-- No `who()` integration. Reachable-but-unbridged native sessions don't
-  currently show up as a `native` key the way cross-host agents show up under
-  `remote` — `list_native_sessions()` in `bridge_native.py` has everything
-  needed for that; it just isn't wired into `who()` yet.
-- No control-message handling (`rename`, delivery receipts) — cosmetic to
-  dispatch's own model, and skipped until something needs them.
-- No systemd service installer or `SessionStart` arm hook, unlike
-  `dispatch-gitsync`/`dispatch-ircd`. Run it under whatever supervises your
-  other long-lived processes; `bin/dispatch-ucbridge` exits cleanly on
-  SIGINT/SIGTERM like any well-behaved daemon.
+- **Act on `rename` or delivery receipts.** See
+  [Control messages](#control-messages-rename--delivery-receipts) above —
+  both are recognized, neither is safe or useful to honor here.
+- **Correlate outbound sends to receipts.** `send_native` stays fire-and-forget
+  by design; adding a sent-message log purely to watch receipts nobody acts on
+  would be complexity with no payoff — same call the spec's own reference
+  implementation makes.
+- **Show `remote`-style staleness for native sessions.** Unlike a git-lane
+  entry (durable — an agent can be hours offline and still listed, flagged
+  `stale`), a dead native session has no history to remain reachable through:
+  `.native/` entries are dropped the tick they stop probing live, not marked
+  stale.

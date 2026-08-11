@@ -966,6 +966,14 @@ tagged `via: "native-bridge"` and attributed to a fixed placeholder id, never
 to whatever the wire claims — and by default it cannot force a wake by merely
 claiming `must_read` (`[bridge] trust_wake` opts back in).
 
+`who()` shows a `native` key — every other live native session currently
+visible on the host, informational reachability independent of send traffic,
+the native-bus equivalent of `remote`. Run it hands-free the same two ways as
+`dispatch-gitsync`: `hooks/dispatch-ucbridge-arm.py` on `SessionStart`
+(wired in by `install.py`, a no-op unless `[bridge].enabled`), or
+`bin/dispatch-ucbridge service install` for a systemd user service on any
+other harness.
+
 ## Security
 
 This is local-host-only IPC; the threat model is other local users on a shared machine.

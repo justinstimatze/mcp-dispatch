@@ -263,8 +263,11 @@ def send_native(
 
 
 def parse_inbound_line(raw: bytes) -> dict[str, Any] | None:
-    """Validate one NDJSON line against the spec's stated gates. None means
-    silently drop, exactly as the spec says a real receiver would."""
+    """Validate one NDJSON ``type: "user"`` line against the spec's stated
+    gates. None means silently drop, exactly as the spec says a real receiver
+    would. A ``type: "control"`` line is a different, valid thing — see
+    ``parse_control_line`` — so this returning None doesn't imply the line was
+    garbage, only that it isn't a deliverable message."""
     if not raw or len(raw) > MAX_LINE_BYTES:
         return None
     try:
@@ -272,12 +275,43 @@ def parse_inbound_line(raw: bytes) -> dict[str, Any] | None:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(env, dict) or env.get("type") != "user":
-        return None  # control messages (rename, receipts) aren't handled here
+        return None
     message = env.get("message")
     if not isinstance(message, dict):
         return None
     content = message.get("content")
     if not isinstance(content, str) or not content:
+        return None
+    return env
+
+
+def parse_control_line(raw: bytes) -> dict[str, Any] | None:
+    """Validate one NDJSON ``type: "control"`` line (``rename``,
+    ``peer_message_status`` delivery receipts, per the spec). Recognized but
+    never acted on:
+
+    - ``rename`` would change how this bridge's registered identity resolves.
+      Honoring a request to rename FROM the wire would let any peer that can
+      reach the socket hijack a bridged nick's addressing — the identity is
+      the operator's ``[bridge] nicks`` config, not something a peer gets to
+      negotiate.
+    - ``peer_message_status`` (delivery receipts) has no consumer here:
+      ``send_native`` is intentionally fire-and-forget (see its docstring),
+      and correlating a receipt back to a specific outbound send would need a
+      sent-message log this bridge doesn't keep. The spec's own reference
+      implementation is in the same position — receipts exist on the wire but
+      nothing acts on hold/denial notifications there either.
+
+    So a caller sees these ONLY for observability (``NativeInboundListener
+    .control_seen``), distinguishing "recognized but intentionally inert"
+    from "not valid JSON at all" — which ``parse_inbound_line`` alone can't."""
+    if not raw or len(raw) > MAX_LINE_BYTES:
+        return None
+    try:
+        env = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(env, dict) or env.get("type") != "control":
         return None
     return env
 
@@ -371,6 +405,7 @@ class NativeInboundListener:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.delivered = 0
+        self.control_seen = 0
 
     def start(self) -> None:
         self.socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -453,13 +488,19 @@ class NativeInboundListener:
 
     def _deliver(self, raw: bytes) -> None:
         env = parse_inbound_line(raw)
-        if env is None:
+        if env is not None:
+            msg = native_to_local_msg(env, to=self.nick)
+            inbox = self.dispatch_dir / self.nick
+            inbox.mkdir(parents=True, exist_ok=True)
+            dispatch_fs.atomic_write(inbox / dispatch_fs.message_filename(NATIVE_FROM_ID), msg)
+            self.delivered += 1
             return
-        msg = native_to_local_msg(env, to=self.nick)
-        inbox = self.dispatch_dir / self.nick
-        inbox.mkdir(parents=True, exist_ok=True)
-        dispatch_fs.atomic_write(inbox / dispatch_fs.message_filename(NATIVE_FROM_ID), msg)
-        self.delivered += 1
+        if parse_control_line(raw) is not None:
+            # Recognized (rename / peer_message_status) but deliberately not
+            # acted on — see parse_control_line's docstring. Counted so an
+            # operator can tell "peers are talking to me and I'm ignoring
+            # control frames" apart from "nothing is reaching this socket".
+            self.control_seen += 1
 
 
 # ---------------------------------------------------------------------------
@@ -542,28 +583,31 @@ class NativeBridge:
     def tick(self) -> int:
         """One outbound pass: deliver newly-seen messages addressed to a
         bridged nick that resolves on the native bus but not on the local
-        dispatch bus. Returns how many were sent.
+        dispatch bus, and refresh who() 's view of native-bus visibility.
+        Returns how many were sent.
 
         The native-session probe sweep (a live connect per registered session)
-        only runs when there's at least one un-ledgered candidate — an idle
-        relay costs nothing beyond the local inbox scan, rather than probing
-        every registered native session every tick regardless of traffic.
+        runs every tick unconditionally now — not just when there's an
+        un-ledgered candidate to send — because ``_write_native_roster`` needs
+        current liveness regardless of outbound traffic: who()'s ``native`` key
+        should reflect who's reachable right now, not lag until the next
+        dispatch() happens to target one of them.
         """
-        candidates = [
-            (msg, msg["id"])
-            for msg in self._local_messages()
-            if msg.get("id") and msg["id"] not in self._ledger
-        ]
-        if not candidates:
-            return 0
         sessions = list_native_sessions(self.sessions_dir)
+        self._write_native_roster(sessions)
         live_local = set(dispatch_fs.live_agents(self.dispatch_dir))
         sent = 0
-        for msg, mid in candidates:
+        touched = False
+        for msg in self._local_messages():
+            mid = msg.get("id")
+            if not mid or mid in self._ledger:
+                continue
+            touched = True
             if self._publish_one(msg, sessions=sessions, live_local=live_local):
                 sent += 1
             self._ledger[mid] = time.time()
-        self._save_ledger()
+        if touched:
+            self._save_ledger()
         return sent
 
     def tick_guarded(self) -> bool:
@@ -616,6 +660,53 @@ class NativeBridge:
             return False
         envelope = build_envelope(msg, from_path=str(self.socket_dir / "dispatch-ucbridge.sock"))
         return send_native(Path(str(session["messagingSocketPath"])), envelope)
+
+    # -- native-bus visibility for who() -----------------------------------------
+
+    def _write_native_roster(self, sessions: list[dict[str, Any]]) -> None:
+        """Materialize native-bus visibility into DISPATCH_DIR/.native/ so who()
+        can show it — read-only from server.py's side, exactly like GitBridge's
+        .remote/ roster keeps who() git-agnostic (that separation is deliberate;
+        server.py doesn't import this module). Every OTHER live native session is
+        listed, live-probed fresh this tick, self-pruning each pass.
+
+        Two exclusions, both deliberate: our OWN inbound listeners register with
+        ``kind: "bridge"`` (see NativeInboundListener.start) — those are bridged
+        nicks reflected back at themselves, not new information, so who() would
+        just be quoting its own `agents`/`known` entries back. And unlike
+        GitBridge's `.remote/` (durable: an entry survives its agent going
+        offline, flagged `stale` instead of removed — see git_bridge.py), a dead
+        native session has no lane history to remain reachable through, so it's
+        simply dropped rather than marked stale.
+        """
+        roster_dir = self.dispatch_dir / ".native"
+        current = {
+            s["name"]: s
+            for s in sessions
+            if s.get("live")
+            and s.get("kind") != "bridge"
+            and isinstance(s.get("name"), str)
+            and ID_RE.match(s["name"])
+        }
+        roster_dir.mkdir(parents=True, exist_ok=True)
+        existing = {p.stem: p for p in roster_dir.glob("*.json")}
+        for name, sess in current.items():
+            path = roster_dir / f"{name}.json"
+            record = {"name": name, "via": "native", "kind": sess.get("kind")}
+            # Only write on change, same reasoning as GitBridge._write_remote_roster:
+            # in the steady state every entry is byte-identical, so an unconditional
+            # write+rename here would cost one per known session per tick forever.
+            try:
+                if json.loads(path.read_text()) == record:
+                    continue
+            except (OSError, json.JSONDecodeError):
+                pass
+            dispatch_fs.atomic_write(path, record)
+        for stale in set(existing) - set(current):
+            try:
+                existing[stale].unlink()
+            except OSError:
+                pass
 
     # -- ledger -----------------------------------------------------------------
 

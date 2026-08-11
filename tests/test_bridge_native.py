@@ -32,6 +32,7 @@ from bridge_native import (  # noqa: E402
     find_live_session,
     list_native_sessions,
     native_to_local_msg,
+    parse_control_line,
     parse_inbound_line,
     send_native,
 )
@@ -222,6 +223,39 @@ def test_parse_inbound_line_rejects_invalid_input(raw):
     assert parse_inbound_line(raw) is None
 
 
+def test_parse_control_line_accepts_rename_and_receipts():
+    for control in ("rename", "peer_message_status"):
+        line = json.dumps({"type": "control", "control": control}).encode()
+        env = parse_control_line(line)
+        assert env is not None
+        assert env["control"] == control
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"not json",
+        b"null",
+        json.dumps({"type": "user", "message": {"content": "hi"}}).encode(),  # a user message
+        json.dumps({"control": "rename"}).encode(),  # no `type` at all
+    ],
+)
+def test_parse_control_line_rejects_non_control_input(raw):
+    assert parse_control_line(raw) is None
+
+
+def test_parse_inbound_and_control_line_are_mutually_exclusive():
+    # Every line is exactly one or the other, never both — the deliver path
+    # relies on this to decide whether to materialize a message or just count.
+    user = json.dumps({"type": "user", "message": {"content": "hi"}}).encode()
+    control = json.dumps({"type": "control", "control": "rename"}).encode()
+    assert parse_inbound_line(user) is not None
+    assert parse_control_line(user) is None
+    assert parse_inbound_line(control) is None
+    assert parse_control_line(control) is not None
+
+
 def test_native_to_local_msg_never_trusts_the_claimed_sender():
     env = {
         "type": "user",
@@ -284,8 +318,8 @@ def test_inbound_listener_materializes_a_valid_message(tmp_path):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.connect(str(listener.socket_path))
         good = json.dumps({"type": "user", "message": {"content": "hi eng"}, "from": "spoofed"})
-        bad = json.dumps({"type": "control"})  # dropped, not a user message
-        c.sendall((good + "\n" + bad + "\n").encode())
+        control = json.dumps({"type": "control", "control": "rename"})  # counted, never delivered
+        c.sendall((good + "\n" + control + "\n").encode())
         c.close()
 
         inbox = dispatch_dir / "eng"
@@ -296,6 +330,7 @@ def test_inbound_listener_materializes_a_valid_message(tmp_path):
         assert delivered["content"] == "hi eng"
         assert delivered["from"] == NATIVE_FROM_ID
         assert delivered["_via"] == "native-bridge"
+        assert _wait_for(lambda: listener.control_seen == 1)
     finally:
         listener.stop()
     assert not listener.socket_path.exists()
@@ -463,12 +498,17 @@ def test_bridge_tick_never_delivers_to_a_non_allowlisted_recipient(tmp_path):
         )
         assert bridge.tick() == 0
 
-        # And nothing was ever written to carol's socket: accept() must time
-        # out rather than find a connection (not even the liveness probe,
-        # since a non-candidate tick short-circuits before probing sessions).
-        srv.settimeout(0.3)
-        with pytest.raises(TimeoutError):
-            srv.accept()
+        # tick() DOES connect to carol's socket — every tick refreshes the
+        # native roster for who() (test_tick_writes_a_native_roster_entry_for_
+        # a_live_peer), independent of carol ever being a send candidate. What
+        # must never happen is carol's PRIVATE CONTENT crossing that
+        # connection: the probe sends nothing and closes immediately, so a
+        # read sees EOF (b""), never the message body.
+        srv.settimeout(2.0)
+        conn, _addr = srv.accept()
+        conn.settimeout(2.0)
+        assert conn.recv(4096) == b""
+        conn.close()
     finally:
         srv.close()
 
@@ -519,3 +559,86 @@ def test_publish_one_rejects_a_non_string_to_instead_of_crashing(tmp_path):
     # the whole daemon via an unguarded tick().
     bridge = NativeBridge(tmp_path / "messages", ["alice"], sessions_dir=tmp_path / "sessions")
     assert bridge._publish_one({"to": 123}, sessions=[], live_local=set()) is False
+
+
+# ---------------------------------------------------------------------------
+# NativeBridge._write_native_roster — who()'s native visibility
+# ---------------------------------------------------------------------------
+
+
+def test_tick_writes_a_native_roster_entry_for_a_live_peer(tmp_path):
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    sock_path = tmp_path / "cc-socks" / "dave.sock"
+    sock_path.parent.mkdir(parents=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(4)
+    try:
+        _write_registry(sessions_dir, "dave", os.getpid(), sock_path)
+        bridge = NativeBridge(
+            dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+        )
+        bridge.tick()
+
+        entry = dispatch_dir / ".native" / "dave.json"
+        assert entry.exists()
+        rec = json.loads(entry.read_text())
+        assert rec == {"name": "dave", "via": "native", "kind": "peer"}
+    finally:
+        srv.close()
+
+
+def test_native_roster_excludes_our_own_bridge_listeners(tmp_path):
+    # A bridged nick's OWN inbound listener registers with kind="bridge" — that
+    # is dispatch's own nick reflected back at itself, not new information, and
+    # who() already shows it via `agents`/`known`.
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    sock_path = tmp_path / "cc-socks" / "alice.sock"
+    sock_path.parent.mkdir(parents=True)
+    _write_registry(sessions_dir, "alice", os.getpid(), sock_path, kind="bridge")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(1)
+    try:
+        bridge = NativeBridge(
+            dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+        )
+        bridge.tick()
+        assert not (dispatch_dir / ".native" / "alice.json").exists()
+    finally:
+        srv.close()
+
+
+def test_native_roster_self_prunes_when_a_session_goes_away(tmp_path):
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    sock_path = tmp_path / "cc-socks" / "dave.sock"
+    sock_path.parent.mkdir(parents=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(4)
+    bridge = NativeBridge(
+        dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+    )
+    _write_registry(sessions_dir, "dave", os.getpid(), sock_path)
+    bridge.tick()
+    assert (dispatch_dir / ".native" / "dave.json").exists()
+
+    srv.close()  # dave's socket goes dead
+    bridge.tick()
+    assert not (dispatch_dir / ".native" / "dave.json").exists()
+
+
+def test_native_roster_omits_a_registered_but_unreachable_session(tmp_path):
+    dispatch_dir = tmp_path / "messages"
+    sessions_dir = tmp_path / "sessions"
+    _write_registry(sessions_dir, "ghost", os.getpid(), tmp_path / "cc-socks" / "ghost.sock")
+    bridge = NativeBridge(
+        dispatch_dir, ["alice"], sessions_dir=sessions_dir, socket_dir=tmp_path / "cc-socks"
+    )
+    bridge.tick()
+    assert not (dispatch_dir / ".native").exists() or not list(
+        (dispatch_dir / ".native").glob("*.json")
+    )

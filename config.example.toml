@@ -333,3 +333,9 @@ Available targets: {agent_list}.
 # notify_on = "all" / "direct" / "important" — this only gates the must_read
 # override specifically. See notify_policy.py.
 # trust_wake = false
+
+# Exit dispatch-ucbridge once no dispatch agent is live on this host, so a
+# SessionStart-hook-spawned daemon can't outlive every session and orphan.
+# Default true. `service install` (systemd) passes --no-presence-gate for you;
+# set this to false only for a hand-run daemon you want to persist regardless.
+# presence_gate = true
