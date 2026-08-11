@@ -297,6 +297,23 @@ def test_via_git_message_not_republished(hosts):
     assert len(_inbox_files(hosts.dir_b, "bob")) == 1
 
 
+def test_native_bridge_message_not_laundered_onto_git(hosts):
+    # Security regression: a message that arrived over the untrusted native
+    # bridge (bridge_native.py) must never be re-published onto the git bus.
+    # If it were, envelope_to_msg would overwrite its `_via` to "git" on
+    # materialization elsewhere, silently laundering an untrusted-provenance
+    # message into what reads like an ordinary cross-host DM everywhere else.
+    msg = _make_msg("native-bridge", "bob", "from the native bus")
+    msg["_via"] = "native-bridge"
+    inbox = hosts.dir_a / "bob"
+    inbox.mkdir(parents=True, exist_ok=True)
+    dispatch_fs.atomic_write(inbox / dispatch_fs.message_filename("native-bridge"), msg)
+
+    hosts.a.tick()
+
+    assert not (hosts.repo_a / "lanes" / "native-bridge.jsonl").exists()
+
+
 def test_remote_roster_written(hosts):
     # After alice's lane reaches host B (where alice is not a local presence), B's
     # daemon records her in DISPATCH_DIR/.remote/ so who() can show her cross-host.

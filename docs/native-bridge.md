@@ -37,27 +37,38 @@ bin/dispatch-ucbridge               # run the daemon
 
 Any Claude Code session on the host can now open a `SendMessage`/native-tool
 call addressed to `publicai` and land a message in that nick's dispatch inbox
-— and `dispatch(target="<some native session's name>", ...)` from any bridged
-session reaches it back over the native socket if dispatch itself has no live
-local delivery path to that name.
+— and `dispatch(target="publicai", ...)` reaches `publicai` back over the
+native socket too, on the occasions dispatch itself has no live local delivery
+path to it (its only live session right now is the native one, not a dispatch
+session).
 
-There is deliberately no wildcard. A nick with no entry in `nicks` gets no
-socket, no registry entry, and no outbound delivery attempt — the same
-allowlist-only posture as `[supervisor]`.
+There is deliberately no wildcard, in **either** direction. A nick with no
+entry in `nicks` gets no socket, no registry entry, and is never a candidate
+for outbound delivery, whatever it is sent — the same allowlist-only posture
+as `[supervisor]`. Bridging `publicai` does not make `carol`'s pending mail
+reachable by anyone who registers a native session named `carol`, even though
+both live in the same `dispatch_dir`; the outbound scan only ever reads a
+bridged nick's own inbox.
 
 ## How it works
 
-**Outbound** (`dispatch(target=X)` → native socket): each tick, the bridge
-scans every local inbox for messages whose recipient `X` has no live *local*
-dispatch presence. If `X` matches a currently-live entry in the native session
-registry, the message is wrapped as a `<cross-session-message from="dispatch:…"
-from-name="…" from-mode="dispatch">` envelope (the same convention the spec
-says a compliant sender uses) and written once to that session's socket.
+**Outbound** (`dispatch(target=X)` → native socket, `X` a bridged nick): each
+tick, the bridge scans only the bridged nicks' own inboxes for messages with
+no live *local* dispatch presence for their recipient. If the recipient (which
+by construction of the scan is always one of `nicks`) matches a currently-live
+entry in the native session registry, the message is wrapped as a
+`<cross-session-message from="dispatch:…" from-name="…" from-mode="dispatch">`
+envelope (the same convention the spec says a compliant sender uses, with
+`from`/content escaped so the message's own text can't forge a second,
+differently-attributed block) and written once to that session's socket.
 Delivery there has no receipt — the protocol returns nothing on the sending
 socket — so "sent" means only that the write succeeded, mirroring how
 `git_bridge.py` treats a push to a frozen remote. Already-attempted message ids
 are ledgered (`.native/ucbridge-outbound.json`) so a dead or slow peer isn't
-retried every tick. Broadcasts (`to = "all"`) and channel posts (`to = "#…"`)
+retried every tick, and — mirroring `git_bridge.py`'s identical first-run
+guard — messages already pending when the bridge is first enabled are seeded
+into that ledger unsent, so turning it on means "bridge from now on," not
+"dump the backlog." Broadcasts (`to = "all"`) and channel posts (`to = "#…"`)
 have no native equivalent and are never bridged, same as the git transport's
 DM-only outbound scope.
 
@@ -119,9 +130,21 @@ Concretely, everything that arrives over this bridge:
   that would otherwise stay silent. Set `[bridge] trust_wake = true` only if
   you have a reason to trust everything that can reach this socket as much as
   you trust dispatch's own local relay.
+- DOES carry a self-reported `priority`: the native envelope's own
+  `"now"`/`"next"` maps to dispatch's `"urgent"`/`"normal"`. This is not a
+  parallel escalation path to `must_read` — every dispatch sender could
+  already claim `priority="urgent"` for free, with no validation, so this is
+  the same pre-existing, already-untrusted signal, not a new one. Without the
+  mapping, a bridged nick could never be woken by native-bus traffic at all
+  under the default `notify_on = "important"`, defeating the point of bridging
+  it; `must_read` remains the one channel actually gated behind `trust_wake`.
 - Is never routed to task creation or claiming. Bridged content is a message
   like any other; nothing about arriving over this path grants it the ability
   to act on the task board.
+- On the way OUT, `from`/`content` are HTML-escaped before being spliced into
+  the `<cross-session-message>` wrapper, so a dispatch message's own content
+  can't close that element early and forge a second one claiming a different
+  `from-name` to the native peer reading it.
 
 What is **not** at additional risk: other users' messages (still `0600`/`0700`
 owner-only), cross-host traffic (gated separately by the git bus's own repo

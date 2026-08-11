@@ -34,10 +34,17 @@ identity.
   * ``notify_policy.should_notify`` refuses to let a message tagged
     ``_via: "native-bridge"`` force a wake via the must_read override unless
     the operator has explicitly set ``[bridge] trust_wake = true``. See
-    notify_policy.py.
+    notify_policy.py. Ordinary priority claims are NOT gated the same way —
+    every dispatch sender can already self-report ``priority="urgent"`` with
+    no validation, so mapping the native envelope's own ``"now"``/``"next"``
+    into that same pre-existing, already-untrusted channel (see
+    ``native_to_local_msg``) isn't a new trust concession.
   * Bridged nicks are an explicit allowlist (``[bridge] nicks = [...]``), the
     same "nothing without a config line" posture as ``[supervisor]``. There is
-    no wildcard that exposes every dispatch agent to the native bus.
+    no wildcard that exposes every dispatch agent to the native bus — and this
+    is enforced on BOTH directions: inbound listeners only ever exist for a
+    bridged nick, and the outbound scan (``NativeBridge._local_messages``)
+    only ever reads a bridged nick's own inbox, never anyone else's.
 
 Outbound delivery mirrors GitBridge's ``_publish_one``: a message is only
 handed to the native transport once dispatch itself has given up trying to
@@ -48,10 +55,12 @@ answers to that name. Delivery there is fire-and-forget with no receipt, so
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -185,15 +194,26 @@ def _wrap_content(msg: dict[str, Any]) -> str:
     field. This mirrors that convention on the way out, and is exactly why the
     inbound half of this module (``native_to_local_msg``) never trusts the same
     convention coming back: it's a display format, not proof of anything.
+
+    ``frm`` and ``body`` are both escaped before interpolation. ``body`` in
+    particular is the dispatch message's free-text content — fully controlled
+    by whoever sent it — and without escaping, a crafted body containing its
+    own literal ``</cross-session-message><cross-session-message from="…">``
+    could forge a second, differently-attributed block inside one envelope.
+    That would defeat the one thing this wrapper is supposed to preserve
+    truthfully: which *dispatch-validated* identity (``msg["from"]``, set
+    server-side by ``server.py``'s ``_send``, never attacker-chosen) actually
+    sent this. Escaping keeps the untrusted content inertly inside its own
+    element instead of letting it edit the markup around it.
     """
-    frm = str(msg.get("from") or "?")
+    frm = html.escape(str(msg.get("from") or "?"), quote=True)
     meta = []
     if msg.get("thread_id"):
         meta.append(f"thread={msg['thread_id']}")
     if msg.get("priority") and msg["priority"] != "normal":
         meta.append(f"priority={msg['priority']}")
     tail = f" [{', '.join(meta)}]" if meta else ""
-    body = str(msg.get("content", ""))
+    body = html.escape(str(msg.get("content", "")), quote=True)
     return (
         f'<cross-session-message from="dispatch:{frm}" from-name="{frm}" '
         f'from-mode="dispatch">{body}</cross-session-message>{tail}'
@@ -270,7 +290,20 @@ def native_to_local_msg(env: dict[str, Any], *, to: str) -> dict[str, Any]:
     docstring). That claim is preserved read-only for a human under
     ``payload.claimed_from``, not consumed by anything that makes a trust
     decision. ``must_read`` is always False: the native protocol has no such
-    concept, so nothing here synthesizes escalation on its behalf.
+    concept, so nothing here synthesizes escalation on its behalf, and
+    notify_policy.py refuses to let it pierce via must_read regardless.
+
+    ``priority`` DOES carry the envelope's own self-reported ``"now"`` (mapped
+    to dispatch's ``"urgent"``) vs ``"next"`` (``"normal"``). This is not a new
+    trust concession: every dispatch sender can already self-report
+    ``priority="urgent"`` with no validation — notify_policy.py's "important"
+    policy has always trusted a claimed priority the same way it distrusts a
+    claimed must_read. Without this mapping every native-bridge message would
+    be silently unable to wake anyone under the default ``notify_on =
+    "important"``, regardless of ``[bridge] trust_wake`` (which only affects
+    the separate must_read override, not this one) — undermining the whole
+    point of exposing a nick on the native bus. must_read stays the one thing
+    this bridge gates behind explicit operator opt-in.
     """
     content = env["message"]["content"]
     return {
@@ -278,7 +311,7 @@ def native_to_local_msg(env: dict[str, Any], *, to: str) -> dict[str, Any]:
         "from": NATIVE_FROM_ID,
         "to": to,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "priority": "normal",
+        "priority": "urgent" if env.get("priority") == "now" else "normal",
         "content": content,
         "payload": {"claimed_from": env.get("from"), "native_msg_id": env.get("msg_id")},
         "thread_id": None,
@@ -439,7 +472,13 @@ class NativeBridge:
 
     No wildcard: a nick not in ``nicks`` is never exposed on the native bus and
     never receives outbound native delivery, the same "nothing without a config
-    line" posture as ``[supervisor]``.
+    line" posture as ``[supervisor]``. That allowlist is enforced TWICE on the
+    outbound path, deliberately redundantly: ``_local_messages`` only ever
+    scans a bridged nick's own inbox in the first place, and ``_publish_one``
+    checks ``to in self.nicks`` again before ever building an envelope — so a
+    future change to either one alone can't reopen the gap where an unrelated
+    dispatch agent's private mail was reachable by anyone able to register a
+    same-named entry in the native session roster.
     """
 
     def __init__(
@@ -459,7 +498,16 @@ class NativeBridge:
         self.socket_dir = Path(socket_dir)
         self._state = Path(state_dir) if state_dir else (self.dispatch_dir / ".native")
         self._ledger_path = self._state / "ucbridge-outbound.json"
+        # "Bridge from now on": if no ledger exists yet (the bridge was just
+        # enabled), messages already sitting in a bridged nick's inbox are
+        # pre-existing backlog, NOT traffic to forward. Mirrors GitBridge's
+        # identical first-run guard, and for the identical reason — without it,
+        # turning this on for a nick with old pending mail dumps that backlog
+        # onto whatever native session currently answers to that name.
+        first_run = not self._ledger_path.exists()
         self._ledger = self._load_ledger()
+        if first_run:
+            self._seed_ledger_from_backlog()
         self._listeners: dict[str, NativeInboundListener] = {}
 
     # -- lifecycle ------------------------------------------------------------
@@ -484,7 +532,7 @@ class NativeBridge:
         self.start()
         try:
             while True:
-                self.tick()
+                self.tick_guarded()
                 time.sleep(interval)
         finally:
             self.stop()
@@ -492,33 +540,60 @@ class NativeBridge:
     # -- outbound: local inbox -> native socket -------------------------------
 
     def tick(self) -> int:
-        """One outbound pass: deliver newly-seen messages addressed to a name
-        that resolves on the native bus but not on the local dispatch bus.
-        Returns how many were sent."""
+        """One outbound pass: deliver newly-seen messages addressed to a
+        bridged nick that resolves on the native bus but not on the local
+        dispatch bus. Returns how many were sent.
+
+        The native-session probe sweep (a live connect per registered session)
+        only runs when there's at least one un-ledgered candidate — an idle
+        relay costs nothing beyond the local inbox scan, rather than probing
+        every registered native session every tick regardless of traffic.
+        """
+        candidates = [
+            (msg, msg["id"])
+            for msg in self._local_messages()
+            if msg.get("id") and msg["id"] not in self._ledger
+        ]
+        if not candidates:
+            return 0
         sessions = list_native_sessions(self.sessions_dir)
         live_local = set(dispatch_fs.live_agents(self.dispatch_dir))
         sent = 0
-        touched = False
-        for msg in self._local_messages():
-            mid = msg.get("id")
-            if not mid or mid in self._ledger:
-                continue
-            touched = True
+        for msg, mid in candidates:
             if self._publish_one(msg, sessions=sessions, live_local=live_local):
                 sent += 1
             self._ledger[mid] = time.time()
-        if touched:
-            self._save_ledger()
+        self._save_ledger()
         return sent
 
+    def tick_guarded(self) -> bool:
+        """tick() that never raises: mirrors GitBridge.tick_guarded — a
+        transient I/O error must not take down every bridged nick's listener.
+        Returns True on a clean pass, False if it swallowed an error."""
+        try:
+            self.tick()
+            return True
+        except Exception as e:  # noqa: BLE001 - daemon resilience is the whole point
+            print(f"[ucbridge] sync pass failed (will retry): {e}", file=sys.stderr, flush=True)
+            return False
+
     def _local_messages(self):
-        for inbox in self._inbox_dirs():
+        """Yield each pending message in a BRIDGED nick's own inbox — never any
+        other agent's. Scoping the scan itself (rather than reading every inbox
+        on the relay and filtering by recipient afterward) means an unrelated
+        dispatch agent's private mail is never even parsed by this process, on
+        top of the explicit `to in self.nicks` check `_publish_one` makes
+        again before ever building an envelope."""
+        for nick in self.nicks:
+            inbox = self.dispatch_dir / nick
+            if not inbox.is_dir():
+                continue
             for f in sorted(inbox.glob("*.json")):
                 try:
                     msg = json.loads(f.read_text())
                 except (json.JSONDecodeError, OSError):
                     continue
-                if msg.get("_via") in ("git", "native-bridge"):
+                if msg.get("_via") in dispatch_fs.BRIDGED_VIA_TAGS:
                     continue  # never echo something that arrived over a bridge
                 if msg.get("state") == "expired":
                     continue
@@ -528,8 +603,10 @@ class NativeBridge:
         self, msg: dict[str, Any], *, sessions: list[dict[str, Any]], live_local: set[str]
     ) -> bool:
         to = msg.get("to")
-        if not to or to == "all" or to.startswith("#"):
+        if not isinstance(to, str) or not to or to == "all" or to.startswith("#"):
             return False  # broadcast/channels have no native equivalent
+        if to not in self.nicks:
+            return False  # redundant with _local_messages' scope — see class docstring
         if not ID_RE.match(to):
             return False
         if to in live_local:
@@ -540,28 +617,24 @@ class NativeBridge:
         envelope = build_envelope(msg, from_path=str(self.socket_dir / "dispatch-ucbridge.sock"))
         return send_native(Path(str(session["messagingSocketPath"])), envelope)
 
-    def _inbox_dirs(self) -> list[Path]:
-        try:
-            entries = sorted(self.dispatch_dir.iterdir())
-        except OSError:
-            return []
-        return [d for d in entries if d.is_dir() and not d.name.startswith(".")]
+    # -- ledger -----------------------------------------------------------------
 
-    # -- ledger (identical shape to git_bridge's) ------------------------------
+    def _seed_ledger_from_backlog(self) -> None:
+        """First-run guard: record every message already sitting in a bridged
+        nick's inbox as already-handled WITHOUT publishing it. Idempotent-safe:
+        only called when no ledger existed yet. Mirrors
+        GitBridge._seed_ledger_from_backlog exactly, including always
+        persisting even when nothing was seeded — the file's *existence* is
+        what latches first_run to false for the next construction."""
+        now = time.time()
+        for msg in self._local_messages():
+            mid = msg.get("id")
+            if mid and mid not in self._ledger:
+                self._ledger[mid] = now
+        self._save_ledger()
 
     def _load_ledger(self) -> dict[str, float]:
-        try:
-            raw: dict[str, Any] = json.loads(self._ledger_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {}
-        cutoff = time.time() - LEDGER_TTL_SECONDS
-        return {k: float(v) for k, v in raw.items() if float(v) >= cutoff}
+        return dispatch_fs.load_ledger(self._ledger_path, LEDGER_TTL_SECONDS)
 
     def _save_ledger(self) -> None:
-        cutoff = time.time() - LEDGER_TTL_SECONDS
-        pruned = {k: v for k, v in self._ledger.items() if v >= cutoff}
-        self._ledger = pruned
-        self._state.mkdir(parents=True, exist_ok=True)
-        tmp = self._ledger_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(pruned))
-        tmp.replace(self._ledger_path)
+        self._ledger = dispatch_fs.save_ledger(self._ledger_path, self._ledger, LEDGER_TTL_SECONDS)

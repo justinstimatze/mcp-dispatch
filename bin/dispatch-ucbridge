@@ -91,6 +91,16 @@ def _cmd_check(section: dict) -> int:
         except ValueError as e:
             print(f"[ucbridge] {e}", file=sys.stderr)
             return 1
+    if not section.get("enabled"):
+        # Config is otherwise valid, but `dispatch-ucbridge` (no flags) would
+        # refuse to start on this same config — say so rather than reporting
+        # "OK" for something that won't actually run.
+        print(
+            f"[ucbridge] nicks OK ({', '.join(nicks)}) but [bridge].enabled is not "
+            "true — the daemon will refuse to start until it is",
+            file=sys.stderr,
+        )
+        return 1
     print(f"[ucbridge] config OK — would bridge: {', '.join(nicks)}")
     return 0
 
@@ -131,11 +141,11 @@ def main() -> int:
 
     bridge = _build(section, dispatch_dir)
     if args.once:
-        bridge.start()
-        try:
-            sent = bridge.tick()
-        finally:
-            bridge.stop()
+        # Outbound-only: tick() never touches the inbound listeners, so this
+        # deliberately does NOT call bridge.start() — a "smoke test" shouldn't
+        # itself stand up a real /tmp/cc-socks socket + ~/.claude/sessions
+        # registry entry for every bridged nick.
+        sent = bridge.tick()
         print(f"[ucbridge] one pass: {sent} message(s) sent")
         return 0
 

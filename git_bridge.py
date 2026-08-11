@@ -32,7 +32,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 import dispatch_fs
 from dispatch_fs import ID_RE
@@ -185,17 +184,26 @@ class GitBridge:
     # -- outbound: local inbox -> git lane ----------------------------------
 
     def _local_messages(self):
-        """Yield each locally-originated (non-``_via:git``) inbox message dict,
-        across every inbox. The single scan both ``_outbound`` and the first-run
-        ``_seed_ledger_from_backlog`` share, so their skip logic can't drift."""
+        """Yield each locally-originated inbox message dict, across every inbox,
+        skipping anything tagged with a bridge provenance (dispatch_fs.BRIDGED_VIA_TAGS
+        — currently "git" and "native-bridge"). The single scan both ``_outbound``
+        and the first-run ``_seed_ledger_from_backlog`` share, so their skip logic
+        can't drift.
+
+        Skipping "git" is the ordinary echo guard. Skipping "native-bridge" too
+        matters for a different reason: ``envelope_to_msg`` (below) unconditionally
+        overwrites `_via` to "git" on materialization, so re-publishing a
+        native-bridge-origin message here would silently launder its
+        untrusted-provenance tag into an ordinary cross-host DM on every other host.
+        """
         for inbox in self._inbox_dirs():
             for f in sorted(inbox.glob("*.json")):
                 try:
                     msg = json.loads(f.read_text())
                 except (json.JSONDecodeError, OSError):
                     continue
-                if msg.get("_via") == "git":
-                    continue  # arrived over git — never echo back
+                if msg.get("_via") in dispatch_fs.BRIDGED_VIA_TAGS:
+                    continue
                 if msg.get("state") == "expired":
                     # A tombstone is local bookkeeping — the record that this
                     # message was never read — not a message to transmit. Narrow
@@ -426,18 +434,7 @@ class GitBridge:
         self._save_ledger()
 
     def _load_ledger(self) -> dict[str, float]:
-        try:
-            raw: dict[str, Any] = json.loads(self._ledger_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {}
-        cutoff = time.time() - LEDGER_TTL_SECONDS
-        return {k: float(v) for k, v in raw.items() if float(v) >= cutoff}
+        return dispatch_fs.load_ledger(self._ledger_path, LEDGER_TTL_SECONDS)
 
     def _save_ledger(self) -> None:
-        cutoff = time.time() - LEDGER_TTL_SECONDS
-        pruned = {k: v for k, v in self._ledger.items() if v >= cutoff}
-        self._ledger = pruned
-        self._state.mkdir(parents=True, exist_ok=True)
-        tmp = self._ledger_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(pruned))
-        tmp.replace(self._ledger_path)
+        self._ledger = dispatch_fs.save_ledger(self._ledger_path, self._ledger, LEDGER_TTL_SECONDS)
