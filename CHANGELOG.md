@@ -9,17 +9,37 @@ truth for versions.
 ## [0.11.3] - 2026-08-25
 
 ### Added
+- **Native-protocol bridge** (`bin/dispatch-ucbridge`, `bridge_native.py`) —
+  bridges an explicit allowlist of dispatch nicks onto Claude Code's own
+  built-in Unix-socket inter-session protocol, so a local Claude Code session
+  reaches a bridged nick by name with no dispatch MCP server needed on the
+  other end. Sender attribution on that wire is composed text, not a
+  verified fact, so everything delivered this way is tagged
+  `_via: "native-bridge"` and attributed to a fixed placeholder id rather
+  than whatever the wire claims; `notify_policy.should_notify` carves it out
+  of `must_read`-forced wakes unless `[bridge] trust_wake` is set. Off by
+  default — nothing is exposed without an explicit `[bridge].nicks` entry.
+  See `docs/native-bridge.md`.
 - **`trust_local_peers` config option** (off by default). When set, the
   composed `instructions` tell the model that a dispatch message with no
   `via` field is trustworthy on the *channel* — it could only have been
   written by a local process running as this account, since the relay's own
   file permissions (or `group_mode`'s deliberately widened group) already
-  gate who can write there, and the `via` tag is stamped exactly once by the
-  git-ingestion path, never by a local sender. It doesn't relax judgment on
-  the *action* (still declines anything destructive, irreversible, or
-  credential-touching) and doesn't extend to `via: "remote"` messages, which
-  keep the default tool-result caution. See "Trusting local peers" in the
-  README.
+  gate who can write there, and every bridge tags what it delivers
+  (`dispatch_fs.BRIDGED_VIA_TAGS`), so an untagged message has no path
+  except a local sender. It doesn't relax judgment on the *action* (still
+  declines anything destructive, irreversible, or credential-touching) and
+  doesn't extend to a message carrying any `via` value — `via: "remote"`
+  (git bridge) or `via: "native-bridge"` — both of which keep the default
+  tool-result caution. See "Trusting local peers" in the README.
+
+### Fixed
+- **TUI staticcheck failures** that had CI red on every push to `main` since
+  2026-08-03, predating this release's other changes: trailing periods in
+  three `ircd/config.go` `Validate()` error strings (ST1005), and dead
+  `write`/`writeInbox`/`laneLine` helpers in `model_test.go` (U1000) left
+  behind when the tui/relay extraction moved the live copies to
+  `tui/relay/relay_test.go` without deleting the originals.
 
 ## [0.11.2] - 2026-08-07
 

@@ -1034,22 +1034,25 @@ carried out. That's correct caution for a channel that could be anything;
 it's just stricter than this relay's actual local case, where the channel
 already IS the answer to "who could have sent this." Delivery is
 filesystem-permission-scoped (`0700`/`0600`, or `group_mode`'s deliberately
-widened group), and the `via` tag on a remote-origin message is stamped
-exactly once, by the git-ingestion path alone — a local sender has no way to
-set it. So a message with no `via` field could only have been written by a
-process running as your own account (or, under `group_mode`, one you put in
-the group): the same trust you already extend to anything else running as
-you.
+widened group), and every bridge tags what it delivers —
+`dispatch_fs.BRIDGED_VIA_TAGS` is the enforced set, currently the git bridge
+and the [native-protocol bridge](#native-protocol-bridge) — so a local sender
+has no way to set `via` itself. A message with no `via` field could only have
+been written by a process running as your own account (or, under
+`group_mode`, one you put in the group): the same trust you already extend
+to anything else running as you.
 
 Set `trust_local_peers = true` to tell the model that directly — see
 `config.example.toml`. It changes the CHANNEL's presumption, not the model's
 judgment about the action: the same clause tells it to keep declining
 anything destructive, irreversible, credential-touching, or leaving the
-machine, same as if you'd asked directly, and it says nothing about
-`via: "remote"` messages, which keep the default caution since a git remote
-is unauthenticated cleartext. Off by default for the same reason `group_mode`
-is: it's a real change to what the model will act on unprompted, worth an
-informed opt-in rather than a silent default.
+machine, same as if you'd asked directly, and it says nothing about a
+message carrying any `via` value — `via: "remote"` (git bridge, cleartext,
+unauthenticated) or `via: "native-bridge"` (its `from` is always a fixed
+placeholder, never a verified dispatch identity) — both keep the default
+caution. Off by default for the same reason `group_mode` is: it's a real
+change to what the model will act on unprompted, worth an informed opt-in
+rather than a silent default.
 
 ## Message Format
 
