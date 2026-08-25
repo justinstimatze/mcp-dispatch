@@ -19,6 +19,8 @@ def should_notify(
     notify_on: str,
     agent_id: str | None,
     channels: list[str] | tuple[str, ...] | None = None,
+    *,
+    native_bridge_trusted: bool = False,
 ) -> bool:
     """Return True if ``msg`` warrants notifying ``agent_id`` under ``notify_on``.
 
@@ -32,6 +34,17 @@ def should_notify(
     ``must_read`` always pierces, regardless of policy, *except* under "none"
     (an explicit opt-out stays silent). This mirrors must_read's override
     semantics elsewhere in the relay (e.g. it ignores TTL expiry).
+
+    One exception: a message tagged ``_via: "native-bridge"`` (see
+    bridge_native.py) arrived over Claude Code's own inter-session protocol,
+    where attribution is sender-composed text, not a verified fact — see that
+    module's docstring for the threat model. Letting such a message force a
+    wake purely because it *claims* ``must_read`` would let any local process
+    that can open a socket escalate itself into your attention. So a
+    native-bridge message only pierces via must_read when the operator has
+    opted in with ``native_bridge_trusted=True`` (``[bridge] trust_wake`` in
+    config); otherwise it still notifies normally under "all"/"direct"/
+    "important" — it just can't force a wake on its own say-so.
 
     A subscribed channel counts as "direct" because subscribing *is* the opt-in:
     the fan-out already put a durable copy in this agent's inbox, and a
@@ -47,7 +60,8 @@ def should_notify(
         return False
     if notify_on == "all":
         return True
-    if msg.get("must_read"):
+    untrusted_bridge = msg.get("_via") == "native-bridge" and not native_bridge_trusted
+    if msg.get("must_read") and not untrusted_bridge:
         return True
     if notify_on == "direct":
         to = msg.get("to")

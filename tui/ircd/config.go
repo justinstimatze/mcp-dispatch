@@ -182,7 +182,7 @@ func (c Config) Validate() error {
 			"→ it exposes the relay to anything that can reach its socket, so it stays off\n" +
 			"  until you turn it on in the config file:\n\n" +
 			"    [irc]\n    enabled = true\n\n" +
-			"  There is deliberately no flag for this — see docs/irc-gateway.md.")
+			"  There is deliberately no flag for this — see docs/irc-gateway.md")
 	}
 	if c.Socket == "" && c.Listen == "" {
 		return fmt.Errorf("[irc] has neither socket nor listen set — nothing to bind")
@@ -204,7 +204,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("[irc] listen = %q has no TLS\n"+
 				"→ refusing: every TCP listener must be encrypted, loopback included.\n"+
 				"  Generate a certificate:  dispatch-ircd --init-tls\n"+
-				"  Or drop `listen` and use the unix socket, which needs no TLS at all.", c.Listen)
+				"  Or drop `listen` and use the unix socket, which needs no TLS at all", c.Listen)
 		}
 		if _, err := tlsMinVersion(c.TLSMinVersion); err != nil {
 			return err
@@ -212,7 +212,7 @@ func (c Config) Validate() error {
 		if !isLoopback(c.Listen) && !c.AllowRemote {
 			return fmt.Errorf("[irc] listen = %q is not a loopback address\n"+
 				"→ refusing to serve the relay to the network. Bind 127.0.0.1 instead,\n"+
-				"  or set [irc] allow_remote = true if you really mean to.", c.Listen)
+				"  or set [irc] allow_remote = true if you really mean to", c.Listen)
 		}
 	}
 	return nil

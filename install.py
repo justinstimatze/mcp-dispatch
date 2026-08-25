@@ -39,6 +39,7 @@ REPO = Path(__file__).resolve().parent
 LAUNCHER = REPO / "bin" / "dispatch-launcher"
 HOOK_ARM = REPO / "hooks" / "dispatch-arm.py"
 HOOK_GITSYNC = REPO / "hooks" / "dispatch-gitsync-arm.py"
+HOOK_UCBRIDGE = REPO / "hooks" / "dispatch-ucbridge-arm.py"
 HOOK_PEEK = REPO / "hooks" / "dispatch-peek.py"
 
 # Which hook fires on which Claude Code event.
@@ -48,11 +49,15 @@ HOOK_PEEK = REPO / "hooks" / "dispatch-peek.py"
 #                       end-of-turn re-checks the host lock and respawns the
 #                       daemon if it died. It's lock-gated, so a redundant spawn
 #                       exits immediately — cheap and safe to fire often.
+#   dispatch-ucbridge — same self-healing story as dispatch-gitsync, for the
+#                       native-protocol bridge daemon (bin/dispatch-ucbridge)
+#                       instead of the git one. Also a no-op unless [bridge] is
+#                       configured, so wiring it globally is safe.
 #   dispatch-peek     — surfaces unread inbox messages to a session that only
 #                       consumes (never calls a tool, so piggyback never fires).
 HOOK_WIRING: dict[str, list[Path]] = {
-    "SessionStart": [HOOK_ARM, HOOK_GITSYNC],
-    "Stop": [HOOK_ARM, HOOK_GITSYNC, HOOK_PEEK],
+    "SessionStart": [HOOK_ARM, HOOK_GITSYNC, HOOK_UCBRIDGE],
+    "Stop": [HOOK_ARM, HOOK_GITSYNC, HOOK_UCBRIDGE, HOOK_PEEK],
 }
 
 
@@ -68,7 +73,7 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> int:
 def ensure_executable() -> None:
     """The launcher and hooks must be +x — a fresh clone or a zip download can
     drop the mode bit."""
-    for p in (LAUNCHER, HOOK_ARM, HOOK_GITSYNC, HOOK_PEEK):
+    for p in (LAUNCHER, HOOK_ARM, HOOK_GITSYNC, HOOK_UCBRIDGE, HOOK_PEEK):
         if p.exists():
             mode = p.stat().st_mode
             p.chmod(mode | 0o111)

@@ -89,6 +89,14 @@ def _resolve_agent_id(dispatch_dir: Path) -> str | None:
     return common.resolve_agent_id(dispatch_dir, os.getcwd())
 
 
+def _bridge_trust_wake() -> bool:
+    # Mirrors server.py's _bridge_trust_wake: a message tagged "native-bridge"
+    # (see bridge_native.py) only pierces via must_read when the operator opted
+    # in — both delivery paths must apply that carve-out identically.
+    raw = common.load_config().get("bridge")
+    return bool(raw.get("trust_wake")) if isinstance(raw, dict) else False
+
+
 def _my_channels(dispatch_dir: Path, agent_id: str) -> list[str]:
     """This agent's current channel subscriptions, from its presence record.
 
@@ -113,6 +121,7 @@ def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]
     """Unread, unexpired messages in this agent's inbox that the policy notifies on."""
     inbox = dispatch_dir / agent_id
     channels = _my_channels(dispatch_dir, agent_id)
+    trust_wake = _bridge_trust_wake()
     out = []
     for f in sorted(inbox.glob("*.json")):
         try:
@@ -121,7 +130,7 @@ def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]
             continue
         if msg.get("state", "pending") != "pending" or _expired(msg):
             continue
-        if should_notify(msg, notify_on, agent_id, channels):
+        if should_notify(msg, notify_on, agent_id, channels, native_bridge_trusted=trust_wake):
             out.append(msg)
     return out
 
@@ -138,8 +147,18 @@ def _oneline(agent_id: str, m: dict) -> str:
         flags += " ‼"
     elif m.get("priority") == "high":
         flags += " !"
-    # Surface cross-host provenance: a git-materialized message is tagged _via.
-    via = " «remote»" if m.get("_via") == "git" else ""
+    # Surface provenance across a trust boundary: a git-materialized message
+    # or one that crossed the native-protocol bridge is tagged _via — server.py's
+    # _public_msg exposes the same distinction to peek()/who(), so the wake
+    # line must agree rather than rendering a native-bridge message (`from` is
+    # always a fixed placeholder, see bridge_native.py) identically to an
+    # ordinary trusted local one.
+    if m.get("_via") == "git":
+        via = " «remote»"
+    elif m.get("_via") == "native-bridge":
+        via = " «native-bridge»"
+    else:
+        via = ""
     preview = (m.get("content", "") or "")[:140].replace("\n", " ")
     return (
         f"[mcp-dispatch] {m.get('from', '?')} → {agent_id}{flags}{via}: {preview}  "

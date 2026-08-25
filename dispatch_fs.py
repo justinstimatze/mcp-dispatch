@@ -289,3 +289,57 @@ def envelope_to_msg(env: Any) -> dict:
     msg.pop("read_at", None)
     msg["_via"] = "git"
     return msg
+
+
+# ---------------------------------------------------------------------------
+# Bridge provenance tags — shared by git_bridge.py and bridge_native.py
+# ---------------------------------------------------------------------------
+
+# `_via` values marking a message as having already crossed ONE bridge (a
+# transport/trust boundary this relay doesn't fully vouch for). Every bridge's
+# own outbound scan must skip ALL of these, not just its own: re-publishing a
+# git-origin message over git is a pointless echo, but re-publishing a
+# native-bridge-origin message over git is worse than pointless — git_bridge's
+# materialization (envelope_to_msg, above) unconditionally overwrites `_via`
+# to "git", which would silently launder an untrusted-provenance message into
+# one that reads as an ordinary cross-host DM on every other host. One shared
+# set is what keeps a THIRD bridge from repeating this by hand-copying a
+# single-value check the way this repo's dispatch_common.py module exists to
+# stop happening for config/identity plumbing.
+BRIDGED_VIA_TAGS = frozenset({"git", "native-bridge"})
+
+
+# ---------------------------------------------------------------------------
+# Outbound-ledger persistence — shared by git_bridge.py and bridge_native.py
+# ---------------------------------------------------------------------------
+#
+# "Already attempted this message id" bookkeeping has the identical shape in
+# both bridges (load + TTL-prune on start, prune + durable save after every
+# tick), and started drifting the moment there were two copies — this is the
+# single source both now call.
+
+
+def load_ledger(path: Path, ttl_seconds: float) -> dict[str, float]:
+    """Load a bridge's ``{message_id: attempted_at}`` ledger, dropping entries
+    older than ``ttl_seconds`` (the source inbox message has long since expired,
+    so the entry recording "already attempted" is moot)."""
+    try:
+        raw: dict[str, Any] = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cutoff = time.time() - ttl_seconds
+    return {k: float(v) for k, v in raw.items() if float(v) >= cutoff}
+
+
+def save_ledger(path: Path, ledger: dict[str, float], ttl_seconds: float) -> dict[str, float]:
+    """Prune and durably save a ledger (plain write+rename — this is
+    bookkeeping, not delivery state, so atomic_write's fsync isn't needed).
+    Returns the pruned dict, which the caller should keep as its new in-memory
+    copy so a later save doesn't resurrect what this one just dropped."""
+    cutoff = time.time() - ttl_seconds
+    pruned = {k: v for k, v in ledger.items() if v >= cutoff}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(pruned))
+    tmp.replace(path)
+    return pruned

@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""Bridge an allowlist of dispatch nicks to Claude Code's own built-in
+inter-session protocol (Unix sockets in /tmp/cc-socks/), per
+https://github.com/chrismo/claude-rig/blob/main/docs/inter-claude-protocol.md.
+
+    dispatch-ucbridge                    # run the daemon (bridges [bridge].nicks)
+    dispatch-ucbridge --once             # a single outbound pass and exit (smoke test)
+    dispatch-ucbridge --check            # validate config, print what would be bridged
+    dispatch-ucbridge --no-presence-gate # run forever, independent of any harness
+    dispatch-ucbridge status             # is it running? config, lock, what's visible
+    dispatch-ucbridge service install    # run it as a systemd user service
+
+OFF unless [bridge] enabled = true AND a non-empty nicks = [...] are both set —
+the same allowlist-only posture as [supervisor]: a nick with no entry is never
+exposed on the native bus, whatever it is sent.
+
+The daemon holds a host-level lock (one daemon per DISPATCH_DIR) so a second
+instance can't silently steal a live instance's sockets out from under it. By
+default it is also presence-gated: it exits once no dispatch agent is live on
+this host, so a hook-spawned daemon can't orphan (see
+hooks/dispatch-ucbridge-arm.py, wired into SessionStart by install.py).
+`--no-presence-gate` (or `[bridge] presence_gate = false`) drops the gate for
+running under `service install` instead, mirroring dispatch-gitsync exactly.
+
+Read docs/native-bridge.md before enabling it: every message this bridge
+delivers into a dispatch inbox is tagged `_via: "native-bridge"` and attributed
+to a fixed placeholder id, never to whatever the wire claims — the native
+protocol's own spec says that attribution is sender-composed text, not a
+verified fact. See that document for the full threat model and the
+notify_on/must_read interaction (`[bridge] trust_wake`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+
+# Only ever caught here (subprocess.CalledProcessError); the actual `systemctl`
+# calls this can raise from live in systemd_user.py, argv-only, never a shell.
+import subprocess  # nosec B404
+import sys
+import time
+from pathlib import Path
+
+# bridge_native.py, dispatch_fs.py, dispatch_common.py and ucbridge_service.py
+# live at the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
+import ucbridge_service  # noqa: E402
+from bridge_native import (  # noqa: E402
+    DEFAULT_SESSIONS_DIR,
+    DEFAULT_SOCKET_DIR,
+    NativeBridge,
+    list_native_sessions,
+)
+
+
+def _float_env(name: str, default: float) -> float:
+    """Parse a float from the environment, falling back on anything unparseable.
+    Raising here would happen at *import*, so a typo in a test-only knob would
+    traceback every subcommand — `status` and `service` don't even use this."""
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+# Exit if no dispatch agent ever appears (standalone safety). Env-overridable so
+# the tests don't have to sit through a real minute — same idiom as
+# dispatch-wait's MCP_DISPATCH_STANDALONE_FALLBACK / dispatch-gitsync's grace.
+STARTUP_GRACE_SECONDS = _float_env("MCP_DISPATCH_UCBRIDGE_GRACE", 60.0)
+
+# Ungated (service) mode only: how long a failing tick backs off to.
+MAX_BACKOFF_SECONDS = 60.0
+MAX_BACKOFF_SHIFT = 8  # see dispatch-gitsync's identical constant for why
+
+# How often a supervised daemon re-checks config while it isn't ready to bridge.
+READY_POLL_SECONDS = _float_env("MCP_DISPATCH_UCBRIDGE_READY_POLL", 5.0)
+
+
+# ---------------------------------------------------------------------------
+# Config / path resolution
+# ---------------------------------------------------------------------------
+
+
+def _bridge_section(cfg: dict) -> dict:
+    raw = cfg.get("bridge")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _nicks(section: dict) -> list[str]:
+    raw = section.get("nicks") or []
+    return [str(n) for n in raw if isinstance(n, str)]
+
+
+def _sessions_dir(section: dict) -> Path:
+    return Path(os.path.expanduser(str(section.get("sessions_dir") or DEFAULT_SESSIONS_DIR)))
+
+
+def _socket_dir(section: dict) -> Path:
+    return Path(os.path.expanduser(str(section.get("socket_dir") or DEFAULT_SOCKET_DIR)))
+
+
+def _build(section: dict, dispatch_dir: Path) -> NativeBridge:
+    return NativeBridge(
+        dispatch_dir,
+        _nicks(section),
+        socket_dir=_socket_dir(section),
+        sessions_dir=_sessions_dir(section),
+        allow_outbound=bool(section.get("allow_outbound")),
+    )
+
+
+def _host_lock_path(dispatch_dir: Path) -> Path:
+    """One daemon per DISPATCH_DIR — the lock key is the dir, not a nick, so
+    two overlapping [bridge] configs on one relay still can't race each other's
+    sockets."""
+    return common.state_dir() / f"ucbridge-{common.md5_key(str(dispatch_dir))}.lock"
+
+
+def _presence_gate(cli: bool | None, section: dict) -> bool:
+    """Should the daemon exit when no dispatch agent holds a presence lock? CLI
+    beats env beats config, defaulting to True — mirrors dispatch-gitsync's
+    _presence_gate exactly, including the reasoning: only an explicit opt-out
+    should let a hook-spawned daemon outlive every session."""
+    if cli is not None:
+        return cli
+    env = os.environ.get("MCP_DISPATCH_UCBRIDGE_PRESENCE_GATE")
+    if env is not None and env.strip():
+        return common.truthy(env)
+    val = section.get("presence_gate")
+    return True if val is None else bool(val)
+
+
+def _backoff_delay(failures: int, interval: float) -> float:
+    """Seconds to sleep after `failures` consecutive failed ticks. Exponential
+    from `interval` up to MAX_BACKOFF_SECONDS, exponent clamped — see
+    dispatch-gitsync's identical helper for why the clamp matters."""
+    if failures <= 0:
+        return interval
+    return min(interval * (2 ** min(failures, MAX_BACKOFF_SHIFT)), MAX_BACKOFF_SECONDS)
+
+
+def _resolve() -> tuple[dict | None, tuple[str, int] | None]:
+    """Re-read config and resolve everything the daemon needs to start bridging.
+
+    Returns ``(settings, None)`` when ready, or ``(None, (reason, exit_code))``.
+    A function of CURRENT config, not startup state: a supervised daemon calls
+    this repeatedly while waiting, so flipping [bridge].enabled on takes effect
+    without anyone touching systemctl — mirrors dispatch-gitsync's `_resolve`.
+    """
+    cfg = common.load_config()
+    section = _bridge_section(cfg)
+    enabled = bool(section.get("enabled")) or common.truthy(
+        os.environ.get("MCP_DISPATCH_BRIDGE_ENABLED")
+    )
+    if not enabled:
+        return None, (
+            "[bridge].enabled is not true — not bridging. Set it in config, "
+            "or MCP_DISPATCH_BRIDGE_ENABLED=1 for an ad hoc run.",
+            0,
+        )
+    nicks = _nicks(section)
+    if not nicks:
+        return None, ("[bridge].nicks is empty — nothing to bridge.", 1)
+    for n in nicks:
+        try:
+            dispatch_fs.validate_id(n, "bridge nick")
+        except ValueError as e:
+            # Same class of problem as "not enabled" or "no relay yet" — a
+            # typo'd nick must WAIT for a config fix under supervision, not
+            # crash NativeBridge's constructor uncaught and crash-loop the
+            # unit past its start limit. cmd_check already validates this for
+            # a one-shot `--check`; this is the same rule on the live path.
+            return None, (str(e), 1)
+    dispatch_dir = common.dispatch_dir(cfg)
+    if not dispatch_dir.is_dir():
+        return None, (f"no relay at {dispatch_dir} — nothing to bridge.", 0)
+    return {"cfg": cfg, "section": section, "dispatch_dir": dispatch_dir}, None
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+
+def cmd_status(argv: list[str]) -> int:
+    argparse.ArgumentParser(prog="dispatch-ucbridge status").parse_args(argv)
+    cfg = common.load_config()
+    section = _bridge_section(cfg)
+    dispatch_dir = common.dispatch_dir(cfg)
+    nicks = _nicks(section)
+
+    print(f"enabled:          {bool(section.get('enabled'))}")
+    print(f"nicks:            {', '.join(nicks) or '(none configured)'}")
+    print(f"allow_outbound:   {bool(section.get('allow_outbound'))} (default off)")
+    print(f"daemon running:   {common.flock_held(_host_lock_path(dispatch_dir))}")
+    print(f"dispatch_dir:     {dispatch_dir}")
+    print(f"socket_dir:       {_socket_dir(section)}")
+    print(f"sessions_dir:     {_sessions_dir(section)}")
+    for line in ucbridge_service.status_lines():
+        print(line)
+    if not section.get("enabled") or not nicks:
+        print("bridge is OFF (needs [bridge] enabled = true and a non-empty nicks list)")
+        return 0
+    live = list_native_sessions(_sessions_dir(section))
+    print(f"native sessions visible: {len(live)} ({sum(1 for s in live if s.get('live'))} live)")
+    if dispatch_dir.is_dir():
+        native_dir = dispatch_dir / ".native"
+        if native_dir.is_dir():
+            print(f"who() native roster:     {[p.stem for p in sorted(native_dir.glob('*.json'))]}")
+    return 0
+
+
+def cmd_check(argv: list[str]) -> int:
+    argparse.ArgumentParser(prog="dispatch-ucbridge --check").parse_args(argv)
+    cfg = common.load_config()
+    section = _bridge_section(cfg)
+    nicks = _nicks(section)
+    if not nicks:
+        print("[ucbridge] no [bridge].nicks configured — nothing would be bridged", file=sys.stderr)
+        return 1
+    for n in nicks:
+        try:
+            dispatch_fs.validate_id(n, "bridge nick")
+        except ValueError as e:
+            print(f"[ucbridge] {e}", file=sys.stderr)
+            return 1
+    if not section.get("enabled"):
+        # Config is otherwise valid, but `dispatch-ucbridge` (no flags) would
+        # refuse to start on this same config — say so rather than reporting
+        # "OK" for something that won't actually run.
+        print(
+            f"[ucbridge] nicks OK ({', '.join(nicks)}) but [bridge].enabled is not "
+            "true — the daemon will refuse to start until it is",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"[ucbridge] config OK — would bridge: {', '.join(nicks)}")
+    return 0
+
+
+def cmd_service(argv: list[str]) -> int:
+    """Install/remove the systemd user unit — the harness-independent way to run.
+
+    hooks/dispatch-ucbridge-arm.py only exists inside Claude Code; anything else
+    talking through the relay never starts a daemon at all. This puts it under
+    the user's own init instead. Mirrors dispatch-gitsync's cmd_service.
+    """
+    ap = argparse.ArgumentParser(
+        prog="dispatch-ucbridge service",
+        description="Run the bridge as a systemd user service (any harness, no hooks).",
+    )
+    ap.add_argument(
+        "action", nargs="?", default="install", choices=["install", "uninstall", "show"]
+    )
+    ap.add_argument("--dry-run", action="store_true", help="print the plan/unit, write nothing")
+    ap.add_argument("--no-enable", action="store_true", help="write the unit but don't start it")
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra Environment= line (repeatable)",
+    )
+    ap.add_argument("--interval", type=float, default=None, help="seconds between outbound passes")
+    args = ap.parse_args(argv)
+
+    try:
+        if args.action == "uninstall":
+            for step in ucbridge_service.uninstall(dry_run=args.dry_run):
+                print(f"  {'would ' if args.dry_run else ''}{step}")
+            return 0
+
+        cfg = common.load_config()
+        section = _bridge_section(cfg)
+        if not section.get("enabled"):
+            # A service around a disabled bridge would exit immediately and be
+            # restarted forever. Fail loudly here instead of shipping a flapping unit.
+            print("[ucbridge] [bridge].enabled is false — enable it before installing the service.")
+            return 2
+        if not _nicks(section):
+            print("[ucbridge] [bridge].nicks is empty — nothing to bridge.")
+            return 2
+
+        config_path = (
+            Path(os.environ.get("MCP_DISPATCH_CONFIG") or "~/.config/mcp-dispatch/config.toml")
+            .expanduser()
+            .resolve()
+        )
+        unit = ucbridge_service.render_unit(
+            python=sys.executable,
+            daemon=Path(__file__).resolve(),
+            repo_root=Path(__file__).resolve().parent.parent,
+            config_path=config_path,
+            dispatch_dir=common.dispatch_dir(cfg),
+            socket_dir=_socket_dir(section),
+            sessions_dir=_sessions_dir(section),
+            state_dir=common.state_dir(),
+            group_mode=bool(common.flat(cfg, "group_mode")),
+            interval=args.interval,
+            env=ucbridge_service.validate_env(args.env),
+        )
+        if args.action == "show":
+            print(unit, end="")
+            return 0
+
+        steps = ucbridge_service.install(unit, enable=not args.no_enable, dry_run=args.dry_run)
+    except ucbridge_service.ServiceError as e:
+        print(f"[ucbridge] {e}")
+        return 2
+    except subprocess.CalledProcessError as e:
+        print(f"[ucbridge] systemctl failed: {(e.stderr or '').strip() or e}")
+        return 2
+
+    for step in steps:
+        print(f"  {'would ' if args.dry_run else ''}{step}")
+    if args.dry_run:
+        print("\n(--dry-run: nothing written. `service show` prints the unit itself.)")
+    else:
+        print(
+            "\n[ucbridge] the bridge now runs independently of any agent harness.\n"
+            "  logs:   journalctl --user -u mcp-dispatch-ucbridge -f\n"
+            "  upgrade: re-run `dispatch-ucbridge service install` after changing config"
+        )
+    return 0
+
+
+def cmd_run(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dispatch-ucbridge", description="Bridge dispatch nicks to the native protocol."
+    )
+    ap.add_argument(
+        "--interval", type=float, default=2.0, help="seconds between outbound passes (default 2.0)"
+    )
+    ap.add_argument("--once", action="store_true", help="run a single outbound pass and exit")
+    ap.add_argument("--check", action="store_true", help="validate config and exit")
+    gate = ap.add_mutually_exclusive_group()
+    gate.add_argument(
+        "--no-presence-gate",
+        dest="presence_gate",
+        action="store_false",
+        default=None,
+        help="run until stopped instead of exiting when no dispatch agent is live",
+    )
+    gate.add_argument(
+        "--presence-gate",
+        dest="presence_gate",
+        action="store_true",
+        default=None,
+        help="force the default gated lifetime even if config disables it",
+    )
+    args = ap.parse_args(argv)
+
+    if args.check:
+        return cmd_check([])
+
+    gated = _presence_gate(args.presence_gate, _bridge_section(common.load_config()))
+
+    if args.once:
+        ready, problem = _resolve()
+        if problem:
+            print(f"[ucbridge] {problem[0]}", file=sys.stderr)
+            return problem[1]
+        if ready is None:  # unreachable: _resolve() always pairs a None problem with settings
+            return 1
+        bridge = _build(ready["section"], ready["dispatch_dir"])
+        # Outbound-only: tick() never touches the inbound listeners, so this
+        # deliberately does NOT call bridge.start() — a "smoke test" shouldn't
+        # itself stand up a real /tmp/cc-socks socket + ~/.claude/sessions
+        # registry entry for every bridged nick.
+        sent = bridge.tick()
+        print(f"[ucbridge] one pass: {sent} message(s) sent")
+        return 0
+
+    ready, problem = _resolve()
+    if problem:
+        reason, code = problem
+        # A transient run (hook-spawned) just reports and leaves. A SUPERVISED
+        # one must not: every one of these is "the world isn't ready yet", and
+        # exiting hands systemd's Restart=always a process that dies
+        # immediately, latching the unit `failed` after the start limit — so
+        # wait instead, re-reading config each pass, exactly like dispatch-gitsync.
+        if gated:
+            print(f"[ucbridge] {reason}", file=sys.stderr)
+            return code
+        last = None
+        try:
+            while problem:
+                if problem[0] != last:
+                    last = problem[0]
+                    print(f"[ucbridge] {last}\n[ucbridge] waiting — config is re-read every pass.")
+                time.sleep(READY_POLL_SECONDS)
+                ready, problem = _resolve()
+        except KeyboardInterrupt:
+            return 0
+        print("[ucbridge] ready — starting the bridge.")
+
+    if ready is None:  # unreachable: the wait loop only exits once _resolve() succeeds
+        return 1
+    dispatch_dir = ready["dispatch_dir"]
+    nicks = _nicks(ready["section"])
+    bridge = _build(ready["section"], dispatch_dir)
+
+    # One daemon per host. A gated run (a racing SessionStart hook) finds the
+    # lock held and exits quietly. An ungated run WAITS for it instead — see
+    # dispatch-gitsync's identical reasoning.
+    lock_path = _host_lock_path(dispatch_dir)
+    lock = common.acquire_flock(lock_path, attempts=2)
+    if lock is None:
+        if gated:
+            print(f"[ucbridge] a daemon is already bridging {dispatch_dir}; not starting a second.")
+            return 0
+        print(f"[ucbridge] another daemon holds {dispatch_dir}; waiting to take over…")
+        try:
+            while lock is None:
+                time.sleep(max(args.interval, 1.0))
+                lock = common.acquire_flock(lock_path)
+        except KeyboardInterrupt:
+            return 0
+        print("[ucbridge] took over the host lock.")
+
+    print(
+        f"[ucbridge] bridging {', '.join(nicks)} "
+        f"(every {args.interval}s, "
+        f"lifetime={'presence-gated' if gated else 'until stopped'})",
+        file=sys.stderr,
+    )
+    # SIGTERM has no default Python handler (unlike SIGINT/KeyboardInterrupt),
+    # so systemctl stop / a plain `kill` would otherwise skip cleanup below and
+    # leave stale sockets + registry files behind.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(0)))
+
+    seen_live = False
+    start = time.monotonic()
+    failures = 0
+    try:
+        # Inside the try (not before it): if start() raises partway through
+        # (e.g. the 2nd of 3 nicks fails to bind), whichever listeners DID
+        # come up before the failure must still be torn down by the finally
+        # below, not orphaned.
+        bridge.start()
+        while True:
+            ok = bridge.tick_guarded()
+            if gated:
+                live = bool(dispatch_fs.live_agents(dispatch_dir))
+                if live:
+                    seen_live = True
+                elif seen_live:
+                    print("[ucbridge] no live agents on host — exiting (a new session re-arms me).")
+                    return 0
+                elif time.monotonic() - start > STARTUP_GRACE_SECONDS:
+                    print("[ucbridge] no agents appeared within startup grace — exiting.")
+                    return 0
+                time.sleep(args.interval)
+                continue
+            failures = 0 if ok else failures + 1
+            time.sleep(_backoff_delay(failures, args.interval))
+    except (KeyboardInterrupt, SystemExit):
+        return 0
+    finally:
+        bridge.stop()
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "status":
+        return cmd_status(argv[1:])
+    if argv and argv[0] == "service":
+        return cmd_service(argv[1:])
+    return cmd_run(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

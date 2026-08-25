@@ -2,10 +2,11 @@
 
 PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_policy.py \
 	dispatch_common.py gitsync_service.py systemd_user.py supervisor.py \
-	supervisor_service.py digest.py install.py tests/ \
+	supervisor_service.py digest.py bridge_native.py ucbridge_service.py install.py tests/ \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
+	hooks/dispatch-ucbridge-arm.py \
 	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync bin/dispatch-supervise \
-	bin/dispatch-digest scripts/
+	bin/dispatch-digest bin/dispatch-ucbridge scripts/
 
 # One-command setup: sync deps, register the MCP server, wire the hooks.
 # Idempotent — safe to re-run. `make install ARGS=--dry-run` to preview.
@@ -34,9 +35,11 @@ lint:
 # supervisor.py earns its place twice over: it is the only module that spawns a
 # process, and what it spawns is decided by a config file.
 TYPED := server.py dispatch_common.py gitsync_service.py systemd_user.py \
-	supervisor.py supervisor_service.py digest.py \
+	supervisor.py supervisor_service.py digest.py bridge_native.py ucbridge_service.py \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
-	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync bin/dispatch-supervise
+	hooks/dispatch-ucbridge-arm.py \
+	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync bin/dispatch-supervise \
+	bin/dispatch-ucbridge
 
 typecheck:
 	uv run mypy --scripts-are-modules $(TYPED)
