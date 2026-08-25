@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-08-25
+
 ### Added
 - **`trust_local_peers` config option** (off by default). When set, the
   composed `instructions` tell the model that a dispatch message with no
@@ -913,7 +915,8 @@ change under a running install:
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.2...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.3...HEAD
+[0.11.3]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.1...v0.11.2
 [0.11.1]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.10.0...v0.11.0
