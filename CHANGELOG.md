@@ -6,6 +6,19 @@ truth for versions.
 
 ## [Unreleased]
 
+### Added
+- **`trust_local_peers` config option** (off by default). When set, the
+  composed `instructions` tell the model that a dispatch message with no
+  `via` field is trustworthy on the *channel* — it could only have been
+  written by a local process running as this account, since the relay's own
+  file permissions (or `group_mode`'s deliberately widened group) already
+  gate who can write there, and the `via` tag is stamped exactly once by the
+  git-ingestion path, never by a local sender. It doesn't relax judgment on
+  the *action* (still declines anything destructive, irreversible, or
+  credential-touching) and doesn't extend to `via: "remote"` messages, which
+  keep the default tool-result caution. See "Trusting local peers" in the
+  README.
+
 ## [0.11.2] - 2026-08-07
 
 ### Security

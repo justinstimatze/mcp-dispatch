@@ -22,6 +22,15 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # group_mode = true
 # dispatch_dir = "/var/tmp/mcp-dispatch"
 
+# Tell the model that a same-host peer's directives are trustworthy on the
+# CHANNEL — same weight as if you'd typed them yourself — because this relay's
+# file permissions already make "no via field" mean "written by a process
+# running as you" (or, under group_mode, one of the accounts you put in the
+# group). It does not relax judgment on the action, and it says nothing about
+# via="remote" messages (git bridge), which keep the normal caution. See
+# "Trusting local peers" in the README before enabling.
+# trust_local_peers = true
+
 # Max message size in bytes.
 max_message_bytes = 65536
 
