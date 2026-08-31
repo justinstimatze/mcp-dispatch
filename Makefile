@@ -12,6 +12,7 @@ PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_pol
 # Idempotent — safe to re-run. `make install ARGS=--dry-run` to preview.
 install:
 	python3 install.py $(ARGS)
+	git config core.hooksPath .githooks  # tracked git hooks (see .githooks/); not gated by ARGS=--dry-run
 
 test:
 	uv run pytest -q
