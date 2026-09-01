@@ -1799,15 +1799,37 @@ def who_tool() -> dict:
         "agents": agents,
         "count": len(agents),
     }
-    deaf = [str(a.get("agent_id")) for a in agents if a.get("armed") is False]
+    deaf_recs = [a for a in agents if a.get("armed") is False]
+    deaf = [str(a.get("agent_id")) for a in deaf_recs]
     if deaf:
         result["unarmed"] = deaf
+        # 0 attempts means the Stop hook hasn't fired for that id yet — almost
+        # always "no turn has completed there since it started", not "arming is
+        # broken." A nonzero count means the hook tried and is still blocking (or
+        # gave up and already desktop-warned the operator). Distinguishing these
+        # from a flat "unarmed" list is what stops a fresh, untouched session from
+        # reading as a wedged or dead one.
+        # Same state_dir resolution as `armed_for` above (a session that published
+        # its own state_dir writes its counter there too) — reusing the default
+        # location for one would silently read 0 for a session that's actually
+        # wedged.
+        result["unarmed_arm_attempts"] = {
+            str(a.get("agent_id")): dispatch_common.arm_block_count(
+                str(a.get("agent_id")),
+                Path(str(a["state_dir"])) if a.get("state_dir") else None,
+            )
+            for a in deaf_recs
+        }
         result["unarmed_note"] = (
             "These sessions are running but hold no message watch, so a message "
             "lands in the inbox and nothing wakes them; they read it whenever "
             "their operator next types. Delivery is still durable — nothing is "
             "lost — but do not expect a reply on any timescale, and do not read "
-            "silence from one as a decision."
+            "silence from one as a decision. unarmed_arm_attempts counts Stop-hook "
+            "blocks per id: 0 means that session hasn't completed a turn since it "
+            "started (the hook never got a chance, not a failure); nonzero means "
+            "the hook has tried to arm it and either is still retrying or already "
+            "gave up and warned its operator."
         )
     if remote:
         result["remote"] = remote

@@ -89,6 +89,27 @@ def md5_key(text: str) -> str:
     return hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()[:8]
 
 
+def arm_block_count(agent_id: str, state: Path | None = None) -> int:
+    """How many consecutive times the Stop hook has blocked this id trying to
+    arm it (hooks/dispatch-arm.py owns writing this; this is the read side for
+    who() to explain an unarmed session instead of just naming it).
+
+    0 means the Stop hook has never fired for this id at all — most often
+    because the session hasn't completed a first turn since it started, not
+    because arming failed. A count at or past the hook's cap means it kept
+    failing and the hook gave up (and already fired a desktop warning).
+
+    ``state`` mirrors ``armed()``'s own override param: a session that published
+    a non-default state_dir writes its counter there too, and reading the
+    default location for it would silently report 0 (looks fresh) for a session
+    that's actually wedged."""
+    f = (state or state_dir()) / f"armblock-{md5_key(agent_id)}.txt"
+    try:
+        return int(f.read_text())
+    except (OSError, ValueError):
+        return 0
+
+
 def notify(summary: str, body: str = "", cfg: dict | None = None) -> bool:
     """Fire the operator's ``notify_command``, if they set one. False if not.
 
