@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-09-01
+
 ### Fixed
 - **`group_mode` inbox inheritance stranded a nick's own mail when its bare
   inbox directory happened to be owned by a different account than the one
@@ -959,7 +961,8 @@ change under a running install:
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.4...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.5...HEAD
+[0.11.5]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.4...v0.11.5
 [0.11.4]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.1...v0.11.2
