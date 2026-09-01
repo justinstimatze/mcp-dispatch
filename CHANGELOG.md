@@ -6,6 +6,19 @@ truth for versions.
 
 ## [Unreleased]
 
+### Fixed
+- **`group_mode` inbox inheritance stranded a nick's own mail when its bare
+  inbox directory happened to be owned by a different account than the one
+  running the nick's live sessions.** `_inherit_orphan_inbox()`'s same-uid
+  gate was a flat `st_uid != os.getuid()` reject, which defeats group_mode's
+  entire point — the owner of a `<nick>/` inbox is whichever account first
+  sent it mail, not necessarily the account that later runs the nick. Now
+  mirrors `_enforce_dir_mode`'s own "not owner, but genuinely group-shared"
+  test (setgid + group rwx) instead of rejecting on ownership alone.
+  Confirmed live against the `defn` nick: five pending messages, oldest from
+  2026-08-05, stuck in an inbox owned by a different account than the one
+  running `defn`'s sessions.
+
 ## [0.11.4] - 2026-09-01
 
 ### Added

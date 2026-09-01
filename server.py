@@ -730,7 +730,9 @@ def _inherit_orphan_inbox(agent_id: str) -> int:
         105 pending messages sat in dead spools, 23 of them permanently
         ineligible here. git_bridge._local_ids now classifies by the .agents
         registry, which is never reaped;
-      - same uid, so group_mode can't siphon another account's mail.
+      - owned by me, or genuinely group-shared (setgid + group rwx, checked the
+        same way _enforce_dir_mode does) when group_mode is on — plain foreign
+        ownership isn't enough on its own to prove group_mode can't explain it.
 
     Claiming is the rename, not the read: two successors racing the same corpse
     both see the file, but only one os.replace() succeeds, so a message is adopted
@@ -758,8 +760,25 @@ def _inherit_orphan_inbox(agent_id: str) -> int:
         if pf.exists() and _presence_is_live(pf):
             continue  # live peer, not a corpse
         try:
-            if d.stat().st_uid != os.getuid():
-                continue  # another account's mail (group_mode)
+            st = d.stat()
+            is_owner = st.st_uid == os.getuid()
+            # Mirrors _enforce_dir_mode's own "not owner, but genuinely shared"
+            # test: a directory just being owned by someone else isn't proof it's
+            # foreign mail — under group_mode the owner is whichever account's
+            # process happened to mkdir it first (often the *nick's own* bare
+            # inbox, created by a different account than later runs its live
+            # sessions), and that's the exact case this function exists to adopt.
+            # Nick-name equality (the sibling/base match above) is the actual
+            # boundary; setgid+group-rwx is the proof this dir is really shared
+            # rather than a stray foreign directory group_mode can't explain.
+            shared = (
+                GROUP_MODE
+                and bool(st.st_mode & stat.S_ISGID)
+                and (st.st_mode & 0o070) == 0o070
+                and os.access(d, os.R_OK | os.W_OK | os.X_OK)
+            )
+            if not (is_owner or shared):
+                continue  # foreign, unshared directory — not mine to sweep
         except OSError:
             continue
         for f in sorted(d.glob("*.json")):

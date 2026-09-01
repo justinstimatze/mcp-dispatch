@@ -227,3 +227,78 @@ def test_no_sweeper_runs_when_inheritance_is_disabled(server_factory, tmp_path):
     before = _sweepers()
     s._start_sweeper("proj-222")
     assert _sweepers() == before
+
+
+# --- group_mode: ownership alone can't be the adoption gate -----------------
+#
+# A nick's bare inbox (`d.name == base`, not a `-<pid>` sibling) is where a DM
+# to a not-currently-running nick waits. Under group_mode that directory was
+# mkdir'd by whichever account first sent to it — not necessarily the account
+# that later runs the nick's live sessions — so the old flat "same uid" check
+# stranded genuinely-shared mail. Confirmed live against the `defn` nick: five
+# pending messages, oldest from 2026-08-05, sitting in an inbox dir owned by a
+# different account than the one running defn's sessions.
+
+
+def _group_config(tmp_path):
+    cfg = tmp_path / "group.toml"
+    cfg.write_text("group_mode = true\n")
+    return cfg
+
+
+def test_group_mode_adopts_a_differently_owned_nick_inbox(server_factory, tmp_path, monkeypatch):
+    dd = server_factory.dispatch_dir
+    dd.mkdir(parents=True, exist_ok=True)
+    s = server_factory("defn-999", config_path=_group_config(tmp_path))
+    assert s._read_inbox("defn-999") == []  # nothing to inherit at claim time
+
+    _plant(dd, "defn", mid="msg-crossuid")
+    (dd / "defn").chmod(0o2770)  # setgid + group rwx, as group_mode's own dirs are
+    monkeypatch.setattr(s.os, "getuid", lambda: -1)  # a different account's session
+    monkeypatch.setattr(s, "SWEEP_SECONDS", 0.02)
+    s._start_sweeper("defn-999")
+
+    assert _wait_for(lambda: bool(s._read_inbox("defn-999", state_filter="pending")))
+    got = s._read_inbox("defn-999")
+    assert [m["id"] for m in got] == ["msg-crossuid"]
+    assert got[0]["_inherited_from"] == "defn"
+
+
+def test_group_mode_still_refuses_a_foreign_unshared_dir(server_factory, tmp_path, monkeypatch):
+    """Foreign ownership plus group_mode isn't enough on its own — the dir must
+    actually carry the setgid+group-rwx bits group_mode's own dirs get, or any
+    session could claim to have inherited any nick's leftover mail."""
+    dd = server_factory.dispatch_dir
+    dd.mkdir(parents=True, exist_ok=True)
+    s = server_factory("defn-999", config_path=_group_config(tmp_path))
+    assert s._read_inbox("defn-999") == []
+
+    _plant(dd, "defn", mid="msg-notshared")
+    (dd / "defn").chmod(0o700)  # owner-only, not group-shared
+    monkeypatch.setattr(s.os, "getuid", lambda: -1)
+    monkeypatch.setattr(s, "SWEEP_SECONDS", 0.02)
+    s._start_sweeper("defn-999")
+
+    time.sleep(0.2)
+    assert s._read_inbox("defn-999") == []
+    assert list((dd / "defn").glob("*.json"))
+
+
+def test_default_mode_still_refuses_a_foreign_uid_regardless_of_perms(server_factory, monkeypatch):
+    """Without group_mode, foreign ownership is refused even if the dir happens
+    to carry group-shared bits — group_mode being off is what makes
+    cross-account adoption untrusted, not the bits alone."""
+    dd = server_factory.dispatch_dir
+    dd.mkdir(parents=True, exist_ok=True)
+    s = server_factory("defn-999")
+    assert s._read_inbox("defn-999") == []
+
+    _plant(dd, "defn", mid="msg-untrusted")
+    (dd / "defn").chmod(0o2770)  # looks shared, but group_mode is off
+    monkeypatch.setattr(s.os, "getuid", lambda: -1)
+    monkeypatch.setattr(s, "SWEEP_SECONDS", 0.02)
+    s._start_sweeper("defn-999")
+
+    time.sleep(0.2)
+    assert s._read_inbox("defn-999") == []
+    assert list((dd / "defn").glob("*.json"))
