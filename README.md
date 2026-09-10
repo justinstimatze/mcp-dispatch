@@ -7,6 +7,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 ## Features
 
 - **Non-destructive messaging** — Messages persist until explicitly acknowledged. No more lost messages from crashes or compaction.
+- **`dispatch-send` — posting without an MCP client** — a webhook receiver, cron job, or script in any language can post one message via `bin/dispatch-send`, calling the exact same routing/fan-out code `dispatch()` does rather than hand-rolling the on-disk format. See [Sending from outside MCP](#sending-from-outside-mcp-dispatch-send).
 - **Channels** — `subscribe('#name')` and `dispatch(target='#name')` fan a message out to current subscribers. Ephemeral — subscriptions vanish when a session exits.
 - **Threading** — Group messages into conversations with `thread_id` and `reply_to`.
 - **Tasks** — `task('create', title=…, target='#eng')` posts a claimable work item. Claiming is atomic (an `O_EXCL` create — exactly one agent wins a race), and the announcement is an ordinary message, so it wakes parked sessions and crosses hosts through the paths that already exist.
@@ -165,6 +166,25 @@ which also disappears. Now what is left behind is a tombstone: enough to say the
 message was never read, without the content, which is genuinely gone. `peek()`
 lists those ids under `expired_unread`. `must_read=true` opts out of expiry
 entirely.
+
+#### Sending from outside MCP (`dispatch-send`)
+
+A process that isn't an MCP client — a webhook receiver, a cron job, a script
+in any language — can post one message without speaking the MCP protocol and
+without hand-rolling the on-disk relay format:
+
+```bash
+bin/dispatch-send --from linear-watcher --to publicai "PR #42 merged"
+bin/dispatch-send --from linear-watcher --to '#eng' --priority urgent "deploy started"
+```
+
+It calls the exact same routing/fan-out code the `dispatch()` tool above
+calls, so a message from either path is indistinguishable to a reader — no
+second implementation of the wire format to keep in sync. `--from` is your
+choice of sender id (validated the same way an agent id is); pick something
+stable and identifying, since it's what shows up in `who()` and receipts.
+Prints the send result as JSON on success, an error to stderr and a nonzero
+exit on failure — see `bin/dispatch-send --help`.
 
 ### channels
 

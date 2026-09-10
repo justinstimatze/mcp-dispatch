@@ -1,0 +1,21 @@
+{
+  "name": "unicode-and-symbol-body",
+  "description": "Non-ASCII sender id and a body mixing CJK, emoji, and HTML-special chars.",
+  "envelope": {
+    "type": "message",
+    "from": "日本語",
+    "to": "bob",
+    "chan": null,
+    "key": null,
+    "id": "msg-unicode1",
+    "ts": "2026-01-01T00:15:00Z",
+    "seq": 3,
+    "ttl": null,
+    "version": 1,
+    "sig": null,
+    "body": {
+      "content": "héllo wörld 🎉 日本語テスト <b>&</b>"
+    }
+  },
+  "jsonl": "{\"type\":\"message\",\"from\":\"日本語\",\"to\":\"bob\",\"chan\":null,\"key\":null,\"id\":\"msg-unicode1\",\"ts\":\"2026-01-01T00:15:00Z\",\"seq\":3,\"ttl\":null,\"version\":1,\"sig\":null,\"body\":{\"content\":\"héllo wörld 🎉 日本語テスト <b>&</b>\"}}"
+}

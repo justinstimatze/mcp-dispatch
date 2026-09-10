@@ -1,0 +1,19 @@
+{
+  "name": "ttl-zero-equals-never-expire-null-body",
+  "description": "ttl=0 and ttl=null are wire-equivalent (both mean never-expire); body is null.",
+  "envelope": {
+    "type": "ack",
+    "from": "bob",
+    "to": "alice",
+    "chan": null,
+    "key": null,
+    "id": "msg-ack00001",
+    "ts": "2026-01-01T00:25:00Z",
+    "seq": 5,
+    "ttl": 0,
+    "version": 1,
+    "sig": null,
+    "body": null
+  },
+  "jsonl": "{\"type\":\"ack\",\"from\":\"bob\",\"to\":\"alice\",\"chan\":null,\"key\":null,\"id\":\"msg-ack00001\",\"ts\":\"2026-01-01T00:25:00Z\",\"seq\":5,\"ttl\":0,\"version\":1,\"sig\":null,\"body\":null}"
+}

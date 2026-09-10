@@ -1,0 +1,21 @@
+{
+  "name": "signed-message",
+  "description": "sig populated (v1: carried but unenforced on both sides).",
+  "envelope": {
+    "type": "message",
+    "from": "alice",
+    "to": "bob",
+    "chan": null,
+    "key": null,
+    "id": "msg-signed01",
+    "ts": "2026-01-01T00:20:00Z",
+    "seq": 4,
+    "ttl": null,
+    "version": 1,
+    "sig": "ed25519:deadbeefcafefeed",
+    "body": {
+      "content": "signed message"
+    }
+  },
+  "jsonl": "{\"type\":\"message\",\"from\":\"alice\",\"to\":\"bob\",\"chan\":null,\"key\":null,\"id\":\"msg-signed01\",\"ts\":\"2026-01-01T00:20:00Z\",\"seq\":4,\"ttl\":null,\"version\":1,\"sig\":\"ed25519:deadbeefcafefeed\",\"body\":{\"content\":\"signed message\"}}"
+}

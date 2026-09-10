@@ -206,6 +206,53 @@ def live_nicks(dispatch_dir: Path) -> set[str]:
     return {durable_nick(aid) for aid in live_agents(dispatch_dir)}
 
 
+def resolve_recipients(dispatch_dir: Path, target: str) -> list[str]:
+    """Map a DM target to the inbox ids it should actually be written to.
+
+    Cases, in order:
+
+      - the target is itself a live session id → deliver to it, unchanged;
+      - the target is a *nick* with live sessions → deliver to all of them,
+        because addressing `publicai` means addressing that teammate, and
+        picking one of its sessions arbitrarily is how a message reaches the
+        window nobody is watching. The caller reports exactly where it went;
+      - the target is another host's session id → deliver to it unchanged. Its
+        inbox here is the git bridge's pickup point, not a local mailbox, and
+        stripping the suffix would hand the message to a same-named session on
+        *this* host instead — `documents-<pid>` is what every session launched
+        from a projects folder is called on every machine;
+      - the target is a *dead* session id of a local nick → resolve the nick
+        behind it. Addressing one specific window only means something while
+        that window exists; once it has exited, writing to its inbox is how a
+        reply reaches a corpse — the sender picked the id off a `who()` list
+        minutes stale, and nobody finds out until they go looking on disk;
+      - nothing live → deliver to the nick's own inbox and leave it there. It
+        is not lost: the next session of that nick inherits it on startup
+        (see server._inherit_orphan_inbox). This is what makes an offline
+        teammate addressable at all.
+
+    Shared by server.py's dispatch() tool and bin/dispatch-send so a message
+    from either path resolves identically — one routing decision, not two that
+    can drift.
+    """
+    if target in live_agents(dispatch_dir):
+        return [target]
+    live = sorted(aid for aid in live_agents(dispatch_dir) if durable_nick(aid) == target)
+    if live:
+        return live
+    nick = durable_nick(target)
+    if nick == target:
+        return [target]  # no pid suffix — an ordinary name, possibly never seen
+    # The roster is only a safe "somewhere else" signal because git_bridge tells
+    # this host's own corpses apart from other machines' sessions by the .agents
+    # registry rather than by presence, which gets reaped. If that ever regresses
+    # this branch starts stranding local mail again, which is where it began.
+    if (dispatch_dir / ".remote" / f"{target}.json").exists():
+        return [target]
+    live = sorted(aid for aid in live_agents(dispatch_dir) if durable_nick(aid) == nick)
+    return live if live else [nick]
+
+
 def local_session_ids(dispatch_dir: Path) -> set[str]:
     """Every session id the ``.agents`` registry records as claimed on this host.
 
@@ -251,6 +298,120 @@ def channel_subscribers(dispatch_dir: Path, channel: str) -> list[str]:
             if aid and ID_RE.match(str(aid)):
                 subs.append(aid)
     return subs
+
+
+def send_message(
+    dispatch_dir: Path,
+    from_id: str,
+    to: str,
+    content: str,
+    *,
+    priority: str = "normal",
+    thread_id: str | None = None,
+    reply_to: str | None = None,
+    payload: dict | None = None,
+    ttl: int | None = None,
+    must_read: bool = False,
+    dynamic_mode: bool,
+    agent_ids: list[str],
+    max_message_bytes: int,
+    default_ttl: int,
+) -> dict:
+    """Write a message to ``to``'s inbox (or fan it out for ``'all'``/``'#chan'``).
+
+    The single implementation behind both server.py's ``dispatch()`` MCP tool
+    and ``bin/dispatch-send``, so a write from either path produces byte-
+    identical inbox files — the reason this lives here rather than being
+    hand-rolled a second time by an external caller reimplementing the wire
+    format from outside.
+    """
+    if ttl is not None and ttl < 0:
+        raise ValueError(f"ttl must be >= 0 (got {ttl}); use 0 or omit for no expiry.")
+    effective_ttl = default_ttl if ttl is None else ttl
+    msg = {
+        "id": f"msg-{uuid.uuid4().hex[:8]}",
+        "from": from_id,
+        "to": to,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "priority": priority,
+        "content": content,
+        "payload": payload,
+        "thread_id": thread_id,
+        "reply_to": reply_to,
+        "ttl": effective_ttl if effective_ttl and effective_ttl > 0 else None,
+        "must_read": must_read,
+        "state": "pending",
+    }
+
+    # Enforce size limit against the bytes actually written (indent=2, matching
+    # atomic_write) plus headroom for the read_at/state fields added on read.
+    msg_bytes = len(json.dumps(msg, indent=2).encode("utf-8")) + 64
+    if msg_bytes > max_message_bytes:
+        raise ValueError(
+            f"Message too large ({msg_bytes} bytes). Maximum: {max_message_bytes} bytes."
+        )
+
+    def _validate_target(target: str) -> None:
+        if not dynamic_mode:
+            if target not in agent_ids:
+                valid = ", ".join(agent_ids) + ", #channel, all"
+                raise ValueError(f"Unknown agent '{target}'. Valid targets: {valid}")
+        else:
+            # In dynamic mode any name is accepted, but it becomes a path
+            # segment, so it must still be a safe single segment.
+            validate_id(target, "target")
+        # No mkdir here. _deliver_one creates whatever inbox resolution actually
+        # chose, and creating the *named* one first resurrects the directory of a
+        # dead session we are about to route away from — an empty spool that reads
+        # like a real mailbox to anyone listing the relay.
+
+    def _deliver_one(target: str, resolved_to: str | None = None) -> None:
+        # resolved_to overrides the stored `to` for this copy only. Needed for the
+        # nick-resolution path: notify_policy's "direct" check is exact-string
+        # equality against the *reading* session's own id, so a copy still
+        # carrying the typed nick never matches `<nick>-<pid>` and never wakes a
+        # direct-policy watch, even though it landed in the right inbox — see
+        # docs/feedback-2026-08-08-nick-addressed-dm-never-wakes-a-direct-watch.md.
+        # "all" and "#channel" deliveries keep the original `to`; should_notify's
+        # channel/broadcast branches key off that literal, not off exact-id match.
+        out = dict(msg)
+        if resolved_to is not None:
+            out["to"] = resolved_to
+        (dispatch_dir / target).mkdir(exist_ok=True)
+        atomic_write(dispatch_dir / target / message_filename(from_id), out)
+
+    if to == "all":
+        # Broadcast: live agents in dynamic mode (a dead <project>-<pid> id never
+        # returns, so writing to its inbox is pure waste). In roster mode keep the
+        # full roster — an offline roster agent keeps its id and collects mail.
+        pool = agent_ids if agent_ids else live_agents(dispatch_dir)
+        delivered = [aid for aid in pool if aid != from_id]
+        for target in delivered:
+            _deliver_one(target)
+    elif to.startswith("#"):
+        # Channel: only current subscribers, except the sender.
+        channel = validate_id(to[1:], "channel")
+        delivered = [aid for aid in channel_subscribers(dispatch_dir, channel) if aid != from_id]
+        for target in delivered:
+            _deliver_one(target)
+    else:
+        _validate_target(to)
+        # A nick is not an inbox: `publicai` names a teammate whose live sessions
+        # are `publicai-<pid>`. Resolve it, so addressing the teammate reaches the
+        # session actually running — and, when none is, waits in the nick's inbox
+        # for the next one to inherit instead of rotting in a dead pid's.
+        delivered = resolve_recipients(dispatch_dir, to)
+        for target in delivered:
+            _deliver_one(target, target)
+
+    result: dict = dict(msg)
+    # `queued_to`, not `delivered_to`: this is the set of inboxes written, i.e.
+    # addressing — not receipt. Whether a recipient ever *reads* it shows up later
+    # as the message's state flipping pending → read, which peek() surfaces to the
+    # sender as sent_receipts. Conflating the two is how a channel post can look
+    # landed while nobody has seen it.
+    result["queued_to"] = delivered
+    return result
 
 
 # ---------------------------------------------------------------------------

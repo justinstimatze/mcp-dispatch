@@ -1,0 +1,21 @@
+{
+  "name": "channel-post",
+  "description": "Channel post with a finite TTL.",
+  "envelope": {
+    "type": "message",
+    "from": "alice",
+    "to": null,
+    "chan": "eng",
+    "key": null,
+    "id": "msg-def67890",
+    "ts": "2026-01-01T00:05:00Z",
+    "seq": 2,
+    "ttl": 3600,
+    "version": 1,
+    "sig": null,
+    "body": {
+      "content": "deploy started"
+    }
+  },
+  "jsonl": "{\"type\":\"message\",\"from\":\"alice\",\"to\":null,\"chan\":\"eng\",\"key\":null,\"id\":\"msg-def67890\",\"ts\":\"2026-01-01T00:05:00Z\",\"seq\":2,\"ttl\":3600,\"version\":1,\"sig\":null,\"body\":{\"content\":\"deploy started\"}}"
+}

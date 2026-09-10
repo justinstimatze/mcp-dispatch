@@ -1,0 +1,21 @@
+{
+  "name": "basic-dm",
+  "description": "Plain DM with all optional fields unset.",
+  "envelope": {
+    "type": "message",
+    "from": "alice",
+    "to": "bob",
+    "chan": null,
+    "key": null,
+    "id": "msg-abc12345",
+    "ts": "2026-01-01T00:00:00Z",
+    "seq": 1,
+    "ttl": null,
+    "version": 1,
+    "sig": null,
+    "body": {
+      "content": "hello"
+    }
+  },
+  "jsonl": "{\"type\":\"message\",\"from\":\"alice\",\"to\":\"bob\",\"chan\":null,\"key\":null,\"id\":\"msg-abc12345\",\"ts\":\"2026-01-01T00:00:00Z\",\"seq\":1,\"ttl\":null,\"version\":1,\"sig\":null,\"body\":{\"content\":\"hello\"}}"
+}

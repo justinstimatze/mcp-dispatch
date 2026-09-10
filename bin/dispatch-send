@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Post one message to the local dispatch relay. Narrow, headless, single-purpose.
+
+For a non-MCP, non-Python process (a webhook receiver, a cron job, any script)
+that needs to inject a message without speaking the MCP protocol and without
+hand-rolling the on-disk filesystem contract. Calls the exact same
+dispatch_fs.send_message() that server.py's dispatch() MCP tool calls — same
+routing, same fan-out, same filename scheme — so a message from either path
+is indistinguishable to a reader. Reimplementing that contract from outside
+is the coupling this script exists to remove.
+
+    dispatch-send --from linear-watcher --to publicai "PR #42 merged"
+    dispatch-send --from linear-watcher --to '#eng' --priority urgent "deploy started"
+    dispatch-send --from linear-watcher --to publicai --payload '{"issue":"ENG-9"}' "..."
+
+Prints the send result as JSON on success (exit 0) and an error message to
+stderr on failure (exit 1) — script-friendly either way. `--from` is your
+choice of sender id; it becomes the `from` field on the message and, in
+dynamic mode, the path segment other agents see in who()/receipts — pick
+something stable and identifying, the way a session's own nick is.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import dispatch_common as common  # noqa: E402
+import dispatch_fs  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="dispatch-send",
+        description="Post one message to the dispatch relay and exit.",
+    )
+    ap.add_argument("message", help="message content")
+    ap.add_argument("--from", dest="from_id", required=True, help="sender id")
+    ap.add_argument(
+        "--to", default="all", help="agent id, nick, '#channel', or 'all' (default: all)"
+    )
+    ap.add_argument("--priority", default="normal", choices=["normal", "urgent"])
+    ap.add_argument("--thread-id", default=None)
+    ap.add_argument("--reply-to", default=None)
+    ap.add_argument("--payload", default=None, help='JSON object, e.g. \'{"k":"v"}\'')
+    ap.add_argument("--ttl", type=int, default=None, help="seconds; 0 = never expire")
+    ap.add_argument("--must-read", action="store_true", help="survive TTL/expiry until read")
+    args = ap.parse_args(argv)
+
+    payload = None
+    if args.payload is not None:
+        try:
+            payload = json.loads(args.payload)
+        except json.JSONDecodeError as e:
+            print(f"dispatch-send: --payload is not valid JSON: {e}", file=sys.stderr)
+            return 1
+        if not isinstance(payload, dict):
+            print("dispatch-send: --payload must be a JSON object", file=sys.stderr)
+            return 1
+
+    try:
+        dispatch_fs.validate_id(args.from_id, "--from")
+    except ValueError as e:
+        print(f"dispatch-send: {e}", file=sys.stderr)
+        return 1
+
+    raw_cfg = common.load_config()
+    dispatch_dir = common.dispatch_dir(raw_cfg)
+    if not dispatch_dir.is_dir():
+        print(f"dispatch-send: no relay at {dispatch_dir}", file=sys.stderr)
+        print("  → no dispatch-enabled session has started there yet.", file=sys.stderr)
+        return 1
+    agent_ids = list(common.flat(raw_cfg, "agents") or [])
+    max_message_bytes = int(common.flat(raw_cfg, "max_message_bytes") or 65536)
+    default_ttl = int(common.flat(raw_cfg, "default_ttl") or 604800)
+
+    try:
+        result = dispatch_fs.send_message(
+            dispatch_dir,
+            args.from_id,
+            args.to,
+            args.message,
+            priority=args.priority,
+            thread_id=args.thread_id,
+            reply_to=args.reply_to,
+            payload=payload,
+            ttl=args.ttl,
+            must_read=args.must_read,
+            dynamic_mode=len(agent_ids) == 0,
+            agent_ids=agent_ids,
+            max_message_bytes=max_message_bytes,
+            default_ttl=default_ttl,
+        )
+    except ValueError as e:
+        print(f"dispatch-send: {e}", file=sys.stderr)
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "sent": True,
+                "id": result["id"],
+                "from": args.from_id,
+                "to": args.to,
+                "queued_to": result.get("queued_to", []),
+            }
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

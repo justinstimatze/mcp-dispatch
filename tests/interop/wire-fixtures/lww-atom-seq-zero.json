@@ -1,0 +1,21 @@
+{
+  "name": "lww-atom-seq-zero",
+  "description": "LWW state record (key set) at seq=0 — a real first record, not absence.",
+  "envelope": {
+    "type": "atom",
+    "from": "carol",
+    "to": null,
+    "chan": null,
+    "key": "slot-1",
+    "id": "rec-000001",
+    "ts": "2026-01-01T00:10:00Z",
+    "seq": 0,
+    "ttl": null,
+    "version": 1,
+    "sig": null,
+    "body": {
+      "s": 1
+    }
+  },
+  "jsonl": "{\"type\":\"atom\",\"from\":\"carol\",\"to\":null,\"chan\":null,\"key\":\"slot-1\",\"id\":\"rec-000001\",\"ts\":\"2026-01-01T00:10:00Z\",\"seq\":0,\"ttl\":null,\"version\":1,\"sig\":null,\"body\":{\"s\":1}}"
+}

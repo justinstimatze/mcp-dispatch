@@ -1,0 +1,11 @@
+{
+  "wire_version": 1,
+  "cases": [
+    "basic-dm.json",
+    "channel-post.json",
+    "lww-atom-seq-zero.json",
+    "unicode-and-symbol-body.json",
+    "signed-message.json",
+    "ttl-zero-equals-never-expire-null-body.json"
+  ]
+}

@@ -594,44 +594,11 @@ def _age_label(seen: float) -> str:
 def _resolve_recipients(target: str) -> list[str]:
     """Map a DM target to the inbox ids it should actually be written to.
 
-    Cases, in order:
-
-      - the target is itself a live session id → deliver to it, unchanged;
-      - the target is a *nick* with live sessions → deliver to all of them,
-        because addressing `publicai` means addressing that teammate, and
-        picking one of its sessions arbitrarily is how a message reaches the
-        window nobody is watching. `queued_to` reports exactly where it went;
-      - the target is another host's session id → deliver to it unchanged. Its
-        inbox here is the git bridge's pickup point, not a local mailbox, and
-        stripping the suffix would hand the message to a same-named session on
-        *this* host instead — `documents-<pid>` is what every session launched
-        from a projects folder is called on every machine;
-      - the target is a *dead* session id of a local nick → resolve the nick
-        behind it. Addressing one specific window only means something while
-        that window exists; once it has exited, writing to its inbox is how a
-        reply reaches a corpse — the sender picked the id off a `who()` list
-        minutes stale, and nobody finds out until they go looking on disk;
-      - nothing live → deliver to the nick's own inbox and leave it there. It
-        is not lost: the next session of that nick inherits it on startup
-        (see _inherit_orphan_inbox). This is what makes an offline teammate
-        addressable at all.
+    Full routing rationale lives on dispatch_fs.resolve_recipients, which does
+    the actual work — shared with bin/dispatch-send so both paths route a
+    target identically.
     """
-    if target in _live_agents():
-        return [target]
-    live = _live_sessions_of(target)
-    if live:
-        return live
-    nick = _durable_nick(target)
-    if nick == target:
-        return [target]  # no pid suffix — an ordinary name, possibly never seen
-    # The roster is only a safe "somewhere else" signal because git_bridge tells
-    # this host's own corpses apart from other machines' sessions by the .agents
-    # registry rather than by presence, which gets reaped. If that ever regresses
-    # this branch starts stranding local mail again, which is where it began.
-    if (DISPATCH_DIR / ".remote" / f"{target}.json").exists():
-        return [target]
-    live = _live_sessions_of(nick)
-    return live if live else [nick]
+    return dispatch_fs.resolve_recipients(DISPATCH_DIR, target)
 
 
 _presence_is_live = dispatch_fs.presence_is_live
@@ -925,98 +892,28 @@ def _send(
     ttl: int | None = None,
     must_read: bool = False,
 ) -> dict:
-    """Write a message to the target's inbox. Fan-out for 'all'."""
-    # ttl: None → default; 0 → explicitly never expire; >0 → seconds. Reject <0.
-    if ttl is not None and ttl < 0:
-        raise ValueError(f"ttl must be >= 0 (got {ttl}); use 0 or omit for no expiry.")
-    effective_ttl = DEFAULT_TTL if ttl is None else ttl
-    msg = {
-        "id": f"msg-{uuid.uuid4().hex[:8]}",
-        "from": from_id,
-        "to": to,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "priority": priority,
-        "content": content,
-        "payload": payload,
-        "thread_id": thread_id,
-        "reply_to": reply_to,
-        "ttl": effective_ttl if effective_ttl and effective_ttl > 0 else None,
-        "must_read": must_read,
-        "state": "pending",
-    }
+    """Write a message to the target's inbox. Fan-out for 'all'.
 
-    # Enforce size limit against the bytes actually written (indent=2, matching
-    # _atomic_write) plus headroom for the read_at/state fields added on read.
-    msg_bytes = len(json.dumps(msg, indent=2).encode("utf-8")) + 64
-    if msg_bytes > MAX_MESSAGE_BYTES:
-        raise ValueError(
-            f"Message too large ({msg_bytes} bytes). Maximum: {MAX_MESSAGE_BYTES} bytes."
-        )
-
-    def _filename() -> str:
-        return dispatch_fs.message_filename(from_id)
-
-    def _validate_target(target: str) -> None:
-        if not DYNAMIC_MODE:
-            if target not in AGENT_IDS:
-                valid = ", ".join(AGENT_IDS) + ", #channel, all"
-                raise ValueError(f"Unknown agent '{target}'. Valid targets: {valid}")
-        else:
-            # In dynamic mode any name is accepted, but it becomes a path
-            # segment, so it must still be a safe single segment.
-            _validate_id(target, "target")
-        # No mkdir here. _deliver_one creates whatever inbox resolution actually
-        # chose, and creating the *named* one first resurrects the directory of a
-        # dead session we are about to route away from — an empty spool that reads
-        # like a real mailbox to anyone listing the relay.
-
-    def _deliver_one(target: str, resolved_to: str | None = None) -> None:
-        # resolved_to overrides the stored `to` for this copy only. Needed for the
-        # nick-resolution path: notify_policy's "direct" check is exact-string
-        # equality against the *reading* session's own id, so a copy still
-        # carrying the typed nick never matches `<nick>-<pid>` and never wakes a
-        # direct-policy watch, even though it landed in the right inbox — see
-        # docs/feedback-2026-08-08-nick-addressed-dm-never-wakes-a-direct-watch.md.
-        # "all" and "#channel" deliveries keep the original `to`; should_notify's
-        # channel/broadcast branches key off that literal, not off exact-id match.
-        payload = dict(msg)
-        if resolved_to is not None:
-            payload["to"] = resolved_to
-        (DISPATCH_DIR / target).mkdir(exist_ok=True)
-        _atomic_write(DISPATCH_DIR / target / _filename(), payload)
-
-    if to == "all":
-        # Broadcast: live agents in dynamic mode (a dead <project>-<pid> id never
-        # returns, so writing to its inbox is pure waste). In roster mode keep the
-        # full roster — an offline roster agent keeps its id and collects mail.
-        pool = AGENT_IDS if AGENT_IDS else _live_agents()
-        delivered = [aid for aid in pool if aid != from_id]
-        for target in delivered:
-            _deliver_one(target)
-    elif to.startswith("#"):
-        # Channel: only current subscribers, except the sender.
-        channel = _validate_id(to[1:], "channel")
-        delivered = [aid for aid in _channel_subscribers(channel) if aid != from_id]
-        for target in delivered:
-            _deliver_one(target)
-    else:
-        _validate_target(to)
-        # A nick is not an inbox: `publicai` names a teammate whose live sessions
-        # are `publicai-<pid>`. Resolve it, so addressing the teammate reaches the
-        # session actually running — and, when none is, waits in the nick's inbox
-        # for the next one to inherit instead of rotting in a dead pid's.
-        delivered = _resolve_recipients(to)
-        for target in delivered:
-            _deliver_one(target, target)
-
-    result: dict = dict(msg)
-    # `queued_to`, not `delivered_to`: this is the set of inboxes written, i.e.
-    # addressing — not receipt. Whether a recipient ever *reads* it shows up later
-    # as the message's state flipping pending → read, which peek() surfaces to the
-    # sender as sent_receipts. Conflating the two is how a channel post can look
-    # landed while nobody has seen it.
-    result["queued_to"] = delivered
-    return result
+    Delegates to dispatch_fs.send_message, the single implementation shared
+    with bin/dispatch-send — see its docstring for the actual routing/fan-out
+    logic. ttl: None → default; 0 → explicitly never expire; >0 → seconds.
+    """
+    return dispatch_fs.send_message(
+        DISPATCH_DIR,
+        from_id,
+        to,
+        content,
+        priority=priority,
+        thread_id=thread_id,
+        reply_to=reply_to,
+        payload=payload,
+        ttl=ttl,
+        must_read=must_read,
+        dynamic_mode=DYNAMIC_MODE,
+        agent_ids=AGENT_IDS,
+        max_message_bytes=MAX_MESSAGE_BYTES,
+        default_ttl=DEFAULT_TTL,
+    )
 
 
 def _discover_agents() -> list[str]:

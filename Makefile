@@ -6,7 +6,7 @@ PY_SOURCES := server.py dispatch_fs.py git_transport.py git_bridge.py notify_pol
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
 	hooks/dispatch-ucbridge-arm.py \
 	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync bin/dispatch-supervise \
-	bin/dispatch-digest bin/dispatch-ucbridge scripts/
+	bin/dispatch-digest bin/dispatch-ucbridge bin/dispatch-send scripts/
 
 # One-command setup: sync deps, register the MCP server, wire the hooks.
 # Idempotent — safe to re-run. `make install ARGS=--dry-run` to preview.
@@ -40,7 +40,7 @@ TYPED := server.py dispatch_common.py gitsync_service.py systemd_user.py \
 	hooks/dispatch-peek.py hooks/dispatch-arm.py hooks/dispatch-gitsync-arm.py \
 	hooks/dispatch-ucbridge-arm.py \
 	bin/dispatch-status bin/dispatch-wait bin/dispatch-gitsync bin/dispatch-supervise \
-	bin/dispatch-ucbridge
+	bin/dispatch-ucbridge bin/dispatch-send
 
 typecheck:
 	uv run mypy --scripts-are-modules $(TYPED)

@@ -6,6 +6,33 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.6] - 2026-09-10
+
+### Added
+- **`bin/dispatch-send` — post one message without an MCP client.** For a
+  webhook receiver, cron job, or script in any language that needs to inject
+  a message into the local relay without speaking MCP and without
+  hand-rolling the on-disk filesystem contract. Calls the same
+  `dispatch_fs.send_message()` the `dispatch()` MCP tool now delegates to
+  (extracted from `server.py`'s `_send`, alongside `_resolve_recipients` →
+  `dispatch_fs.resolve_recipients`), so a message from either path routes and
+  fans out identically — one implementation, not two that can drift. Prints
+  the send result as JSON on success, an error to stderr and nonzero exit on
+  failure.
+- **`tests/interop/wire-fixtures/` — cross-language interop corpus for the
+  git-transport wire format.** `leat` (the canonical Go reimplementation) had
+  claimed wire-compatibility since its first commit with zero test against a
+  live mcp-dispatch peer — asserted, never checked. Six cases (plain DM,
+  channel post, `seq=0` LWW atom, unicode/HTML-special body, a populated
+  `sig`, and `ttl=0`-vs-`null` equivalence with a null body), each generated
+  from the real `Envelope` encoder with an in-generator round-trip
+  self-check, plus a `manifest.json` pinned to `WIRE_VERSION` for a consumer
+  to vendor against. The contract is struct-level equivalence across
+  languages, not byte-identical serialization — `leat`'s own `omitempty`
+  encoding is deliberately wire-equivalent to this repo's explicit `null`,
+  documented in the fixtures' own README so a future loader doesn't assert
+  the wrong thing.
+
 ## [0.11.5] - 2026-09-01
 
 ### Fixed
@@ -961,7 +988,8 @@ change under a running install:
   relay across trusting accounts; `$PWD`-derived launcher identity; Stop-hook peek.
 - `SECURITY.md` and Dependabot config.
 
-[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.5...HEAD
+[Unreleased]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.6...HEAD
+[0.11.6]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.5...v0.11.6
 [0.11.5]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.4...v0.11.5
 [0.11.4]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.3...v0.11.4
 [0.11.3]: https://github.com/justinstimatze/mcp-dispatch/compare/v0.11.2...v0.11.3
