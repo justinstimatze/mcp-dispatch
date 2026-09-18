@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""dispatch-gate-router — close the loop CUR-1515 named: every quality gate in
+aipotluck.org terminates at a human reading a Slack message. This polls the
+repo's own CI runs for new failures on an allowlisted set of workflows and
+posts a structured dispatch message for each distinct one, so a lane wakes
+itself instead of waiting for a person to notice and hand-wake it.
+
+Not a GitHub Actions workflow, on purpose. `workflow_run` shares the exact
+restriction `schedule:`/`workflow_dispatch:` already have (CUR-1360): GitHub
+only registers a workflow file that lives on the repo's DEFAULT branch, and
+this repo's non-emergency work lands on `dumpling` first, with `main` frozen
+indefinitely as of 2026-09-18. A router that only reacts once promoted is a
+router that reacts to nothing for however long that takes. This process needs
+no promotion, no registration, and no new CI credential: it runs on the same
+host the fleet already runs on, using `gh` (already authenticated) and
+`dispatch-send` (already local) -- the same posture `dispatch-gitsync` and
+`dispatch-ucbridge` already use for their own always-on daemons.
+
+The poll interval is a transport detail, not the thing Justin objected to
+when he said he wanted event-driven infra over "cron periodic stuff" --
+this reacts to a state change (a new failed run) and does nothing on the
+ticks where nothing changed, same shape as `dispatch-wait --follow`.
+
+    dispatch-gate-router                  # run the loop (default 30s poll)
+    dispatch-gate-router --once           # one poll pass and exit (smoke test)
+    dispatch-gate-router --check          # validate config/auth, print what would route, exit
+    dispatch-gate-router --allow "CI,Scenario suite (preview)"
+    dispatch-gate-router --interval 30 --channel '#swarm'
+
+State (a debounce ledger) lives in ~/.config/mcp-dispatch/gate-router/state.json,
+a single JSON object holding:
+  - "notified": ["<workflow>::<head_sha>", ...] -- debounce keys already sent
+  - "processed_run_ids": [<int>, ...] -- specific runs already looked at,
+    including ones suppressed by debounce, so a re-run's OWN run id is never
+    re-fetched even though its (workflow, sha) pair correctly sends nothing
+Both lists are size-capped rather than time-based: the GitHub runs API itself
+already stops returning a run once it ages out of its own retention window, so
+an old run id can never resurface as "new" regardless of what's remembered
+here -- the only real risk is unbounded file growth over a long-lived daemon.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_REPO = "currentai-org/aipotluck.org"
+DEFAULT_ALLOW = ["CI", "Scenario suite (preview)"]
+DEFAULT_BASE = "dumpling"
+DEFAULT_CHANNEL = "#swarm"
+DEFAULT_INTERVAL = 30
+STATE_DIR = Path.home() / ".config" / "mcp-dispatch" / "gate-router"
+STATE_FILE = STATE_DIR / "state.json"
+FROM_ID = "gate-router"
+# Resolved relative to this script, not PATH -- dispatch-send lives in the same
+# bin/ but isn't installed onto PATH the way `gh` is.
+DISPATCH_SEND = str(Path(__file__).resolve().parent / "dispatch-send")
+
+
+def gh_json(args: list[str]):
+    out = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args)} failed: {out.stderr.strip()[:300]}")
+    return json.loads(out.stdout) if out.stdout.strip() else None
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"notified": [], "processed_run_ids": []}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        # A corrupt state file must not crash the loop or silently drop the
+        # ledger -- start fresh rather than wedge, same posture as a missing one.
+        return {"notified": [], "processed_run_ids": []}
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(STATE_FILE)  # atomic on POSIX -- no reader ever sees a half-written file
+
+
+def prune(state: dict) -> None:
+    # GH's own runs API stops returning a run once it ages out of its own
+    # retention window, so an old run id can never resurface as "new"
+    # regardless of what's remembered here -- prune by size, keeping the
+    # most recent entries (both lists only ever grow by append).
+    if len(state["processed_run_ids"]) > 5000:
+        state["processed_run_ids"] = state["processed_run_ids"][-2000:]
+    if len(state["notified"]) > 2000:
+        state["notified"] = state["notified"][-1000:]
+
+
+def fetch_recent_failures(repo: str, per_page: int = 30) -> list[dict]:
+    data = gh_json(["api", f"repos/{repo}/actions/runs?status=failure&per_page={per_page}"])
+    return data.get("workflow_runs", []) if data else []
+
+
+def failing_jobs(repo: str, run_id: int) -> list[str]:
+    data = gh_json(["api", f"repos/{repo}/actions/runs/{run_id}/jobs"])
+    jobs = data.get("jobs", []) if data else []
+    return [j["name"] for j in jobs if j.get("conclusion") == "failure"]
+
+
+def tree_distance(repo: str, base: str, head_sha: str) -> str:
+    try:
+        cmp = gh_json(["api", f"repos/{repo}/compare/{base}...{head_sha}", "--jq", "{behind_by,ahead_by}"])
+        if cmp and isinstance(cmp.get("behind_by"), int):
+            return f"{cmp['behind_by']} behind {base}, {cmp.get('ahead_by', '?')} ahead"
+    except RuntimeError:
+        pass
+    return f"distance behind {base} unknown (compare API call failed)"
+
+
+def dispatch_send(channel: str, message: str, payload: dict) -> None:
+    subprocess.run(
+        [
+            DISPATCH_SEND,
+            "--from", FROM_ID,
+            "--to", channel,
+            "--payload", json.dumps(payload),
+            message,
+        ],
+        check=True,
+        timeout=30,
+    )
+
+
+def seed_backlog(repo: str, allow: list[str], state: dict) -> int:
+    """First-ever run: mark every currently-failing allowlisted run as already
+    handled WITHOUT dispatching, so turning this on means "route failures from
+    now on," not "replay tonight's backlog in one flood." Same call
+    dispatch-ucbridge's own outbound ledger makes for a pre-existing backlog
+    (native-bridge.md: "messages already pending when the bridge is first
+    enabled are seeded into that ledger unsent"). Without this, a fleet with
+    real ongoing flakiness (confirmed live here: "Scenario suite (preview)"
+    failed 10 times in the runs this fetched on first test) would flood the
+    channel with every historical failure the instant the daemon starts.
+    """
+    seeded = 0
+    for run in fetch_recent_failures(repo):
+        if run["name"] not in allow:
+            continue
+        state["processed_run_ids"].append(run["id"])
+        state["notified"].append(f"{run['name']}::{run['head_sha']}")
+        seeded += 1
+    return seeded
+
+
+def route(repo: str, allow: list[str], base: str, channel: str, state: dict, dry_run: bool) -> int:
+    routed = 0
+    runs = fetch_recent_failures(repo)
+    for run in runs:
+        rid = run["id"]
+        name = run["name"]
+        sha = run["head_sha"]
+
+        if rid in state["processed_run_ids"]:
+            continue
+        if name not in allow:
+            # Not processed -- an unallowed workflow might get added to the
+            # allowlist later, and this run should still be eligible then.
+            continue
+
+        key = f"{name}::{sha}"
+        already_notified = key in state["notified"]
+
+        if not already_notified:
+            jobs = failing_jobs(repo, rid)
+            dist = tree_distance(repo, base, sha)
+            job_text = ", ".join(jobs) if jobs else "(no failing job found -- check the run directly)"
+            message = (
+                f"CI failure: \"{name}\" failed on {sha[:10]} -- {job_text}. {run['html_url']} ({dist})"
+            )
+            payload = {
+                "workflow": name,
+                "run_id": rid,
+                "run_url": run["html_url"],
+                "head_sha": sha,
+                "failing_jobs": jobs,
+                "distance": dist,
+            }
+            if dry_run:
+                print(f"[dry-run] would dispatch: {message}")
+            else:
+                dispatch_send(channel, message, payload)
+                print(f"routed: {message}")
+            state["notified"].append(key)
+            routed += 1
+        else:
+            print(f"debounced (already notified for {key}): run {rid}")
+
+        state["processed_run_ids"].append(rid)
+
+    return routed
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--repo", default=DEFAULT_REPO)
+    p.add_argument("--allow", default=",".join(DEFAULT_ALLOW), help="comma-separated workflow display names")
+    p.add_argument("--base", default=DEFAULT_BASE, help="branch to measure head SHA distance against")
+    p.add_argument("--channel", default=DEFAULT_CHANNEL)
+    p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
+    p.add_argument("--once", action="store_true", help="one poll pass, then exit")
+    p.add_argument("--check", action="store_true", help="validate gh/dispatch-send auth, print config, exit")
+    p.add_argument("--dry-run", action="store_true", help="print what would route without calling dispatch-send")
+    args = p.parse_args()
+
+    allow = [w.strip() for w in args.allow.split(",") if w.strip()]
+
+    if args.check:
+        who = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        print(f"repo: {args.repo}")
+        print(f"allowlist: {allow}")
+        print(f"channel: {args.channel}")
+        print(f"state file: {STATE_FILE}")
+        print(f"gh auth: {'OK' if who.returncode == 0 else 'NOT AUTHENTICATED'}")
+        ds_ok = Path(DISPATCH_SEND).exists()
+        print(f"dispatch-send: {'OK — ' + DISPATCH_SEND if ds_ok else 'NOT FOUND at ' + DISPATCH_SEND}")
+        return 0
+
+    cold_start = not STATE_FILE.exists()
+    state = load_state()
+    if cold_start:
+        n = seed_backlog(args.repo, allow, state)
+        save_state(state)
+        print(f"first run: seeded {n} pre-existing failure(s) as already-handled, dispatched none")
+    prune(state)
+
+    while True:
+        try:
+            n = route(args.repo, allow, args.base, args.channel, state, args.dry_run)
+            if n:
+                save_state(state)
+        except RuntimeError as e:
+            # A single bad `gh api` call (rate limit, transient network) should not
+            # kill a long-lived poller -- log it and try again next tick. The state
+            # file is only ever written after a successful route(), so a failed
+            # tick can't corrupt or partially advance the ledger.
+            print(f"poll error (will retry): {e}", file=sys.stderr)
+
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
