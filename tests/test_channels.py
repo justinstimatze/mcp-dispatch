@@ -135,3 +135,55 @@ def test_initial_channels_lowercases(server_factory):
 
 def test_initial_channels_absent_is_empty(server_factory):
     assert server_factory()._PRESENCE_DATA["channels"] == []
+
+
+# --- a subscription belongs to the nick and survives a restart ---------------
+
+
+def test_a_restarted_session_rejoins_its_nicks_channels(server_factory):
+    first = server_factory("venus-100")
+    first.subscribe_tool("swarm")
+    first._release_id(first.AGENT_ID)
+    second = server_factory("venus-200")
+    assert second._PRESENCE_DATA["channels"] == ["swarm"]
+    pf = second.DISPATCH_DIR / ".presence" / "venus-200.json"
+    assert json.loads(pf.read_text())["channels"] == ["swarm"]
+
+
+def test_leaving_a_channel_is_remembered_too(server_factory):
+    first = server_factory("venus-100")
+    first.subscribe_tool("swarm")
+    first.unsubscribe_tool("swarm")
+    first._release_id(first.AGENT_ID)
+    assert server_factory("venus-200")._PRESENCE_DATA["channels"] == []
+
+
+def test_remembered_channels_merge_with_the_env_list(server_factory):
+    first = server_factory("venus-100")
+    first.subscribe_tool("swarm")
+    first._release_id(first.AGENT_ID)
+    second = server_factory("venus-200", extra_env={"MCP_DISPATCH_CHANNELS": "ops"})
+    assert second._PRESENCE_DATA["channels"] == ["ops", "swarm"]
+
+
+def test_another_nicks_channels_are_not_inherited(server_factory):
+    first = server_factory("venus-100")
+    first.subscribe_tool("swarm")
+    assert server_factory("mars-100")._PRESENCE_DATA["channels"] == []
+
+
+def test_a_live_siblings_channels_are_not_taken(server_factory):
+    """One channel list per nick, overwritten by whichever session changed it
+    last: while a sibling is live, that list is the sibling's."""
+    sibling = server_factory("venus-100")
+    sibling.subscribe_tool("swarm")
+    assert server_factory("venus-200")._PRESENCE_DATA["channels"] == []
+
+
+def test_env_channels_are_not_written_into_the_record(server_factory):
+    """The env brings its own rooms back. Recording them too would keep a room
+    alive after the operator removed it from MCP_DISPATCH_CHANNELS."""
+    first = server_factory("venus-100", extra_env={"MCP_DISPATCH_CHANNELS": "ops"})
+    first.subscribe_tool("swarm")
+    first._release_id(first.AGENT_ID)
+    assert server_factory("venus-200")._PRESENCE_DATA["channels"] == ["swarm"]

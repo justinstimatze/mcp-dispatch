@@ -298,6 +298,38 @@ def _initial_channels() -> list[str]:
     return sorted(out)
 
 
+def _remembered_channels(agent_id: str) -> list[str]:
+    """The channels this session's nick was in when it last subscribed or left.
+
+    A subscription is something the lane asked for, not the process, but presence
+    dies with the process. Before this, a restarted session came back in no rooms:
+    four agents subscribed to #swarm, two restarted, and a broadcast reached one
+    of the three it was meant for while reporting `sent: true`. _set_subscription
+    mirrors every change into the nick's registry record, so rejoin from that.
+
+    Only when the nick is coming back online. The record holds one channel list
+    per nick and every session of it overwrites the list on each change, so while
+    a sibling is live the list is that sibling's, not this session's to inherit.
+    Roster ids are skipped too: `worker-1` and `worker-2` both reduce to nick
+    `worker`, and a roster setup names its rooms in MCP_DISPATCH_CHANNELS anyway.
+    """
+    if AGENT_IDS:
+        return []
+    nick = _durable_nick(agent_id)
+    if not _ID_RE.match(nick):
+        return []
+    if [aid for aid in _live_sessions_of(nick) if aid != agent_id]:
+        return []
+    try:
+        rec = json.loads(_agent_record_path(nick).read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    raw = rec.get("channels") if isinstance(rec, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [str(c) for c in raw if _ID_RE.match(str(c))]
+
+
 def _session_cwd() -> str:
     """Where the session was launched, not where this process happens to run.
 
@@ -358,7 +390,7 @@ def _try_lock_presence(pf: Path, agent_id: str) -> bool:
         # against theirs would be probing a path that never existed.
         "state_dir": str(dispatch_common.state_dir()),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "channels": _initial_channels(),
+        "channels": sorted(set(_initial_channels()) | set(_remembered_channels(agent_id))),
     }
     _write_presence()
     return True
@@ -947,8 +979,12 @@ def _set_subscription(channel: str, subscribed: bool) -> list[str]:
     _PRESENCE_DATA["channels"] = sorted(channels)
     _write_presence()
     # Mirror into the durable record: presence evaporates with the session, so
-    # this is what lets who() report the rooms an offline nick was standing in.
-    _touch_agent(AGENT_ID, channels=_PRESENCE_DATA["channels"])
+    # this is what lets who() report the rooms an offline nick was standing in,
+    # and what a restarted session rejoins (_remembered_channels). Rooms that came
+    # from MCP_DISPATCH_CHANNELS stay out: the env already brings them back, and
+    # recording them would keep a room the operator deleted from the env.
+    from_env = set(_initial_channels())
+    _touch_agent(AGENT_ID, channels=[c for c in _PRESENCE_DATA["channels"] if c not in from_env])
     return _PRESENCE_DATA["channels"]
 
 
@@ -1173,6 +1209,11 @@ def _arm_nudge(result: dict) -> dict:
     if dispatch_common.auto_arm_disabled(_ARM_CFG):
         return result
     if dispatch_common.armed(AGENT_ID) is not False:
+        return result
+    # The watch exits on the message it woke us for, so the lock is free while we
+    # handle it. The wake text already said to re-arm and the Stop hook enforces
+    # it; nagging on every tool result in between adds nothing.
+    if dispatch_common.handling(AGENT_ID):
         return result
     if not dispatch_common.arm_nudge_due(AGENT_ID):
         return result
@@ -1625,14 +1666,22 @@ def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
         "the git transport (the 'remote' list — durable delivery, so they may be "
         "offline right now). dispatch(target=id) reaches either the same way. "
         "Each local agent carries 'armed': false means it is running but holds no "
-        "message watch, so nothing wakes it and a reply waits on its operator. "
+        "message watch, so nothing wakes it and a reply waits on its operator — "
+        "unless it also carries 'handling': true, meaning its watch woke it for a "
+        "message in the last few minutes and it is dealing with that now. "
+        "Every entry in 'agents' is live (its presence lock is held); "
+        "'server_pid' is the dispatch server subprocess, not the session, so do "
+        "not check it against /proc for liveness. "
         "'native' lists OTHER Claude Code sessions currently visible on Claude "
         "Code's own built-in inter-session protocol — informational only unless "
         "the dispatch-ucbridge daemon is running for a bridged nick; see "
-        "docs/native-bridge.md."
+        "docs/native-bridge.md. "
+        "scope='live' returns only the sessions live on this host, skipping the "
+        "remote, native and known (offline nick) rosters, which make up most of a "
+        "full answer."
     ),
 )
-def who_tool() -> dict:
+def who_tool(scope: str = "all") -> dict:
     """List connected agents. Liveness is the presence flock, not a pid check.
 
     This only *filters* by liveness; it never unlinks (that would race a process
@@ -1646,7 +1695,15 @@ def who_tool() -> dict:
     roster dispatch-ucbridge maintains from a live-socket probe (bridge_native.py),
     not a heartbeat. who() stays equally bridge-agnostic about it: no import of
     bridge_native.py here, same separation as the git roster.
+
+    scope="live" skips the three rosters. On a host with 80-odd known nicks the
+    full answer ran to 57k characters for four live agents — past the tool-result
+    cap — which made the one call that shows who is actually listening too costly
+    to make casually.
     """
+    if scope not in ("all", "live"):
+        raise ValueError(f"scope must be 'all' or 'live', not {scope!r}")
+    live_only = scope == "live"
     agents: list[dict] = []
     for pf in _live_presence_files():
         try:
@@ -1654,12 +1711,22 @@ def who_tool() -> dict:
         except (json.JSONDecodeError, OSError):
             continue
         rec["armed"] = dispatch_common.armed_for(rec, pf)
+        if rec["armed"] is False and dispatch_common.handling_for(rec):
+            # Its watch just woke it and exited; it is replying, not deaf.
+            rec["handling"] = True
+        # The presence file keeps `pid` (process_chain and the TUI read it), but
+        # handed out bare it reads as the session's pid and invites a /proc check.
+        # It is the MCP server subprocess's, which can be gone while the session is
+        # live — a caller did exactly that and concluded a live peer was dead.
+        # Being in this list at all is the liveness answer.
+        if "pid" in rec:
+            rec["server_pid"] = rec.pop("pid")
         agents.append(rec)
 
     local_ids = {a.get("agent_id") for a in agents}
     remote: list[dict] = []
     remote_dir = DISPATCH_DIR / ".remote"
-    if remote_dir.is_dir():
+    if remote_dir.is_dir() and not live_only:
         for rf in sorted(remote_dir.glob("*.json")):
             try:
                 data = json.loads(rf.read_text())
@@ -1682,7 +1749,7 @@ def who_tool() -> dict:
 
     native: list[dict] = []
     native_dir = DISPATCH_DIR / ".native"
-    if native_dir.is_dir():
+    if native_dir.is_dir() and not live_only:
         for nf in sorted(native_dir.glob("*.json")):
             try:
                 data = json.loads(nf.read_text())
@@ -1698,7 +1765,7 @@ def who_tool() -> dict:
     remote_ids = {r.get("agent_id") for r in remote}
     known = [
         rec
-        for rec in _known_agents()
+        for rec in ([] if live_only else _known_agents())
         if rec.get("nick") not in live_nicks and rec.get("nick") not in remote_ids
     ]
 
@@ -1715,7 +1782,7 @@ def who_tool() -> dict:
         "agents": agents,
         "count": len(agents),
     }
-    deaf_recs = [a for a in agents if a.get("armed") is False]
+    deaf_recs = [a for a in agents if a.get("armed") is False and not a.get("handling")]
     deaf = [str(a.get("agent_id")) for a in deaf_recs]
     if deaf:
         result["unarmed"] = deaf

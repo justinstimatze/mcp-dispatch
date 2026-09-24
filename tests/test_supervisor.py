@@ -1104,3 +1104,23 @@ def test_the_sweep_covers_sessions_outside_the_allowlist(tmp_path, no_desktop):
         for h in handles:
             if h is not None:
                 h.close()
+
+
+def test_a_woken_agent_is_not_asked_to_arm_a_watch(tmp_path):
+    """A triage session has no Bash or Monitor and is told to stop; the arm hook
+    blocking its Stop held stope and lexicon sessions open indefinitely. The
+    supervisor wakes the nick next time, so the runtime opts out of arming."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    env_out = tmp_path / "env.txt"
+    stub = tmp_path / "claude-stub"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s" "$MCP_DISPATCH_NO_AUTO_ARM" > {env_out}\n')
+    stub.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "MCP_DISPATCH_NO_AUTO_ARM"}
+    subprocess.run(
+        [str(RUNTIME), str(project)],
+        capture_output=True,
+        env={**env, "DISPATCH_AGENT_CLAUDE": str(stub)},
+        check=True,
+    )
+    assert env_out.read_text() == "1"

@@ -6,6 +6,39 @@ truth for versions.
 
 ## [Unreleased]
 
+### Changed
+- **The arm hook asks for a one-shot background watch, not a Monitor stream.**
+  It used to ask for `Monitor(dispatch-wait --follow, persistent=true,
+  timeout_ms=3600000)`. Claude Code's Monitor has no `persistent` parameter and
+  caps a watch at 30 minutes, so every idle session woke twice an hour just to
+  re-arm (one session logged eleven expiries with no message). The instruction
+  is now `MCP_DISPATCH_AGENT_ID=<id> dispatch-wait` with `run_in_background`.
+  It has no time cap and exits only on a message. The id is in the command
+  because resolving it from the working directory fails in a subdirectory.
+  `--follow` stays available for a Monitor without that cap.
+- **One-shot `dispatch-wait` doesn't wake twice for the same message.** It
+  records what it reported, so a re-arm launched before `peek()` can't exit on
+  that message again and loop. Its summary now carries the «remote» and
+  «native-bridge» provenance marks and prints the full re-arm command.
+- **`who()` and `dispatch-status` report a just-woken session as handling,
+  not deaf.** For 15 minutes after its watch wakes it, a session with no arm
+  lock gets `handling: true`, stays out of `unarmed`, and gets no arm nudges.
+- **`who()` returns `server_pid` instead of `pid`.** It is the dispatch server
+  subprocess, not the session, and a `/proc` check on it had reported a live
+  peer as dead. The presence file keeps `pid`.
+- **Supervisor-started triage sessions skip arming.** `dispatch-agent-claude`
+  sets `MCP_DISPATCH_NO_AUTO_ARM=1`. The Stop hook had held stope and lexicon
+  triage sessions open indefinitely, when the supervisor is what wakes them.
+
+### Added
+- **A restarted session rejoins its nick's channels.** Subscriptions were
+  mirrored into the nick's record but never read back, so a restart silently
+  dropped a lane out of `#swarm`. The rejoin happens only when no other session
+  of the nick is live, never in roster mode, and never for rooms that came
+  from `MCP_DISPATCH_CHANNELS`.
+- **`who(scope="live")`** skips the remote, native and offline-nick rosters.
+  The full answer had grown to 57k characters for four live agents.
+
 ## [0.11.6] - 2026-09-10
 
 ### Added

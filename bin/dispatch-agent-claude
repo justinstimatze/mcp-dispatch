@@ -116,6 +116,14 @@ fi
 : "${MCP_CONNECTION_NONBLOCKING:=false}"   # block until servers are up, if honoured
 export MCP_TIMEOUT MCP_CONNECT_TIMEOUT_MS MCP_CONNECTION_NONBLOCKING
 
+# No message watch. The arm hook blocks Stop until a session holds one, but this
+# session is told to triage and stop, has no Bash or Monitor to arm with, and
+# needs no watch: the supervisor is what wakes this nick next time. Without the
+# opt-out, triage sessions for stope and lexicon were held open by the hook,
+# re-arming every time the Monitor watch expired, instead of exiting.
+: "${MCP_DISPATCH_NO_AUTO_ARM:=1}"
+export MCP_DISPATCH_NO_AUTO_ARM
+
 echo "[$(date -u +%FT%TZ)] waking $(basename "$project") in $project" >&2
 # `--` is load-bearing: --allowed-tools and --mcp-config are both variadic, so
 # without it the prompt is swallowed as one more value and claude tries to open

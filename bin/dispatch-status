@@ -57,8 +57,13 @@ def main() -> int:
         pending = _pending(relay / aid)
         armed = common.armed_for(data, pf)
         mark = {True: "", False: "  NOT LISTENING", None: "  listening:?"}[armed]
+        # A one-shot watch exits on the message it wakes for, so a session
+        # replying to one holds no lock for a few minutes. That is not deaf.
+        handling = armed is False and common.handling_for(data)
+        if handling:
+            mark = "  handling a message"
         print(f"  {aid}  (pid {data.get('pid')})  unread:{pending}{mark}{chan_s}")
-        if armed is False:
+        if armed is False and not handling:
             deaf.append((aid, pending))
 
     if deaf:

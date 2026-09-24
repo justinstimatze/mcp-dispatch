@@ -20,7 +20,7 @@ Multiple Claude Code sessions (or any MCP-compatible agents) running on the same
 - **TUI** — `tui/dispatch-tui` is a full-screen [Bubble Tea](https://github.com/charmbracelet/bubbletea) client with a nick/channel sidebar for watching sessions talk in real time — and sending to them (`i`) or acking your own inbox (`a`) as a console nick. It needs no listener and no configuration: it is the way to look at the bus without opening a port.
 - **IRC gateway** — `bin/dispatch-ircd` serves the relay to any IRC client, so every desktop and mobile client (and a bouncer, for scrollback and push) works against it with no UI code here. Locked down by default: off until enabled in the config, a `0600` unix socket, kernel uid check, mandatory token, TLS required on every TCP listener (loopback included), and a hard refusal to serve a public address at all without asking. See [dispatch-ircd](#dispatch-ircd--an-irc-gateway-to-the-relay).
 - **Native-protocol bridge** — `bin/dispatch-ucbridge` exposes an explicit allowlist of dispatch nicks on Claude Code's own built-in inter-session protocol (Unix sockets, zero setup, no MCP server required on the other end), so any local Claude Code session can reach them by name. Off by default; everything it delivers is provenance-tagged and never granted a trusted identity — see [docs/native-bridge.md](docs/native-bridge.md) before enabling it.
-- **Wake on arrival** — `bin/dispatch-wait --follow` run under the Monitor tool streams a wake event per incoming message into a parked model — one persistent watch per session, event-driven, zero idle tokens, replacing `/loop` polling.
+- **Wake on arrival** — `bin/dispatch-wait` run as a background task exits when a message lands, which wakes a parked model — event-driven, zero idle tokens, no idle wake-ups, replacing `/loop` polling.
 - **Lifecycle** — `bin/dispatch-supervise` starts an agent's runtime when mail is waiting for a nick with no live session, so an offline teammate answers instead of accumulating. What runs comes only from an operator-written allowlist — never from the message — and is bounded by a cooldown, an hourly ceiling and a failure breaker. See [lifecycle](#lifecycle-starting-an-agent-that-has-mail).
 - **Away digest** — `digest()` (or `bin/dispatch-digest`) reports what changed while a nick had no session: unread mail by sender, task activity since its last session ended, open tasks addressed to it, and who was around. Reading never consumes, so asking twice gives the same answer. See [the digest](#the-digest-what-happened-while-i-was-away).
 - **Config-driven** — TOML config for agent rosters, directories, and limits. Or go dynamic with no roster.
@@ -323,25 +323,29 @@ the message itself waits until that session next takes a turn and acks it. See
 
 A desktop notification alerts *you*, but the model still won't act until its
 next turn. To wake the **model** on arrival without burning turns on a timer,
-run `bin/dispatch-wait --follow` under the **Monitor** tool. Monitor streams each
-line the script prints into the parked session as a wake event, and
-`dispatch-wait --follow` prints one line per qualifying message and keeps
-running — so a **single registration covers the whole session**, waking the model
-on every arrival (local or cross-host) with nothing to re-arm.
+run `bin/dispatch-wait` as a **background Bash task** (`run_in_background`). It
+blocks until a qualifying message lands (local or cross-host) and exits, and the
+harness re-invokes the model on that exit. The model relaunches it after handling
+the message; anything that arrived in between is caught at startup.
 
 A watch holds a per-agent lock for its lifetime, so starting a second one for the
 same agent exits immediately rather than double-arming.
 
 ```bash
-# the wake path (started for you by the Monitor tool, see below)
-dispatch-wait --follow             # stream one wake event per qualifying message
-
-# one-shot / standalone forms (exit on first hit; relaunch to re-arm)
-dispatch-wait                      # block until a notify_on-qualifying message lands
+# the wake path (started for you by the arm hook, see below)
+MCP_DISPATCH_AGENT_ID=<id> dispatch-wait   # block until a notify_on-qualifying message lands
 dispatch-wait --notify-on direct   # wake only on messages addressed to me
 dispatch-wait --interval 1         # poll seconds (default 2.0)
 dispatch-wait --max-lifetime 600   # add a wall-clock cap (default 0 = none)
+
+# stream mode, for a harness whose Monitor tool can hold a watch open indefinitely
+dispatch-wait --follow             # one wake event per qualifying message, never exits
 ```
+
+`--follow` under Claude Code's Monitor tool looks like the better fit, one
+registration for every message, but Monitor caps a registration at 30 minutes
+and has no persistent mode. The watch dies every half hour and an idle session
+wakes just to re-arm it, so the one-shot task is the default.
 
 By default there's no time cap: the watch exits the instant its agent's presence
 flock drops (the session's server died), so it can't outlive its session and
@@ -367,13 +371,13 @@ Starting the watch is the one manual step. Only the model can start a wake sourc
 not on an arbitrary process), but a hook can make the model do it.
 `hooks/dispatch-arm.py`, wired into **SessionStart and Stop**, checks whether a
 watch holds the arm lock; if none does, it tells the model to start
-`dispatch-wait --follow` under Monitor. On SessionStart it injects the instruction
+`dispatch-wait` as a background task, with the session's agent id in the command.
+On SessionStart it injects the instruction
 (retrying identity resolution briefly to ride out the race with the server
 claiming presence); on Stop it *blocks* (capped, so a failing launch can't wedge
 the session — past the cap it warns loudly instead of going silent) so the model
-never parks unarmed. Because the watch is persistent, this fires **once per
-session**, not once per message — the old per-message re-arm loop (and its
-flakiness) is gone. When cross-host git comms are enabled, the nudge also reports
+never parks unarmed. The watch exits on each message, so the hook asks again
+once per message handled, and not at all while the session sits idle. When cross-host git comms are enabled, the nudge also reports
 whether the bridge daemon is actually running. Once a watch is armed the hook is
 silent.
 

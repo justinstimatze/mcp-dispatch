@@ -7,24 +7,24 @@ model can, by calling a tool. So this hook does the next best thing: it *nudges
 the model* to start a persistent watch whenever none is armed, removing the human
 from the loop.
 
-The watch is `dispatch-wait --follow` run under the **Monitor** tool: Monitor
-streams each stdout line as a wake event into the parked session, so ONE
-registration covers the whole session and there is nothing to re-arm after each
-message. (This replaced the older run_in_background waiter, which woke on task
-*exit* and so had to be relaunched after every single message — the source of the
-"not always armed" flakiness. Empirically confirmed: a Monitor event re-invokes an
-idle session the same way a background-task exit does.)
+The watch is one-shot `dispatch-wait` run as a background Bash task: the harness
+re-invokes the model when the task exits, which it does on the first qualifying
+message, and the Stop hook then asks for the next one. `--follow` under Monitor
+was the recommendation for a while, but Monitor caps a registration at 30 minutes
+with no persistent mode, so that watch died every half hour and woke an idle
+session only to re-arm. The instruction text lives in
+dispatch_common.arm_instruction.
 
   - SessionStart: if the relay+agent resolve and nothing is armed, inject an
-    instruction telling the model to start the Monitor watch. Resolution is
+    instruction telling the model to start the watch. Resolution is
     retried briefly to ride out the race with the server claiming presence.
   - Stop: same check, but *block* the stop (the model must not park unarmed) so
     the model arms before going idle. Self-terminating — once the watch holds the
     lock the next Stop is silent — and capped so a failing launch can never wedge
     the session; past the cap it warns loudly (desktop + text) instead of silently.
 
-"Armed" is detected by probing the per-agent flock that a live `dispatch-wait
---follow` holds (hooks/.. and bin/dispatch-wait agree on the path). flock is
+"Armed" is detected by probing the per-agent flock that a live `dispatch-wait`
+holds (either mode) (hooks/.. and bin/dispatch-wait agree on the path). flock is
 uid-agnostic and pid-reuse-immune, and the kernel frees it the instant the watch
 dies — so a crashed watch is detected as unarmed and re-nudged.
 
@@ -65,7 +65,7 @@ def _resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
 
 
 def _is_armed(agent_id: str) -> bool:
-    """True if a live ``dispatch-wait --follow`` holds this agent's arm lock."""
+    """True if a live ``dispatch-wait`` holds this agent's arm lock."""
     return common.armed(agent_id) is True
 
 

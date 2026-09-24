@@ -46,7 +46,7 @@ def test_an_unarmed_session_is_told_on_its_next_tool_result(server):
     out = server.peek_tool()
     assert "_arm_required" in out
     assert server.AGENT_ID in out["_arm_required"]
-    assert "Monitor(" in out["_arm_required"]
+    assert "run_in_background" in out["_arm_required"]
 
 
 def test_an_armed_session_is_not_told(server, held_arm_lock):
@@ -127,7 +127,13 @@ def test_hook_and_server_say_the_same_thing():
     text = common.arm_instruction("alpha", {}, Path("/tmp/relay"))
     assert "alpha" in text
     assert str(common.waiter_path()) in text
-    assert "--follow" in text
+
+
+def test_the_instruction_names_the_agent_id_in_the_command():
+    """The waiter's fallback resolves the id from the working directory, which
+    fails from a subdirectory of the project; the command must not depend on it."""
+    text = common.arm_instruction("alpha", {}, Path("/tmp/relay"))
+    assert f"MCP_DISPATCH_AGENT_ID=alpha {common.waiter_path()}" in text
 
 
 def test_the_instruction_warns_when_the_git_bridge_is_down(tmp_path, monkeypatch):

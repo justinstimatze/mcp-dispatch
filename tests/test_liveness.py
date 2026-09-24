@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 
 
 def _make_presence(server, agent_id, channels=()):
@@ -182,3 +183,62 @@ def test_an_all_armed_relay_says_nothing_about_it(server_factory, tmp_path):
     finally:
         if fh is not None:
             fh.close()
+
+
+def test_who_names_the_pid_for_what_it_is(server):
+    """A bare `pid` read as the session's and got checked against /proc, which
+    called a live peer dead: it is the server subprocess's. The presence file
+    keeps `pid` for its own readers; who() hands it out as `server_pid`."""
+    me = next(a for a in server.who_tool()["agents"] if a["agent_id"] == server.AGENT_ID)
+    assert "pid" not in me
+    assert me["server_pid"] == os.getpid()
+    pf = server.DISPATCH_DIR / ".presence" / f"{server.AGENT_ID}.json"
+    assert json.loads(pf.read_text())["pid"] == os.getpid()
+
+
+def test_who_live_scope_leaves_out_the_rosters(server_factory):
+    """The full answer carries every nick ever seen; scope='live' is the cheap
+    call for "who is here right now"."""
+    gone = server_factory("mars-1")
+    gone._release_id(gone.AGENT_ID)
+    me = server_factory("venus-1")
+    remote = me.DISPATCH_DIR / ".remote"
+    remote.mkdir(exist_ok=True)
+    (remote / "jupiter-9.json").write_text(json.dumps({"agent_id": "jupiter-9"}))
+
+    full = me.who_tool()
+    assert full["known_count"] >= 1 and full["remote_count"] == 1
+
+    live = me.who_tool(scope="live")
+    assert [a["agent_id"] for a in live["agents"]] == ["venus-1"]
+    assert not {"known", "remote", "native"} & live.keys()
+
+
+def test_who_rejects_an_unknown_scope(server):
+    import pytest
+
+    with pytest.raises(ValueError):
+        server.who_tool(scope="everything")
+
+
+def test_a_session_just_woken_by_its_watch_is_handling_not_deaf(server, tmp_path):
+    """A one-shot watch exits on the message it wakes for, so for the length of
+    the reply the arm lock is free. who() must not tell senders that session
+    won't answer."""
+    from dispatch_common import wake_record
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    pf = server.DISPATCH_DIR / ".presence" / f"{server.AGENT_ID}.json"
+    data = json.loads(pf.read_text())
+    data["state_dir"] = str(state)
+    server._PRESENCE_DATA.update(data)
+    server._write_presence()
+
+    me = lambda: next(a for a in server.who_tool()["agents"] if a["agent_id"] == server.AGENT_ID)  # noqa: E731
+    assert me()["armed"] is False and server.AGENT_ID in server.who_tool()["unarmed"]
+
+    wake_record(server.AGENT_ID, state).write_text('{"reported": ["m1"]}')
+    out = server.who_tool()
+    assert me()["handling"] is True
+    assert server.AGENT_ID not in out.get("unarmed", [])

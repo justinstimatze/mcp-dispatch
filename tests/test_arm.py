@@ -125,12 +125,15 @@ def test_top_level_auto_arm_overrides_section(tmp_path):
     assert proc.stdout.strip() == ""  # top-level false wins → opted out, silent
 
 
-def test_session_start_nudges_monitor(tmp_path):
-    """The nudge now points at the Monitor tool + --follow, not run_in_background."""
+def test_session_start_nudges_a_background_one_shot_watch(tmp_path):
+    """Monitor caps a registration at 30 minutes, so the nudge asks for a one-shot
+    background task instead of `--follow` under Monitor, and never promises a
+    persistence Monitor can't give."""
     dispatch_dir, state_dir = _setup(tmp_path)
     proc = _run("SessionStart", dispatch_dir=dispatch_dir, state_dir=state_dir)
-    assert "Monitor(" in proc.stdout
-    assert "--follow" in proc.stdout
+    assert "run_in_background" in proc.stdout
+    assert "--follow" not in proc.stdout
+    assert "persistent" not in proc.stdout.lower()
 
 
 def test_git_enabled_bridge_down_warns(tmp_path):

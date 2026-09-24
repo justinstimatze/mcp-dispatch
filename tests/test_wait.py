@@ -236,3 +236,58 @@ def test_follow_marks_native_bridge_provenance(tmp_path):
     finally:
         proc.kill()
         holder.close()
+
+
+# ── one-shot: the recommended arm path ──────────────────────────────────────
+
+
+def _one_shot(dispatch_dir, state_dir, *args):
+    proc = _launch(dispatch_dir, state_dir, *args, MCP_DISPATCH_NOTIFY_ON="direct")
+    out, _ = proc.communicate(timeout=5)
+    return out
+
+
+def test_one_shot_relaunch_does_not_rewake_on_a_reported_message(tmp_path):
+    """The model is told to re-arm after a wake. If it relaunches before peek()
+    marks the message read, the waiter must not exit on that same message again,
+    or the session loops: wake, relaunch, wake."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir)
+    try:
+        _write_msg(dispatch_dir, "alice", to="alice", content="first", mid="m1")
+        assert "m1" in _one_shot(dispatch_dir, state_dir)
+        # Still unread. The relaunch should wait, and only hit its cap.
+        out = _one_shot(dispatch_dir, state_dir, "--max-lifetime", "0.6")
+        assert "within" in out and "m1" not in out
+    finally:
+        holder.close()
+
+
+def test_one_shot_still_wakes_on_a_message_that_arrived_after_the_wake(tmp_path):
+    """Level-triggering survives the dedupe: mail that landed between the wake and
+    the re-arm ends the new wait at once."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir)
+    try:
+        _write_msg(dispatch_dir, "alice", to="alice", content="first", mid="m1")
+        _one_shot(dispatch_dir, state_dir)
+        _write_msg(dispatch_dir, "alice", to="alice", content="second", mid="m2")
+        out = _one_shot(dispatch_dir, state_dir, "--max-lifetime", "3")
+        assert "m2" in out and "m1" not in out
+    finally:
+        holder.close()
+
+
+def test_one_shot_summary_marks_provenance_and_gives_a_working_rearm(tmp_path):
+    """The recommended path must flag untrusted provenance the way --follow does,
+    and its re-arm line must carry the agent id, since resolving it from the
+    working directory fails in a subdirectory of the project."""
+    dispatch_dir, state_dir = _dirs(tmp_path)
+    holder = _hold_presence(dispatch_dir)
+    try:
+        _write_msg(dispatch_dir, "alice", to="alice", content="hi", mid="n1", _via="native-bridge")
+        out = _one_shot(dispatch_dir, state_dir)
+        assert "«native-bridge»" in out
+        assert f"MCP_DISPATCH_AGENT_ID=alice {WAIT}" in out
+    finally:
+        holder.close()

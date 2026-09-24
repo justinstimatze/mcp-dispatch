@@ -5,16 +5,20 @@ The MCP server can detect a new message (its background poll fires notify_comman
 but cannot inject a turn into the model's loop — only the harness can. Two harness
 mechanisms do that, and this script serves both:
 
-  --follow (RECOMMENDED — run under the Monitor tool):
+  one-shot (RECOMMENDED — run as a Bash run_in_background task):
+    MCP_DISPATCH_AGENT_ID=<id> dispatch-wait   # block until a qualifying message, then exit
+    The harness re-invokes the model on the task's *exit*; relaunch it after each
+    message to re-arm. No time cap, so an idle session stays asleep until a
+    message actually arrives. This is what hooks/dispatch-arm.py nudges the model
+    to start.
+
+  --follow (run under the Monitor tool):
     dispatch-wait --follow        # stream one wake event per message, forever
     Monitor streams each printed line into the parked session as a wake event, so
-    ONE persistent registration covers the whole session — nothing to re-arm after
-    each message. This is what hooks/dispatch-arm.py nudges the model to start.
-
-  one-shot (run as a Bash run_in_background task):
-    dispatch-wait                 # block until a direct/must_read message, then exit
-    The harness re-invokes the model on the task's *exit*; you must relaunch it to
-    re-arm for the next message. Kept for standalone/scripted use.
+    one registration covers every message — but only for as long as Monitor keeps
+    it alive. Claude Code's Monitor caps a registration at 30 minutes, so there it
+    needs re-arming every half hour whether or not anything arrived. Use it on a
+    harness whose Monitor has no such cap.
 
     dispatch-wait --interval 1    # poll faster (default 2.0s)
     dispatch-wait --notify-on all # override the configured policy for this run
@@ -31,6 +35,9 @@ With notify_on = "direct" an idle session wakes on messages addressed to it
 
 Level-triggered: if a qualifying message is already unread at launch it exits
 immediately, so re-arming after handling one leaves no window to miss the next.
+The one exception is a message an earlier wake already reported (recorded in
+common.wake_record): relaunching before peek() has marked it read must not end
+the new wait on the same message, or the session loops.
 
 Lifetime: by default there is no time cap. Instead the waiter exits the moment
 its agent's presence flock drops — the MCP server releases it when the session
@@ -135,11 +142,8 @@ def _qualifying(dispatch_dir: Path, agent_id: str, notify_on: str) -> list[dict]
     return out
 
 
-def _oneline(agent_id: str, m: dict) -> str:
-    """One-line render of a single qualifying message, for --follow stream mode.
-
-    Under the Monitor tool each printed line becomes one wake event, so this must
-    be a single flushed line carrying enough to triage without a peek()."""
+def _marks(m: dict) -> str:
+    """Priority flags and provenance tags, shared by both output modes."""
     flags = ""
     if m.get("must_read"):
         flags += " 🔒"
@@ -159,9 +163,17 @@ def _oneline(agent_id: str, m: dict) -> str:
         via = " «native-bridge»"
     else:
         via = ""
+    return flags + via
+
+
+def _oneline(agent_id: str, m: dict) -> str:
+    """One-line render of a single qualifying message, for --follow stream mode.
+
+    Under the Monitor tool each printed line becomes one wake event, so this must
+    be a single flushed line carrying enough to triage without a peek()."""
     preview = (m.get("content", "") or "")[:140].replace("\n", " ")
     return (
-        f"[mcp-dispatch] {m.get('from', '?')} → {agent_id}{flags}{via}: {preview}  "
+        f"[mcp-dispatch] {m.get('from', '?')} → {agent_id}{_marks(m)}: {preview}  "
         f"(id {m.get('id', '?')}) — peek() to read, ack() when handled"
     )
 
@@ -214,21 +226,39 @@ def _follow(
 def _summary(agent_id: str, notify_on: str, msgs: list[dict]) -> str:
     lines = [f"[mcp-dispatch] {len(msgs)} message(s) for {agent_id} (notify_on={notify_on}):"]
     for m in msgs[:10]:
-        flags = ""
-        if m.get("must_read"):
-            flags += " 🔒"
-        if m.get("priority") == "urgent":
-            flags += " !"
         preview = (m.get("content", "") or "")[:100].replace("\n", " ")
         lines.append(
-            f"  from {m.get('from', '?')} → {m.get('to', '?')}{flags}: "
+            f"  from {m.get('from', '?')} → {m.get('to', '?')}{_marks(m)}: "
             f"{preview}  (id {m.get('id', '?')})"
         )
     lines.append(
-        "Use peek() to read in full and ack() when handled, "
-        "then launch dispatch-wait again to re-arm."
+        "Use peek() to read in full and ack() when handled. Then re-arm with a "
+        "background Bash task (run_in_background: true):\n"
+        f"    MCP_DISPATCH_AGENT_ID={agent_id} {common.waiter_path()}"
     )
     return "\n".join(lines)
+
+
+def _load_reported(agent_id: str) -> set[str]:
+    try:
+        raw = json.loads(common.wake_record(agent_id).read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    ids = raw.get("reported") if isinstance(raw, dict) else None
+    return {str(i) for i in ids} if isinstance(ids, list) else set()
+
+
+def _save_reported(agent_id: str, ids: set[str]) -> None:
+    """Record what this wake reported. Best-effort: losing it costs one repeat
+    wake, never a missed one."""
+    path = common.wake_record(agent_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"reported": sorted(ids)}))
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -248,9 +278,9 @@ def main() -> int:
         "--follow",
         action="store_true",
         help="stream mode: don't exit on the first hit — print one line per "
-        "qualifying message and keep running until presence drops. Designed to run "
-        "under the Monitor tool so a single registration wakes a parked session on "
-        "every message, with no re-arming.",
+        "qualifying message and keep running until presence drops. For a Monitor "
+        "tool that can hold a watch open indefinitely; Claude Code's caps it at 30 "
+        "minutes, so there the default one-shot mode as a background task is better.",
     )
     args = ap.parse_args()
 
@@ -311,10 +341,19 @@ def main() -> int:
             max_lifetime,
         )
 
+    # Only messages no earlier wake reported. The model is told to re-arm, and if
+    # it does that before peek() has marked the message read, a waiter that
+    # counted every pending message would exit on the same one at once, wake the
+    # model again, and repeat. A message arriving between wake and re-arm is new,
+    # so it still ends the wait immediately.
+    reported = _load_reported(agent_id)
     while True:
         hits = _qualifying(dispatch_dir, agent_id, notify_on)
-        if hits:
-            print(_summary(agent_id, notify_on, hits))
+        new = [m for m in hits if str(m.get("id") or "") not in reported]
+        if new:
+            # Keep only ids still pending, so the record never outgrows the inbox.
+            _save_reported(agent_id, {str(m.get("id") or "") for m in hits})
+            print(_summary(agent_id, notify_on, new))
             return 0
         if gated and not common.flock_held(presence_pf):
             print(

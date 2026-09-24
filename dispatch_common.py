@@ -246,7 +246,7 @@ def resolve_agent_id(dispatch_dir: Path, cwd: str) -> str | None:
 
 
 def arm_lock(agent_id: str, state: Path | None = None) -> Path:
-    """The lock a live ``dispatch-wait --follow`` holds while a session is armed.
+    """The lock a live ``dispatch-wait`` holds while a session is armed.
 
     ``state`` overrides the local cache directory, for a reader asking about a
     session that is not its own: the lock lives under the *watcher's* HOME, so
@@ -254,6 +254,39 @@ def arm_lock(agent_id: str, state: Path | None = None) -> Path:
     exist there. Sessions record their own state directory in the presence file.
     """
     return (state or state_dir()) / f"wait-{md5_key(agent_id)}.lock"
+
+
+# How long after a one-shot watch wakes its session that session counts as
+# handling the message rather than deaf. The watch exits on the wake, so for the
+# whole reply the arm lock is free and armed() says False; without this, who()
+# told senders not to expect a reply from exactly the session writing one.
+HANDLING_WINDOW = 900.0
+
+
+def wake_record(agent_id: str, state: Path | None = None) -> Path:
+    """Written by a one-shot ``dispatch-wait`` when it wakes its session.
+
+    Holds the ids it reported, so a relaunch before the model has read them does
+    not exit on the same messages again, and its mtime is when the wake
+    happened, which is what ``handling()`` reads."""
+    return (state or state_dir()) / f"waitwoke-{md5_key(agent_id)}.json"
+
+
+def handling(agent_id: str, state: Path | None = None, within: float = HANDLING_WINDOW) -> bool:
+    """True if a watch woke this session within ``within`` seconds."""
+    try:
+        return time.time() - wake_record(agent_id, state).stat().st_mtime < within
+    except OSError:
+        return False
+
+
+def handling_for(rec: dict) -> bool:
+    """``handling()`` for a presence record, against the session's own state dir."""
+    aid = str(rec.get("agent_id") or "")
+    if not aid:
+        return False
+    raw = rec.get("state_dir")
+    return handling(aid, Path(str(raw)) if raw else None)
 
 
 def armed(agent_id: str, state: Path | None = None) -> bool | None:
@@ -340,21 +373,27 @@ def arm_instruction(agent_id: str, cfg: dict | None = None, relay: Path | None =
     Two callers now say this: the arm hook, at session start and on the way to
     parking, and the server, on a tool result the model was already getting. They
     have to say the same thing — a session acting on one wording and then seeing
-    another has no way to tell they describe one problem."""
+    another has no way to tell they describe one problem.
+
+    The watch is a one-shot background Bash task, not `--follow` under Monitor.
+    Monitor caps a registration at 30 minutes and has no persistent mode, so a
+    `--follow` watch died every half hour and the Stop hook woke an idle session
+    just to re-arm it. A background task has no cap and exits only on a message.
+    The agent id goes in the command because the waiter's fallback resolves it
+    from the working directory, which fails when the session sits in a
+    subdirectory of the project."""
     conf = load_config() if cfg is None else cfg
     root = dispatch_dir(conf) if relay is None else relay
     return (
         f"[mcp-dispatch] No message watch is armed for '{agent_id}'. While parked "
-        "you won't see new messages until one is. Start a PERSISTENT watch NOW with "
-        "the Monitor tool (load it via ToolSearch first if it isn't already "
-        "available) — one registration streams an event per incoming message for "
-        "the whole session, so there is NOTHING to re-arm after each one:\n\n"
-        f'    Monitor(command="{waiter_path()} --follow", '
-        f'description="dispatch inbox for {agent_id}", persistent=true, '
-        "timeout_ms=3600000)\n\n"
-        "It costs zero tokens while idle and wakes you the instant a qualifying "
-        "message (local OR cross-host) lands. This notice goes quiet once the watch "
-        "holds its lock." + git_bridge_note(conf, root)
+        "you won't see new messages until one is. Start one NOW as a background "
+        "Bash task (run_in_background: true):\n\n"
+        f"    MCP_DISPATCH_AGENT_ID={agent_id} {waiter_path()}\n\n"
+        "It costs zero tokens while idle, has no time limit, and exits the moment "
+        "a qualifying message (local OR cross-host) lands, which wakes you. Start "
+        "it again after handling each message; a message that arrives in between "
+        "is caught at startup. This notice goes quiet while the watch holds its "
+        "lock." + git_bridge_note(conf, root)
     )
 
 
@@ -363,10 +402,11 @@ def arm_nudge_due(
 ) -> bool:
     """True at most once per ``interval``, and stamps the clock when it says yes.
 
-    The cap is for harnesses with no Monitor tool, where the instruction can
+    The cap is for harnesses with no background tasks, where the instruction can
     never be carried out: without it the notice would ride along on every single
     tool result for the life of the session. A session that *can* arm does so on
-    the first one and never asks again.
+    the first one, and is asked again only after its watch has exited on a message
+    and the handling window (see HANDLING_WINDOW) has passed without a re-arm.
 
     An unwritable state directory means we can't remember having asked, so we ask
     again — the notice is advisory text on a result the caller wanted anyway, and
