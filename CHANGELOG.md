@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-09-24
+
 ### Changed
 - **The arm hook asks for a one-shot background watch, not a Monitor stream.**
   It used to ask for `Monitor(dispatch-wait --follow, persistent=true,
@@ -31,6 +33,12 @@ truth for versions.
   triage sessions open indefinitely, when the supervisor is what wakes them.
 
 ### Added
+- **`bin/dispatch-gate-router` — wake a fleet lane on a new CI failure.** A
+  local poller over `gh api .../actions/runs?status=failure` for an allowlisted
+  workflow set. It debounces by (workflow, head SHA) and posts a structured
+  message (run URL, failing jobs, tree distance) through `dispatch-send`. It
+  polls locally because a `workflow_run` workflow only registers on the default
+  branch. Its first run marks the existing backlog handled without sending it.
 - **A restarted session rejoins its nick's channels.** Subscriptions were
   mirrored into the nick's record but never read back, so a restart silently
   dropped a lane out of `#swarm`. The rejoin happens only when no other session
