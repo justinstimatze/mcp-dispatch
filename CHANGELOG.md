@@ -6,6 +6,29 @@ truth for versions.
 
 ## [Unreleased]
 
+### Changed
+- **`dispatch-gate-router` DMs the lane that owns a red instead of posting to
+  `#swarm`.** A channel post woke nobody, because `dispatch-wait` watches with
+  `notify_on=direct`. The run's head branch now picks the lane:
+  `<planet>justin/...` goes to that planet, and everything else goes to the
+  mayor (`--mayor`, default `aipotluckorg`). `--channel` is gone. `--mirror
+  '#swarm'` still copies each message to a channel for anyone who wants it.
+- **A re-run that fails again is reported.** The debounce key is now
+  (workflow, head SHA, attempt), because GitHub's `conclusion` shows only the
+  latest attempt and hides the earlier ones. The ledger moves to version 2.
+  Upgrading from the old ledger re-seeds the current backlog without sending.
+- **Tree distance is measured against `develop`.** It was measured against the
+  retired `dumpling` branch, so every message ended in "distance unknown".
+- **Fork runs are skipped, and job and branch names are reduced to a safe
+  character set.** A local message with no `via` is read by the fleet as
+  operator instruction, and a fork's workflow file names its own jobs.
+
+### Added
+- **"Green again".** When a later run of the same workflow on the same branch
+  succeeds after a routed red, the lane that got the red gets one short
+  message saying so.
+- **"Journey gallery" and "Live vendor tests"** are on the default allowlist.
+
 ## [0.11.7] - 2026-09-24
 
 ### Changed
