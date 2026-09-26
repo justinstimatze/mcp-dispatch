@@ -7,6 +7,23 @@ truth for versions.
 ## [Unreleased]
 
 ### Changed
+- **`dispatch-gate-router` puts no pusher-written text in a DM.** The branch
+  name, job names and a pull_request run's own workflow name all come from
+  the PR, and a `safe()` charset still lets someone with push access spell an
+  instruction the fleet would read as its operator's. A DM now carries the run
+  id, attempt, head SHA, event (from a fixed set), a `CUR-<digits>` ticket id
+  parsed from a planet branch, and the workflow name looked up by id from the
+  default branch's workflow list. The run URL is rebuilt from the id. The lane
+  reads job names itself with `gh run view`.
+- **Every workflow routes; `--allow` is replaced by `--deny`.** The allowlist
+  left scheduled production probes on `main` reaching only Slack. The first
+  pass after upgrade seeds the newly covered workflows' current reds without
+  sending (ledger key `scope`).
+- **A red for a planet with no live presence goes to the mayor**, saying so,
+  instead of waiting in a dead session's inbox.
+- **A relapse after "green again" on an unchanged SHA is reported.** Scheduled
+  probes re-run on the same `main` SHA, so recovery now clears that
+  workflow's debounce keys for the SHA.
 - **`dispatch-gate-router` DMs the lane that owns a red instead of posting to
   `#swarm`.** A channel post woke nobody, because `dispatch-wait` watches with
   `notify_on=direct`. The run's head branch now picks the lane:
