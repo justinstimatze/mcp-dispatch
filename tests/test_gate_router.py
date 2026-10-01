@@ -124,3 +124,54 @@ def test_a_relapse_after_green_on_the_same_sha_notifies_again(router, monkeypatc
     monkeypatch.setattr(router, "fetch_runs", lambda repo, status: [relapse] if status == "failure" else [])
     router.route_failures(router.DEFAULT_REPO, [], "develop", "aipotluckorg", None, state, False)
     assert len(sent) == 3, "a red after a recovery on an unchanged SHA is new information"
+
+
+def _findings(router, monkeypatch, runs, notes, live):
+    sent: list[tuple[str, str, dict]] = []
+    calls: list[str] = []
+
+    def gh(args):
+        calls.append(args[1])
+        if args[1].endswith("/jobs"):
+            return {"jobs": [{"check_run_url": "https://api.github.com/repos/x/y/check-runs/555"}]}
+        return notes
+
+    monkeypatch.setattr(router, "fetch_runs", lambda repo, status: runs if status == "success" else [])
+    monkeypatch.setattr(router, "live_nicks", lambda: live)
+    monkeypatch.setattr(router, "gh_json", gh)
+    monkeypatch.setattr(router, "dispatch_send", lambda to, msg, payload: sent.append((to, msg, payload)))
+    state = router.empty_state()
+    router.route_findings(router.DEFAULT_REPO, router.DEFAULT_MAYOR, None, state, False)
+    return sent, state, calls
+
+
+def _note(router, msg=INJECTED):
+    return {"annotation_level": "warning", "title": router.FINDINGS_TITLE, "message": msg}
+
+
+def test_a_calque_finding_dms_the_branch_owner_with_a_count_and_none_of_its_text(router, monkeypatch):
+    run = _run(router, path=router.FINDINGS_WORKFLOW)
+    sent, state, _ = _findings(router, monkeypatch, [run], [_note(router), _note(router)], {"jupiter"})
+    [(to, msg, payload)] = sent
+    assert to == "jupiter"
+    assert "calque found 2 new twin(s) on CUR-2082's PR" in msg
+    assert payload["count"] == 2 and payload["type"] == "gate.finding"
+    assert INJECTED not in msg and INJECTED not in str(payload)
+    assert router.run_key(run) in state["findings"]
+
+
+def test_a_calque_run_with_no_findings_sends_nothing_and_is_not_fetched_again(router, monkeypatch):
+    run = _run(router, path=router.FINDINGS_WORKFLOW)
+    other = {"annotation_level": "warning", "title": "something else"}
+    sent, state, _ = _findings(router, monkeypatch, [run], [other], {"jupiter"})
+    assert sent == []
+    calls: list[str] = []
+    monkeypatch.setattr(router, "gh_json", lambda args: calls.append(args[1]) or {})
+    router.route_findings(router.DEFAULT_REPO, router.DEFAULT_MAYOR, None, state, False)
+    assert calls == []
+
+
+def test_a_green_run_of_any_other_workflow_is_never_read_for_findings(router, monkeypatch):
+    run = _run(router, path=".github/workflows/ci.yml")
+    sent, state, calls = _findings(router, monkeypatch, [run], [_note(router)], {"jupiter"})
+    assert sent == [] and calls == [] and state["findings"] == []
