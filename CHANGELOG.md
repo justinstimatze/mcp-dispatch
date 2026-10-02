@@ -6,6 +6,12 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.9] - 2026-10-01
+
+### Security
+- **PyJWT 2.13.0 → 2.15.1 in `uv.lock`,** closing 13 Dependabot alerts (one
+  critical). It arrives only through `mcp[crypto]`; nothing here calls it.
+
 ## [0.11.8] - 2026-10-01
 
 ### Changed
