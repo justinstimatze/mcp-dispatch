@@ -60,6 +60,12 @@ truth for versions.
   greetings or sign-offs, what changes for the reader before any question, and
   paths and ids instead of pasted content. It is appended after the template,
   so a host with its own `instructions` still gets it.
+- **`dispatch-gate-router` reads calque's findings on green runs.**
+  `calque-review.yml` is advisory, so its finding is a warning annotation on a
+  passing job, which `gh pr checks` never shows and lanes never read. A third
+  pass reads successful runs of that workflow, counts the annotations titled
+  "calque: a twin this PR introduces", and DMs the owning lane the count, run
+  id and ticket. The annotation text is PR-written and never leaves the process.
 - **`dispatch-gate-router` puts no pusher-written text in a DM.** The branch
   name, job names and a pull_request run's own workflow name all come from
   the PR, and a `safe()` charset still lets someone with push access spell an
