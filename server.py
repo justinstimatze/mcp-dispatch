@@ -73,6 +73,10 @@ _DEFAULT_CONFIG = {
     "agents": [],  # empty = dynamic registration (any name accepted)
     "dispatch_dir": "~/.config/mcp-dispatch/messages",
     "max_message_bytes": 65536,
+    # How much of a message's text a recipient's model is handed on delivery
+    # (peek, piggyback). The stored message stays whole — bridges, the TUI and
+    # IRC see all of it — and peek(message_ids=[...]) returns the rest. 0 = off.
+    "deliver_max_chars": 2000,
     "default_ttl": 604800,  # seconds; 1-week ambient default (0 = no expiry; must_read overrides)
     "instructions": "",  # empty = use built-in template
     # Owner-only by default. Set true to share one relay across mutually-trusting
@@ -159,6 +163,7 @@ CONFIG = _load_config()
 AGENT_IDS: list[str] = CONFIG["agents"]
 DISPATCH_DIR = Path(CONFIG["dispatch_dir"])
 MAX_MESSAGE_BYTES = int(CONFIG["max_message_bytes"])
+DELIVER_MAX_CHARS = int(CONFIG["deliver_max_chars"])
 DEFAULT_TTL = int(CONFIG["default_ttl"])
 DYNAMIC_MODE = len(AGENT_IDS) == 0  # no roster = accept any agent name
 NOTIFY_COMMAND = str(CONFIG["notify_command"]).strip()
@@ -1196,7 +1201,38 @@ def _omit_defaults(clean: dict, *, just_read: bool = True) -> dict:
     return clean
 
 
-def _public_msg(m: dict, *, just_read: bool = True) -> dict:
+_BREAKS = ("\n", ". ", "; ", ", ", " ")
+
+
+def _clip(text: str, limit: int, msg_id: str = "") -> str:
+    """About `limit` chars of `text`: mostly its head, plus its closing lines.
+
+    The tail is kept because long handoffs put their caveat last ("don't push
+    yet"), and a recipient that never fetches the rest still acts on what it
+    was handed. Each piece ends at the strongest break near the cut, so neither
+    half starts or stops mid-word, and the marker between them names how to get
+    the middle, which is where a recipient notices it is missing."""
+    tail_budget = limit // 5
+    if not tail_budget:
+        return text[:limit] + " …"
+    head = text[: limit - tail_budget]
+    for brk in _BREAKS:
+        at = head.rfind(brk)
+        if at >= len(head) * 0.6:
+            head = head[: at + len(brk)]
+            break
+    tail = text[-tail_budget:]
+    for brk in _BREAKS:
+        at = tail.find(brk)
+        if 0 <= at <= len(tail) * 0.5:
+            tail = tail[at + len(brk) :]
+            break
+    omitted = len(text) - len(head) - len(tail)
+    fetch = f'peek(message_ids=["{msg_id}"])' if msg_id else "peek(message_ids=[...])"
+    return f"{head.rstrip()}\n[… {omitted} chars omitted: {fetch} …]\n{tail.lstrip()}"
+
+
+def _public_msg(m: dict, *, just_read: bool = True, full: bool = False) -> dict:
     """Strip internal (_-prefixed) fields for the wire, but surface provenance: a
     message materialized from the git transport carries an internal `_via` tag —
     expose it as `via: "remote"` so an agent knows this one crossed machines
@@ -1214,6 +1250,21 @@ def _public_msg(m: dict, *, just_read: bool = True) -> dict:
     # longer exists, so say so rather than let it look like fresh mail to me.
     if m.get("_inherited_from"):
         clean["inherited_from"] = m["_inherited_from"]
+    # Message text over the cap is delivered as its head and tail. Over 14 days,
+    # the longest tenth of sends ran past 2,000 chars, and every recipient
+    # carries all of it for the rest of its session. 1,000 was tried first and
+    # replayed against those sends: the ask sat in the cut middle of 3 of 8
+    # sampled messages, because nobody had yet written for a cap. The rest is one
+    # peek(message_ids=[...]) away, which most recipients never need.
+    # A sender who marked a message must_read or urgent has said the whole of
+    # it matters, so those go out uncut.
+    content = clean.get("content")
+    exempt = m.get("must_read") or m.get("priority") == "urgent"
+    if not (full or exempt) and DELIVER_MAX_CHARS > 0 and isinstance(content, str):
+        # Just over the cap, the marker costs more than the cut saves.
+        if len(content) > DELIVER_MAX_CHARS + 80:
+            clean["content"] = _clip(content, DELIVER_MAX_CHARS, str(m.get("id", "")))
+            clean["truncated_from"] = len(content)
     return _omit_defaults(clean, just_read=just_read)
 
 
@@ -1525,6 +1576,26 @@ if CONFIG.get("trust_local_peers"):
         "or anything that leaves this machine."
     )
 
+# Appended for the same reason as the trust note: a host's custom `instructions`
+# replaces the template, and this has to reach every session regardless. Prompted
+# length limits shrink output on average but leak past tight budgets, which is
+# why the delivery cap above does the enforcing and this only sets the register.
+_instructions += (
+    "\n\nMessage style: the reader is another agent, and every message stays in "
+    "its context for the rest of its session. Skip greetings, thanks, sign-offs "
+    "and restating what you were told. Point at file paths, commits, ids and line "
+    "numbers instead of pasting their content."
+    + (
+        f" A message over {DELIVER_MAX_CHARS} characters reaches its recipient as "
+        "its opening and closing lines, and the middle is fetched only on request, "
+        "so the first line carries the ask or the finding — even where your reply "
+        "style puts the ask last, a message is read from the top. Send must_read=true "
+        "when every line matters; that also keeps it from expiring until acked."
+        if DELIVER_MAX_CHARS > 0
+        else " Put the ask or the finding in the first line."
+    )
+)
+
 mcp = FastMCP("dispatch", instructions=_instructions)
 
 
@@ -1572,17 +1643,29 @@ def dispatch_tool(
         ttl=ttl,
         must_read=must_read,
     )
-    return _with_pending(
-        {
-            "sent": True,
-            "id": sent["id"],
-            "from": AGENT_ID,
-            "to": target,
-            "queued_to": sent.get("queued_to", []),
-            "priority": priority,
-            "thread_id": sent.get("thread_id"),
-        }
-    )
+    result = {
+        "sent": True,
+        "id": sent["id"],
+        "from": AGENT_ID,
+        "to": target,
+        "queued_to": sent.get("queued_to", []),
+        "priority": priority,
+        "thread_id": sent.get("thread_id"),
+    }
+    # Telling the sender is the part that changes behaviour: a length limit
+    # stated only in instructions leaks, one the sender sees enforced does less.
+    if (
+        DELIVER_MAX_CHARS > 0
+        and len(message) > DELIVER_MAX_CHARS
+        and not (must_read or priority == "urgent")
+    ):
+        result["truncated_on_delivery"] = (
+            f"{len(message)} chars; recipients get its opening and closing lines "
+            f"(~{DELIVER_MAX_CHARS} chars) and must fetch the middle. Put what they "
+            "act on first, or send must_read=true if every line matters (it then "
+            "never expires unacked)."
+        )
+    return _with_pending(result)
 
 
 @mcp.tool(
@@ -1597,18 +1680,31 @@ def dispatch_tool(
         "Use ack() to acknowledge messages when you're done with them. "
         "Also returns delivery receipts for messages you sent, but only ones that "
         "are new or changed state (pending → read → expired) since your last peek; "
-        "receipts_unchanged counts the rest. Set all_receipts=true for the full list."
+        "receipts_unchanged counts the rest. Set all_receipts=true for the full list. "
+        + (
+            f"Message text over {DELIVER_MAX_CHARS} chars arrives as its opening and "
+            "closing lines around a marker naming what was cut, with truncated_from "
+            "giving the full length; pass message_ids=[...] to get those messages in "
+            "full, before you ack them — ack deletes the only full copy. must_read "
+            "and urgent messages are never cut."
+            if DELIVER_MAX_CHARS > 0
+            else "Pass message_ids=[...] to re-read specific messages."
+        )
     ),
 )
 def peek_tool(
     thread_id: str | None = None,
     include_read: bool = False,
     all_receipts: bool = False,
+    message_ids: list[str] | None = None,
 ) -> dict:
     """Non-destructive read of inbox messages plus sent message receipts."""
     _cleanup_expired(AGENT_ID)
 
-    if include_read:
+    if message_ids:
+        wanted = set(message_ids)
+        messages = [m for m in _read_inbox(AGENT_ID, thread_id=thread_id) if m.get("id") in wanted]
+    elif include_read:
         messages = _read_inbox(AGENT_ID, thread_id=thread_id)
     else:
         messages = _read_inbox(AGENT_ID, state_filter="pending", thread_id=thread_id)
@@ -1617,7 +1713,10 @@ def peek_tool(
     _mark_read(messages)
 
     # Clean internal fields (and surface cross-host provenance via _public_msg)
-    clean = [_public_msg(m, just_read=not include_read) for m in messages]
+    clean = [
+        _public_msg(m, just_read=not (include_read or message_ids), full=bool(message_ids))
+        for m in messages
+    ]
 
     # Delivery receipts for sent messages: only what changed, unless asked.
     every = _get_sent_receipts(AGENT_ID)
@@ -1629,6 +1728,12 @@ def peek_tool(
         "messages": clean,
         "count": len(clean),
     }
+    if message_ids:
+        missing = sorted(set(message_ids) - {m.get("id") for m in messages})
+        if missing:
+            # Acked, expired, outside thread_id, or never ours: all look alike
+            # from here, and an empty list must not read as success.
+            result["not_found"] = missing
     if len(every) > len(receipts):
         result["receipts_unchanged"] = len(every) - len(receipts)
     if receipts:

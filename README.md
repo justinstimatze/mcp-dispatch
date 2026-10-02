@@ -263,6 +263,13 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # Maximum message size in bytes (default: 65536)
 max_message_bytes = 65536
 
+# How much of a message the recipient's model is handed (default: 2000). Longer
+# messages arrive as their opening and closing lines around a marker that says how much was cut and how to fetch it, plus
+# truncated_from; peek(message_ids=[...]) returns them whole. The stored file,
+# bridges and the TUI keep every byte. must_read and urgent messages are never
+# cut. Messages within a few chars of the cap are left whole. 0 turns this off.
+deliver_max_chars = 2000
+
 # Default TTL in seconds (0 = no expiry; must_read overrides). Default: 604800 (7 days)
 # — long enough that messages survive a parked/idle session instead of expiring
 # unread. Set a short ttl= explicitly on time-sensitive sends.

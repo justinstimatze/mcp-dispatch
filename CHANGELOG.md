@@ -23,6 +23,24 @@ truth for versions.
     `payload`/`thread_id`/`reply_to`, `must_read: false`, `priority: "normal"`
     and the default `ttl`. A just-read message also drops `state` and `read_at`.
     Default-valued fields had been 9.4% of message text.
+- **Long messages are delivered as their opening and closing lines.** A message
+  over `deliver_max_chars` (default 2000) reaches the recipient's model as its
+  head and its last lines around a marker that names the omitted length and the
+  exact `peek` call that fetches it, with `truncated_from` giving
+  the full length. `peek(message_ids=[...])` returns it whole, and lists any id
+  it can't return under `not_found` (an acked message is gone). Over the same 14
+  days the longest tenth of sends ran past 2,000 characters, and every
+  recipient carried all of it for the rest of its session. A 1,000 cap was
+  replayed against those sends first and dropped: the ask sat in the cut middle
+  of 3 of 8 sampled messages, written before any sender knew about a cap. The tail is kept
+  because long handoffs put their caveat last. `must_read` and `urgent`
+  messages are never cut (`must_read` also never expires unacked), and the stored message is untouched, so bridges, IRC
+  and the TUI see all of it. The sender's `dispatch()` result says when a
+  message will be cut. `0` turns the cap off.
+- **The server instructions carry a message style for agent readers:** no
+  greetings or sign-offs, ask or finding in the first line, and paths and ids
+  instead of pasted content. It is appended after the template, so a host with
+  its own `instructions` still gets it.
 
 ### Changed
 - **`dispatch-gate-router` puts no pusher-written text in a DM.** The branch
