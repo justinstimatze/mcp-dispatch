@@ -196,9 +196,10 @@ def test_who_names_the_pid_for_what_it_is(server):
     assert json.loads(pf.read_text())["pid"] == os.getpid()
 
 
-def test_who_live_scope_leaves_out_the_rosters(server_factory):
-    """The full answer carries every nick ever seen; scope='live' is the cheap
-    call for "who is here right now"."""
+def test_who_lists_only_live_sessions_by_default(server_factory):
+    """The full answer carries every nick ever seen. The default answers "who is
+    here right now" and reduces the rosters to counts, so an agent knows to ask
+    for scope='all' when it is looking for someone offline."""
     gone = server_factory("mars-1")
     gone._release_id(gone.AGENT_ID)
     me = server_factory("venus-1")
@@ -206,12 +207,13 @@ def test_who_live_scope_leaves_out_the_rosters(server_factory):
     remote.mkdir(exist_ok=True)
     (remote / "jupiter-9.json").write_text(json.dumps({"agent_id": "jupiter-9"}))
 
-    full = me.who_tool()
+    full = me.who_tool(scope="all")
     assert full["known_count"] >= 1 and full["remote_count"] == 1
 
-    live = me.who_tool(scope="live")
+    live = me.who_tool()
     assert [a["agent_id"] for a in live["agents"]] == ["venus-1"]
     assert not {"known", "remote", "native"} & live.keys()
+    assert live["elsewhere"] == {"remote": 1, "known": full["known_count"]}
 
 
 def test_who_rejects_an_unknown_scope(server):

@@ -49,7 +49,7 @@ def test_who_includes_remote_roster(server):
         json.dumps({"agent_id": "carol", "via": "git", "last_seen": "2026-06-24T00:00:00Z"})
     )
 
-    out = server.who_tool()
+    out = server.who_tool(scope="all")
     assert out["remote_count"] == 1
     assert out["remote"][0]["agent_id"] == "carol"
     # carol is not double-counted as a live local agent.
@@ -65,6 +65,6 @@ def test_live_local_shadows_remote_entry(server):
         json.dumps({"agent_id": "alpha", "via": "git", "last_seen": "x"})
     )
 
-    out = server.who_tool()
+    out = server.who_tool(scope="all")
     assert "remote" not in out  # only entry was shadowed → list empty → omitted
     assert "alpha" in {a.get("agent_id") for a in out["agents"]}

@@ -128,7 +128,7 @@ delivery receipts) is recognized and counted (`NativeInboundListener
 **who() visibility:** every tick, the daemon also live-probes the native
 session registry and writes what it finds to `DISPATCH_DIR/.native/` — read-only
 from `server.py`'s side, exactly like `git_bridge.py`'s `.remote/` roster keeps
-`who()` git-agnostic. `who()` then shows a `native` key: every OTHER live
+`who()` git-agnostic. `who(scope="all")` then shows a `native` key: every OTHER live
 native session on the host (bridged nicks' own listeners are excluded — they're
 already visible as ordinary dispatch agents). This is independent of outbound
 send traffic and independent of whether that other session is itself bridged;

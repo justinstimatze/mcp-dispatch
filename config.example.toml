@@ -264,7 +264,7 @@ Available targets: {agent_list}.
 # log_dir = "~/.cache/mcp-dispatch/supervisor"
 
 # One block per startable nick. The section name IS the nick — the durable id
-# with its pid suffix stripped, the thing `who()` lists under `known`.
+# with its pid suffix stripped, the thing `who(scope="all")` lists under `known`.
 #
 # [supervisor.agents.publicai]
 # command = ["/home/you/bin/start-publicai"]   # argv list; command[0] absolute

@@ -356,11 +356,13 @@ def test_who_marks_a_cold_remote_entry_stale_and_names_its_nick(server_factory):
     s = server_factory("alpha")
     _remote(dd, "mcp-dispatch-2995699", last_seen="2026-08-03T12:00:00Z")
 
-    entry = next(r for r in s.who_tool()["remote"] if r["agent_id"] == "mcp-dispatch-2995699")
+    entry = next(
+        r for r in s.who_tool(scope="all")["remote"] if r["agent_id"] == "mcp-dispatch-2995699"
+    )
     assert entry["stale"] is True
     assert entry["nick"] == "mcp-dispatch", "the name that actually resolves"
     assert entry["age"].endswith("d")
-    assert "Address the `nick`" in s.who_tool()["remote_note"]
+    assert "Address the `nick`" in s.who_tool(scope="all")["remote_note"]
 
 
 def test_who_leaves_a_warm_remote_entry_unflagged(server_factory):
@@ -369,7 +371,7 @@ def test_who_leaves_a_warm_remote_entry_unflagged(server_factory):
     fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _remote(dd, "elsewhere-42", last_seen=fresh)
 
-    out = s.who_tool()
+    out = s.who_tool(scope="all")
     entry = next(r for r in out["remote"] if r["agent_id"] == "elsewhere-42")
     assert "stale" not in entry
     assert entry["age"] == "0m"
@@ -383,7 +385,7 @@ def test_who_names_the_relay_it_is_talking_about(server_factory):
     reads as "wrong relay" rather than as an answer."""
     dd = server_factory.dispatch_dir
     s = server_factory("alpha")
-    out = s.who_tool()
+    out = s.who_tool(scope="all")
     assert out["relay"] == str(dd)
     assert (Path(out["relay"]) / ".presence").is_dir(), "and it is the one with the state under it"
 
@@ -397,6 +399,6 @@ def test_a_roster_entry_with_no_timestamp_is_not_guessed_at(server_factory):
         json.dumps({"agent_id": "elsewhere-42", "via": "git", "last_seen": None})
     )
 
-    entry = next(r for r in s.who_tool()["remote"] if r["agent_id"] == "elsewhere-42")
+    entry = next(r for r in s.who_tool(scope="all")["remote"] if r["agent_id"] == "elsewhere-42")
     assert "age" not in entry and "stale" not in entry
     assert entry["nick"] == "elsewhere", "the nick is derivable without a clock"

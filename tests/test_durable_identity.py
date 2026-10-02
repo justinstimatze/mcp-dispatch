@@ -93,7 +93,7 @@ def test_who_reports_offline_nicks_as_known(server_factory):
     prev._release_id("publicai-111")
     s = server_factory("alpha")
 
-    result = s.who_tool()
+    result = s.who_tool(scope="all")
     known = {r["nick"] for r in result.get("known", [])}
     assert "publicai" in known, "an offline teammate must still be discoverable"
     assert result["known_count"] >= 1
@@ -107,7 +107,7 @@ def test_who_does_not_list_a_live_nick_as_known(server_factory):
     s = server_factory("alpha")
     fh = _hold_presence(dd, "publicai-222")
     try:
-        result = s.who_tool()
+        result = s.who_tool(scope="all")
         known = {r["nick"] for r in result.get("known", [])}
         assert "publicai" not in known, "a nick with a live session is not 'known-offline'"
     finally:

@@ -139,3 +139,67 @@ def test_a_tombstone_is_never_published_over_the_git_bridge(tmp_path):
     bridge = git_bridge.GitBridge.__new__(git_bridge.GitBridge)
     bridge.dispatch_dir = relay
     assert [m["id"] for m in bridge._local_messages()] == ["msg-live"]
+
+
+def test_peek_reports_a_receipt_once_per_state(server):
+    """A read-but-unacked message keeps its receipt for up to a week. Returning it
+    on every peek was 44% of dispatch's tool-result volume, 95% of it repeats."""
+    server._send("alpha", "beta", "hello", ttl=600)
+    first = server.peek_tool()
+    assert [r["state"] for r in first["sent_receipts"]] == ["pending"]
+
+    again = server.peek_tool()
+    assert "sent_receipts" not in again
+    assert again["receipts_unchanged"] == 1
+
+    server._mark_read(server._read_inbox("beta", state_filter="pending"))
+    changed = server.peek_tool()
+    assert [r["state"] for r in changed["sent_receipts"]] == ["read"]
+
+
+def test_all_receipts_returns_the_full_list(server):
+    server._send("alpha", "beta", "hello", ttl=600)
+    server.peek_tool()
+    full = server.peek_tool(all_receipts=True)
+    assert [r["state"] for r in full["sent_receipts"]] == ["pending"]
+    assert "receipts_unchanged" not in full
+
+
+def test_an_expiry_is_still_reported_after_the_pending_receipt_was_seen(server, monkeypatch):
+    """The state change that matters most must not be swallowed by the dedupe."""
+    server._send("alpha", "beta", "never read", ttl=60)
+    server.peek_tool()
+    _jump(server, monkeypatch, 61)
+    server._cleanup_expired("beta")
+    out = server.peek_tool()
+    assert [r["state"] for r in out["sent_receipts"]] == ["expired"]
+    assert out["expired_unread"] == [out["sent_receipts"][0]["id"]]
+
+
+def test_a_delivered_message_leaves_out_its_default_fields(server):
+    """Default-valued envelope fields were 9.4% of delivered message text, and
+    state/read_at always said "read, just now". Non-defaults must survive."""
+    server._send("beta", "alpha", "plain", ttl=None)
+    server._send("beta", "alpha", "urgent", priority="urgent", must_read=True, thread_id="t1")
+    by_text = {m["content"]: m for m in server.peek_tool()["messages"]}
+    plain, urgent = by_text["plain"], by_text["urgent"]
+    assert set(plain) == {"id", "from", "to", "timestamp", "content"}
+    assert urgent["priority"] == "urgent" and urgent["must_read"] is True
+    assert urgent["thread_id"] == "t1"
+
+
+def test_each_recipient_of_a_fan_out_gets_its_own_receipt_history(server_factory):
+    """One id lands in every recipient's inbox. Keyed by id alone, the copies
+    overwrote each other and a second recipient's read was never reported."""
+    beta = server_factory("beta")
+    gamma = server_factory("gamma")
+    me = server_factory("alpha")
+    me._send("alpha", "all", "to everyone", ttl=600)
+    assert sorted(r["to"] for r in me.peek_tool()["sent_receipts"]) == ["beta", "gamma"]
+
+    beta._mark_read(beta._read_inbox("beta", state_filter="pending"))
+    assert [(r["to"], r["state"]) for r in me.peek_tool()["sent_receipts"]] == [("beta", "read")]
+    assert "sent_receipts" not in me.peek_tool()
+
+    gamma._mark_read(gamma._read_inbox("gamma", state_filter="pending"))
+    assert [(r["to"], r["state"]) for r in me.peek_tool()["sent_receipts"]] == [("gamma", "read")]

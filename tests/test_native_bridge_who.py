@@ -52,7 +52,7 @@ def test_who_includes_native_roster(server):
     native.mkdir(parents=True, exist_ok=True)
     (native / "carol.json").write_text(json.dumps({"name": "carol", "via": "native"}))
 
-    out = server.who_tool()
+    out = server.who_tool(scope="all")
     assert out["native_count"] == 1
     assert out["native"][0]["name"] == "carol"
     # carol is not double-counted as a live local agent.
@@ -67,7 +67,7 @@ def test_live_local_shadows_native_entry(server):
     native.mkdir(parents=True, exist_ok=True)
     (native / "alpha.json").write_text(json.dumps({"name": "alpha", "via": "native"}))
 
-    out = server.who_tool()
+    out = server.who_tool(scope="all")
     assert "native" not in out  # only entry was shadowed -> list empty -> omitted
     assert "alpha" in {a.get("agent_id") for a in out["agents"]}
 
@@ -75,5 +75,5 @@ def test_live_local_shadows_native_entry(server):
 def test_who_omits_native_key_when_roster_dir_absent(server):
     # No .native/ directory at all (dispatch-ucbridge never ran) must not error
     # or add an empty key — matches .remote/'s absent-directory behavior.
-    out = server.who_tool()
+    out = server.who_tool(scope="all")
     assert "native" not in out

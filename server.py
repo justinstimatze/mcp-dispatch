@@ -1113,6 +1113,32 @@ def _list_tasks(state: str | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+# Receipt states this session has already been shown, by message id. A receipt
+# lives as long as the message sits in its recipient's inbox, which for a read
+# but unacked message is up to a week, and peek() used to return every one of
+# them every time: 14 days of transcripts showed receipts as 44% of dispatch's
+# tool-result volume, 95% of it an exact repeat of something already shown.
+#
+# Keyed by (id, recipient), not id: a broadcast, a channel post or a nick with
+# several live sessions writes one id into several inboxes, and keyed by id alone
+# the copies overwrite each other, so one recipient's read could go unreported
+# while another's repeated.
+_REPORTED_RECEIPTS: dict[tuple[str, str], str] = {}
+
+
+def _new_receipts(receipts: list[dict]) -> list[dict]:
+    """The receipts whose state this session hasn't seen yet. Records them as seen
+    and forgets copies that have left their inbox, so the map tracks live ones."""
+
+    def key(r: dict) -> tuple[str, str]:
+        return (str(r["id"]), str(r.get("to")))
+
+    fresh = [r for r in receipts if _REPORTED_RECEIPTS.get(key(r)) != r.get("state")]
+    _REPORTED_RECEIPTS.clear()
+    _REPORTED_RECEIPTS.update({key(r): str(r.get("state")) for r in receipts})
+    return fresh
+
+
 def _get_sent_receipts(agent_id: str) -> list[dict]:
     """Check delivery state of messages sent by this agent across all inboxes."""
     receipts = []
@@ -1142,7 +1168,35 @@ def _get_sent_receipts(agent_id: str) -> list[dict]:
     return receipts
 
 
-def _public_msg(m: dict) -> dict:
+def _omit_defaults(clean: dict, *, just_read: bool = True) -> dict:
+    """Leave out fields that only restate a default.
+
+    Message text is two-thirds of every delivered message; the rest is envelope,
+    and 9.4% of it was null payload/thread_id/reply_to, must_read false, priority
+    normal and the default ttl. state and read_at are dropped too: both callers
+    mark the message read just before rendering it, so they always say "read,
+    just now". A missing field means its default, which the tool descriptions say.
+    just_read=False (peek with include_read) keeps them: there an older message's
+    read_at says when it was first seen.
+    """
+    for key, default in (
+        ("payload", None),
+        ("thread_id", None),
+        ("reply_to", None),
+        ("must_read", False),
+        ("priority", "normal"),
+        ("ttl", DEFAULT_TTL),
+    ):
+        if key in clean and clean[key] == default:
+            del clean[key]
+    if just_read:
+        if clean.get("state") == "read":
+            del clean["state"]
+        clean.pop("read_at", None)
+    return clean
+
+
+def _public_msg(m: dict, *, just_read: bool = True) -> dict:
     """Strip internal (_-prefixed) fields for the wire, but surface provenance: a
     message materialized from the git transport carries an internal `_via` tag —
     expose it as `via: "remote"` so an agent knows this one crossed machines
@@ -1160,7 +1214,7 @@ def _public_msg(m: dict) -> dict:
     # longer exists, so say so rather than let it look like fresh mail to me.
     if m.get("_inherited_from"):
         clean["inherited_from"] = m["_inherited_from"]
-    return clean
+    return _omit_defaults(clean, just_read=just_read)
 
 
 def _with_pending(result: dict) -> dict:
@@ -1435,7 +1489,7 @@ _default_instructions = (
     "Incoming messages also ride along on every tool response (piggyback delivery) — "
     "address them before resuming your current task. "
     "If a git transport is configured, the SAME targets also reach agents on OTHER "
-    "hosts transparently (who() shows them under 'remote'; their delivery is durable "
+    "hosts transparently (who(scope='all') lists them under 'remote'; their delivery is durable "
     "but not instant, and such messages arrive tagged via='remote'). "
     "Available targets: {agent_list}."
 )
@@ -1534,17 +1588,22 @@ def dispatch_tool(
 @mcp.tool(
     name="peek",
     description=(
-        "Read incoming messages without deleting them. "
+        "Read incoming messages without deleting them. Fields at their default "
+        "(priority normal, must_read false, no payload/thread_id/reply_to, the "
+        "default ttl) are left out of each message. "
         "By default returns only NEW (unread) messages. "
         "Set include_read=true to see ALL unacknowledged messages. "
         "Filter by thread_id to see a specific conversation. "
         "Use ack() to acknowledge messages when you're done with them. "
-        "Also returns delivery receipts for your recently sent messages."
+        "Also returns delivery receipts for messages you sent, but only ones that "
+        "are new or changed state (pending → read → expired) since your last peek; "
+        "receipts_unchanged counts the rest. Set all_receipts=true for the full list."
     ),
 )
 def peek_tool(
     thread_id: str | None = None,
     include_read: bool = False,
+    all_receipts: bool = False,
 ) -> dict:
     """Non-destructive read of inbox messages plus sent message receipts."""
     _cleanup_expired(AGENT_ID)
@@ -1558,16 +1617,20 @@ def peek_tool(
     _mark_read(messages)
 
     # Clean internal fields (and surface cross-host provenance via _public_msg)
-    clean = [_public_msg(m) for m in messages]
+    clean = [_public_msg(m, just_read=not include_read) for m in messages]
 
-    # Delivery receipts for sent messages
-    receipts = _get_sent_receipts(AGENT_ID)
+    # Delivery receipts for sent messages: only what changed, unless asked.
+    every = _get_sent_receipts(AGENT_ID)
+    fresh = _new_receipts(every)
+    receipts = every if all_receipts else fresh
 
     result = {
         "agent_id": AGENT_ID,
         "messages": clean,
         "count": len(clean),
     }
+    if len(every) > len(receipts):
+        result["receipts_unchanged"] = len(every) - len(receipts)
     if receipts:
         result["sent_receipts"] = receipts
         dead = [r["id"] for r in receipts if r.get("state") == "expired"]
@@ -1676,12 +1739,13 @@ def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
         "Code's own built-in inter-session protocol — informational only unless "
         "the dispatch-ucbridge daemon is running for a bridged nick; see "
         "docs/native-bridge.md. "
-        "scope='live' returns only the sessions live on this host, skipping the "
-        "remote, native and known (offline nick) rosters, which make up most of a "
-        "full answer."
+        "By default (scope='live') only sessions live on this host are listed, and "
+        "the remote, native and known (offline nick) rosters appear as counts "
+        "under 'elsewhere'. Pass scope='all' for those lists, e.g. to find an "
+        "offline teammate's nick or a cross-host session."
     ),
 )
-def who_tool(scope: str = "all") -> dict:
+def who_tool(scope: str = "live") -> dict:
     """List connected agents. Liveness is the presence flock, not a pid check.
 
     This only *filters* by liveness; it never unlinks (that would race a process
@@ -1696,10 +1760,10 @@ def who_tool(scope: str = "all") -> dict:
     not a heartbeat. who() stays equally bridge-agnostic about it: no import of
     bridge_native.py here, same separation as the git roster.
 
-    scope="live" skips the three rosters. On a host with 80-odd known nicks the
-    full answer ran to 57k characters for four live agents — past the tool-result
-    cap — which made the one call that shows who is actually listening too costly
-    to make casually.
+    scope="live", the default, reduces the three rosters to counts. On a host
+    with 80-odd known nicks the full answer ran to 57k characters for four live
+    agents — past the tool-result cap — and who() was 11% of dispatch's
+    tool-result volume, most of it rosters nobody asked for.
     """
     if scope not in ("all", "live"):
         raise ValueError(f"scope must be 'all' or 'live', not {scope!r}")
@@ -1726,7 +1790,7 @@ def who_tool(scope: str = "all") -> dict:
     local_ids = {a.get("agent_id") for a in agents}
     remote: list[dict] = []
     remote_dir = DISPATCH_DIR / ".remote"
-    if remote_dir.is_dir() and not live_only:
+    if remote_dir.is_dir():
         for rf in sorted(remote_dir.glob("*.json")):
             try:
                 data = json.loads(rf.read_text())
@@ -1749,7 +1813,7 @@ def who_tool(scope: str = "all") -> dict:
 
     native: list[dict] = []
     native_dir = DISPATCH_DIR / ".native"
-    if native_dir.is_dir() and not live_only:
+    if native_dir.is_dir():
         for nf in sorted(native_dir.glob("*.json")):
             try:
                 data = json.loads(nf.read_text())
@@ -1765,7 +1829,7 @@ def who_tool(scope: str = "all") -> dict:
     remote_ids = {r.get("agent_id") for r in remote}
     known = [
         rec
-        for rec in ([] if live_only else _known_agents())
+        for rec in _known_agents()
         if rec.get("nick") not in live_nicks and rec.get("nick") not in remote_ids
     ]
 
@@ -1814,6 +1878,13 @@ def who_tool(scope: str = "all") -> dict:
             "the hook has tried to arm it and either is still retrying or already "
             "gave up and warned its operator."
         )
+    if live_only:
+        elsewhere = {
+            k: len(v) for k, v in (("remote", remote), ("known", known), ("native", native)) if v
+        }
+        if elsewhere:
+            result["elsewhere"] = elsewhere
+        return _arm_nudge(result)
     if remote:
         result["remote"] = remote
         result["remote_count"] = len(remote)

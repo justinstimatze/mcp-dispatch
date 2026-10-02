@@ -7,6 +7,24 @@ truth for versions.
 ## [Unreleased]
 
 ### Changed
+- **Dispatch tool results cost far fewer tokens.** Across 14 days of
+  transcripts, re-sent delivery receipts were 44% of dispatch's tool-result
+  volume, weighted by how long each result stays in context. 95% of that
+  receipt text repeated something the session had already seen.
+  - `peek()` now lists a receipt only when it is new or its state has changed
+    since that session's last peek. Receipts are tracked per message and
+    recipient, so fan-out copies stay separate. `receipts_unchanged` counts the
+    rest, and `all_receipts=true` returns the full list.
+  - `who()` defaults to `scope="live"`: only live sessions on this host, with
+    the remote, native and offline-nick rosters reduced to counts under
+    `elsewhere`. `who()` was 11% of dispatch volume, mostly those rosters.
+    `scope="all"` gives the old answer.
+  - Delivered messages leave out fields at their default: null
+    `payload`/`thread_id`/`reply_to`, `must_read: false`, `priority: "normal"`
+    and the default `ttl`. A just-read message also drops `state` and `read_at`.
+    Default-valued fields had been 9.4% of message text.
+
+### Changed
 - **`dispatch-gate-router` puts no pusher-written text in a DM.** The branch
   name, job names and a pull_request run's own workflow name all come from
   the PR, and a `safe()` charset still lets someone with push access spell an

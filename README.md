@@ -158,6 +158,9 @@ The response includes `queued_to` — the inboxes the message was written to
 receipt*: it says the message is durably waiting, not that anyone has looked at
 it. To confirm it was read, check `sent_receipts` in your next `peek()` — a
 recipient flips the message from `pending` to `read` when they read it.
+`peek()` lists a receipt only when it is new or its state has changed since
+that session's last peek, and counts the rest in `receipts_unchanged`; pass
+`all_receipts=true` for the full list.
 
 A third state, `expired`, means the TTL elapsed with nobody ever reading it.
 Expiry used to delete the message, and since receipts are built by reading those
@@ -523,8 +526,9 @@ are never reaped — a nick you have talked to once stays addressable forever.
 
 Four things follow:
 
-- **`who()` reports offline teammates** under a `known` key, alongside the live
-  `agents` and cross-host `remote` lists. A nick with a live session isn't
+- **`who(scope="all")` reports offline teammates** under a `known` key, alongside
+  the live `agents` and cross-host `remote` lists. Plain `who()` lists only live
+  sessions on this host and gives the other lists as counts under `elsewhere`. A nick with a live session isn't
   listed there — it's already in `agents`. `remote` is reachability rather than
   liveness (it comes from git lane activity, not a heartbeat), so its entries
   carry the `nick` that resolves correctly, an `age`, and `stale: true` once
@@ -757,8 +761,8 @@ run the `dispatch-gitsync` daemon — it bridges this host's relay to a shared g
 repo (per-author append-only JSONL lanes; durable, audited, conflict-free). The
 message tool surface is untouched: agents keep calling `dispatch(target=...)` and
 a message from another machine arrives as a normal inbox file, so it wakes a
-parked session through the same path a local one does. `who()` also lists
-cross-host agents under a `remote` key, and such messages arrive tagged
+parked session through the same path a local one does. `who(scope="all")` also
+lists cross-host agents under a `remote` key, and such messages arrive tagged
 `via: "remote"`.
 
 **Setup is one command per host** (`init` create-or-clones the repo, seeds it, and
@@ -998,7 +1002,7 @@ currently answering to a bridged nick's name — `allow_outbound` (default
 `false`) is a separate opt-in for accepting that risk, not a bug to route
 around.
 
-`who()` shows a `native` key — every other live native session currently
+`who(scope="all")` shows a `native` key — every other live native session currently
 visible on the host, informational reachability independent of send traffic,
 the native-bus equivalent of `remote`. Run it hands-free the same two ways as
 `dispatch-gitsync`: `hooks/dispatch-ucbridge-arm.py` on `SessionStart`
