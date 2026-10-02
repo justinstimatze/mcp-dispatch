@@ -32,14 +32,31 @@ truth for versions.
   days the longest tenth of sends ran past 2,000 characters, and every
   recipient carried all of it for the rest of its session. A 1,000 cap was
   replayed against those sends first and dropped: the ask sat in the cut middle
-  of 3 of 8 sampled messages, written before any sender knew about a cap. The tail is kept
+  of 3 of 8 sampled messages, written before any sender knew about a cap. At
+  2000 the cap cuts 7.3% of sends and 8.1% of delivered message text. The tail is kept
   because long handoffs put their caveat last. `must_read` and `urgent`
   messages are never cut (`must_read` also never expires unacked), and the stored message is untouched, so bridges, IRC
   and the TUI see all of it. The sender's `dispatch()` result says when a
   message will be cut. `0` turns the cap off.
+- **`dispatch()` takes optional `kind` and `about`.** `kind` is one of `fyi`,
+  `ask`, `decision` or `conflict`; `about` is a pointer of up to 200 chars (a
+  path, interface or ticket). Recipients can triage from them without reading
+  the body. They are written only when set, so other messages stay
+  byte-identical on the git envelope.
+- **An identical message nobody has read yet is dropped,** returning
+  `duplicate_of`. Replaying 14 days of sends found 4 identical re-sends in
+  4,542, so this is a guard and does little for volume.
+- **The `dispatch()` result names what a send got wrong, and only then:**
+  `style` for a greeting opener or a pasted fenced block over 20 lines, and
+  `over_budget` when a session passes `send_budget` sends in
+  `send_budget_window` seconds (default 20 per 10 minutes, warn-only). On the
+  same 14 days, 25 sends opened with a greeting, none pasted a long block, and
+  the budget fired for one session.
+- **`peek()` lists at most 10 changed receipts, newest first,** with
+  `receipts_older` counting the rest.
 - **The server instructions carry a message style for agent readers:** no
-  greetings or sign-offs, ask or finding in the first line, and paths and ids
-  instead of pasted content. It is appended after the template, so a host with
+  greetings or sign-offs, what changes for the reader before any question, and
+  paths and ids instead of pasted content. It is appended after the template, so a host with
   its own `instructions` still gets it.
 
 ### Changed

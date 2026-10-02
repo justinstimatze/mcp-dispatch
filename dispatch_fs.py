@@ -300,6 +300,26 @@ def channel_subscribers(dispatch_dir: Path, channel: str) -> list[str]:
     return subs
 
 
+# What a message is for, so a recipient can triage before reading the body. A
+# boundary object in ettle's sense: concrete enough to coordinate on, loose
+# enough that each reader applies it to its own work.
+MESSAGE_KINDS = ("fyi", "ask", "decision", "conflict")
+# `about` names the thing — a path, an interface, a ticket — not a summary of it.
+MAX_ABOUT_CHARS = 200
+
+
+def _triage_fields(kind: str | None, about: str | None) -> dict:
+    """The optional kind/about fields, validated, holding only the ones set.
+
+    Only set fields are written, so a message that uses neither is byte-identical
+    to one from before they existed — the git envelope carries the dict verbatim."""
+    if kind is not None and kind not in MESSAGE_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(MESSAGE_KINDS)} (got {kind!r}).")
+    if about is not None and len(about) > MAX_ABOUT_CHARS:
+        raise ValueError(f"about is a pointer, at most {MAX_ABOUT_CHARS} chars (got {len(about)}).")
+    return {k: v for k, v in (("kind", kind), ("about", about)) if v is not None}
+
+
 def send_message(
     dispatch_dir: Path,
     from_id: str,
@@ -312,6 +332,8 @@ def send_message(
     payload: dict | None = None,
     ttl: int | None = None,
     must_read: bool = False,
+    kind: str | None = None,
+    about: str | None = None,
     dynamic_mode: bool,
     agent_ids: list[str],
     max_message_bytes: int,
@@ -327,6 +349,7 @@ def send_message(
     """
     if ttl is not None and ttl < 0:
         raise ValueError(f"ttl must be >= 0 (got {ttl}); use 0 or omit for no expiry.")
+    triage = _triage_fields(kind, about)
     effective_ttl = default_ttl if ttl is None else ttl
     msg = {
         "id": f"msg-{uuid.uuid4().hex[:8]}",
@@ -342,6 +365,7 @@ def send_message(
         "must_read": must_read,
         "state": "pending",
     }
+    msg.update(triage)
 
     # Enforce size limit against the bytes actually written (indent=2, matching
     # atomic_write) plus headroom for the read_at/state fields added on read.

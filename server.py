@@ -77,6 +77,10 @@ _DEFAULT_CONFIG = {
     # (peek, piggyback). The stored message stays whole — bridges, the TUI and
     # IRC see all of it — and peek(message_ids=[...]) returns the rest. 0 = off.
     "deliver_max_chars": 2000,
+    # Sends per window before dispatch() starts telling the sender it is the
+    # loudest thing on the rail. Warn-only: nothing is held back. 0 = off.
+    "send_budget": 20,
+    "send_budget_window": 600,
     "default_ttl": 604800,  # seconds; 1-week ambient default (0 = no expiry; must_read overrides)
     "instructions": "",  # empty = use built-in template
     # Owner-only by default. Set true to share one relay across mutually-trusting
@@ -164,6 +168,8 @@ AGENT_IDS: list[str] = CONFIG["agents"]
 DISPATCH_DIR = Path(CONFIG["dispatch_dir"])
 MAX_MESSAGE_BYTES = int(CONFIG["max_message_bytes"])
 DELIVER_MAX_CHARS = int(CONFIG["deliver_max_chars"])
+SEND_BUDGET = int(CONFIG["send_budget"])
+SEND_BUDGET_WINDOW = int(CONFIG["send_budget_window"])
 DEFAULT_TTL = int(CONFIG["default_ttl"])
 DYNAMIC_MODE = len(AGENT_IDS) == 0  # no roster = accept any agent name
 NOTIFY_COMMAND = str(CONFIG["notify_command"]).strip()
@@ -928,6 +934,8 @@ def _send(
     payload: dict | None = None,
     ttl: int | None = None,
     must_read: bool = False,
+    kind: str | None = None,
+    about: str | None = None,
 ) -> dict:
     """Write a message to the target's inbox. Fan-out for 'all'.
 
@@ -946,6 +954,8 @@ def _send(
         payload=payload,
         ttl=ttl,
         must_read=must_read,
+        kind=kind,
+        about=about,
         dynamic_mode=DYNAMIC_MODE,
         agent_ids=AGENT_IDS,
         max_message_bytes=MAX_MESSAGE_BYTES,
@@ -1131,17 +1141,27 @@ def _list_tasks(state: str | None = None) -> list[dict]:
 _REPORTED_RECEIPTS: dict[tuple[str, str], str] = {}
 
 
-def _new_receipts(receipts: list[dict]) -> list[dict]:
-    """The receipts whose state this session hasn't seen yet. Records them as seen
-    and forgets copies that have left their inbox, so the map tracks live ones."""
+def _new_receipts(receipts: list[dict], limit: int | None = None) -> tuple[list[dict], int]:
+    """The receipts whose state this session hasn't seen yet, newest first, at
+    most `limit` of them, and how many more were held back.
+
+    Only what is returned is recorded as seen. A held-back receipt keeps its old
+    recorded state, so it is still new at the next peek rather than marked seen
+    without ever being shown. Copies that have left their inbox are forgotten, so
+    the map tracks live ones."""
 
     def key(r: dict) -> tuple[str, str]:
         return (str(r["id"]), str(r.get("to")))
 
     fresh = [r for r in receipts if _REPORTED_RECEIPTS.get(key(r)) != r.get("state")]
+    fresh.sort(key=lambda r: str(r.get("sent_at") or ""), reverse=True)
+    shown = fresh if limit is None else fresh[:limit]
+    held = {key(r) for r in fresh[len(shown) :]}
+    seen = {key(r): str(r.get("state")) for r in receipts if key(r) not in held}
+    seen.update({k: _REPORTED_RECEIPTS[k] for k in held if k in _REPORTED_RECEIPTS})
     _REPORTED_RECEIPTS.clear()
-    _REPORTED_RECEIPTS.update({key(r): str(r.get("state")) for r in receipts})
-    return fresh
+    _REPORTED_RECEIPTS.update(seen)
+    return shown, len(fresh) - len(shown)
 
 
 def _get_sent_receipts(agent_id: str) -> list[dict]:
@@ -1204,6 +1224,40 @@ def _omit_defaults(clean: dict, *, just_read: bool = True) -> dict:
 _BREAKS = ("\n", ". ", "; ", ", ", " ")
 
 
+def _end_at_break(head: str) -> str:
+    """`head` cut back to the strongest break in its last 40%, if there is one."""
+    for brk in _BREAKS:
+        at = head.rfind(brk)
+        if at >= len(head) * 0.6:
+            return head[: at + len(brk)]
+    return head
+
+
+def _start_at_break(tail: str) -> str:
+    """`tail` cut forward past the strongest break in its first half, if any."""
+    for brk in _BREAKS:
+        at = tail.find(brk)
+        if 0 <= at <= len(tail) * 0.5:
+            return tail[at + len(brk) :]
+    return tail
+
+
+def _cut_exempt(must_read: bool, priority: str | None) -> bool:
+    """A sender who marked a message must_read or urgent has said the whole of it
+    matters, so it goes out uncut. One definition, read by both the sender's
+    notice and the recipient's delivery, so the two cannot disagree."""
+    return bool(must_read) or priority == "urgent"
+
+
+def _will_cut(length: int, must_read: bool, priority: str | None) -> bool:
+    """Whether a message of `length` chars is delivered cut. Just over the cap,
+    the marker costs more than the cut saves, so the line sits 80 chars past it.
+    Read by both the sender's notice and the recipient's delivery."""
+    if DELIVER_MAX_CHARS <= 0 or _cut_exempt(must_read, priority):
+        return False
+    return length > DELIVER_MAX_CHARS + 80
+
+
 def _clip(text: str, limit: int, msg_id: str = "") -> str:
     """About `limit` chars of `text`: mostly its head, plus its closing lines.
 
@@ -1215,18 +1269,8 @@ def _clip(text: str, limit: int, msg_id: str = "") -> str:
     tail_budget = limit // 5
     if not tail_budget:
         return text[:limit] + " …"
-    head = text[: limit - tail_budget]
-    for brk in _BREAKS:
-        at = head.rfind(brk)
-        if at >= len(head) * 0.6:
-            head = head[: at + len(brk)]
-            break
-    tail = text[-tail_budget:]
-    for brk in _BREAKS:
-        at = tail.find(brk)
-        if 0 <= at <= len(tail) * 0.5:
-            tail = tail[at + len(brk) :]
-            break
+    head = _end_at_break(text[: limit - tail_budget])
+    tail = _start_at_break(text[-tail_budget:])
     omitted = len(text) - len(head) - len(tail)
     fetch = f'peek(message_ids=["{msg_id}"])' if msg_id else "peek(message_ids=[...])"
     return f"{head.rstrip()}\n[… {omitted} chars omitted: {fetch} …]\n{tail.lstrip()}"
@@ -1250,22 +1294,26 @@ def _public_msg(m: dict, *, just_read: bool = True, full: bool = False) -> dict:
     # longer exists, so say so rather than let it look like fresh mail to me.
     if m.get("_inherited_from"):
         clean["inherited_from"] = m["_inherited_from"]
-    # Message text over the cap is delivered as its head and tail. Over 14 days,
-    # the longest tenth of sends ran past 2,000 chars, and every recipient
-    # carries all of it for the rest of its session. 1,000 was tried first and
-    # replayed against those sends: the ask sat in the cut middle of 3 of 8
-    # sampled messages, because nobody had yet written for a cap. The rest is one
-    # peek(message_ids=[...]) away, which most recipients never need.
-    # A sender who marked a message must_read or urgent has said the whole of
-    # it matters, so those go out uncut.
-    content = clean.get("content")
-    exempt = m.get("must_read") or m.get("priority") == "urgent"
-    if not (full or exempt) and DELIVER_MAX_CHARS > 0 and isinstance(content, str):
-        # Just over the cap, the marker costs more than the cut saves.
-        if len(content) > DELIVER_MAX_CHARS + 80:
-            clean["content"] = _clip(content, DELIVER_MAX_CHARS, str(m.get("id", "")))
-            clean["truncated_from"] = len(content)
+    if not full:
+        _cut_for_delivery(clean)
     return _omit_defaults(clean, just_read=just_read)
+
+
+def _cut_for_delivery(clean: dict) -> None:
+    """Deliver message text over the cap as its head and tail, in place.
+
+    Over 14 days the longest tenth of sends ran past 2,000 chars, and every
+    recipient carries all of it for the rest of its session. 1,000 was tried
+    first and replayed against those sends: the ask sat in the cut middle of 3
+    of 8 sampled messages, because nobody had yet written for a cap. The rest is
+    one peek(message_ids=[...]) away, which most recipients never need."""
+    content = clean.get("content")
+    if not isinstance(content, str):
+        return
+    if not _will_cut(len(content), clean.get("must_read"), clean.get("priority")):
+        return
+    clean["content"] = _clip(content, DELIVER_MAX_CHARS, str(clean.get("id", "")))
+    clean["truncated_from"] = len(content)
 
 
 def _with_pending(result: dict) -> dict:
@@ -1582,9 +1630,11 @@ if CONFIG.get("trust_local_peers"):
 # why the delivery cap above does the enforcing and this only sets the register.
 _instructions += (
     "\n\nMessage style: the reader is another agent, and every message stays in "
-    "its context for the rest of its session. Skip greetings, thanks, sign-offs "
-    "and restating what you were told. Point at file paths, commits, ids and line "
-    "numbers instead of pasting their content."
+    "its context for the rest of its session. Say what changes for the reader "
+    "first, then any question you need them to answer; point at file paths, "
+    "commits, ids and line numbers for the cause instead of pasting it. Skip "
+    "greetings, thanks, sign-offs and restating what you were told. Set kind and "
+    "about when they apply."
     + (
         f" A message over {DELIVER_MAX_CHARS} characters reaches its recipient as "
         "its opening and closing lines, and the middle is fetched only on request, "
@@ -1615,7 +1665,13 @@ mcp = FastMCP("dispatch", instructions=_instructions)
         "payload carries structured data (dict), "
         "ttl sets expiry in seconds, "
         "must_read=true prevents auto-expiry. "
-        "Returns queued_to — the inboxes written, which is addressing, NOT receipt. "
+        "kind ('fyi', 'ask', 'decision' or 'conflict') says what the message is for "
+        "and about names what it concerns (a path, interface or ticket), so a "
+        "recipient can triage without reading the body. "
+        "Re-sending a message identical to one of yours nobody has read yet is "
+        "dropped and returns duplicate_of. "
+        "Returns queued_to, the inboxes the message now waits in; it says nothing "
+        "about whether anyone has read it. "
         "Confirm a message was actually read via peek()'s sent_receipts (state: "
         "pending, read, or expired — the last meaning its TTL elapsed with nobody "
         "ever reading it). Plus any pending messages for you."
@@ -1630,8 +1686,34 @@ def dispatch_tool(
     payload: dict | None = None,
     ttl: int | None = None,
     must_read: bool = False,
+    kind: str | None = None,
+    about: str | None = None,
 ) -> dict:
     """Send a message to other agents."""
+    key = _send_key(
+        target,
+        {
+            "message": message,
+            "priority": priority,
+            "thread_id": thread_id,
+            "reply_to": reply_to,
+            "payload": payload,
+            "kind": kind,
+            "about": about,
+            "must_read": must_read,
+            "ttl": ttl,
+        },
+    )
+    earlier = _unread_duplicate(key)
+    if earlier:
+        return _with_pending(
+            {
+                "sent": False,
+                "duplicate_of": earlier,
+                "note": "An identical message from you is still unread by every "
+                "recipient, so this one was dropped. peek() shows when it is read.",
+            }
+        )
     sent = _send(
         AGENT_ID,
         target,
@@ -1642,7 +1724,10 @@ def dispatch_tool(
         payload=payload,
         ttl=ttl,
         must_read=must_read,
+        kind=kind,
+        about=about,
     )
+    _SENT_KEYS[key] = (sent["id"], len(sent.get("queued_to", [])))
     result = {
         "sent": True,
         "id": sent["id"],
@@ -1652,20 +1737,155 @@ def dispatch_tool(
         "priority": priority,
         "thread_id": sent.get("thread_id"),
     }
-    # Telling the sender is the part that changes behaviour: a length limit
-    # stated only in instructions leaks, one the sender sees enforced does less.
-    if (
-        DELIVER_MAX_CHARS > 0
-        and len(message) > DELIVER_MAX_CHARS
-        and not (must_read or priority == "urgent")
-    ):
-        result["truncated_on_delivery"] = (
-            f"{len(message)} chars; recipients get its opening and closing lines "
-            f"(~{DELIVER_MAX_CHARS} chars) and must fetch the middle. Put what they "
-            "act on first, or send must_read=true if every line matters (it then "
-            "never expires unacked)."
-        )
+    result.update(_sender_notes(message, must_read, priority))
     return _with_pending(result)
+
+
+# (target, content and envelope) → (id, inboxes written) of the last message
+# this session sent with exactly that shape. In-process: a restarted session is
+# a new sender.
+_SENT_KEYS: dict[tuple, tuple[str, int]] = {}
+_SEND_TIMES: list[float] = []
+
+
+def _send_key(target: str, envelope: dict) -> tuple:
+    return (target, json.dumps(envelope, sort_keys=True))
+
+
+def _unread_duplicate(key: tuple) -> str | None:
+    """The id of an identical earlier send that no recipient has read, if any.
+
+    ettle's rule is to emit only what changes the reader's picture. A copy nobody
+    has opened yet changes nothing; one somebody already read might be a
+    deliberate re-ping, so that goes through."""
+    if key not in _SENT_KEYS:
+        return None
+    earlier, written = _SENT_KEYS[key]
+    states = [r.get("state") for r in _get_sent_receipts(AGENT_ID) if r["id"] == earlier]
+    # A copy that is gone was acked, which means somebody read it. Counting
+    # against the inboxes written catches that; the receipts alone cannot.
+    if written and len(states) == written and all(s == "pending" for s in states):
+        return earlier
+    return None
+
+
+_GREETING = re.compile(
+    r"^\s*(hi|hey|hello|thanks|thank you|great|awesome|perfect|sounds good|got it)\b",
+    re.IGNORECASE,
+)
+_FENCE = re.compile(r"^```.*?$(.*?)^```", re.MULTILINE | re.DOTALL)
+_PASTE_LINES = 20
+
+
+def _sender_notes(message: str, must_read: bool, priority: str) -> dict:
+    """What the sender should hear about the message it just sent.
+
+    Each note fires only when its message breaks the rule, the way pellicle's
+    status reminder stays silent until the status is actually stale. A rule
+    restated on every send is noise; one stated at the send that broke it is the
+    part that changes the next send."""
+    notes: dict = {}
+    truncated = _truncation_note(message, must_read, priority)
+    if truncated:
+        notes["truncated_on_delivery"] = truncated
+    style = _style_notes(message)
+    if style:
+        notes["style"] = style
+    over = _over_budget()
+    if over:
+        notes["over_budget"] = (
+            f"{over} sends in the last {SEND_BUDGET_WINDOW // 60} min (budget "
+            f"{SEND_BUDGET}). Every one sits in each recipient's context for the "
+            "rest of its session; batch updates or send fewer."
+        )
+    return notes
+
+
+def _truncation_note(message: str, must_read: bool, priority: str) -> str | None:
+    if not _will_cut(len(message), must_read, priority):
+        return None
+    return (
+        f"{len(message)} chars; recipients get its opening and closing lines "
+        f"(~{DELIVER_MAX_CHARS} chars) and must fetch the middle. Put what they "
+        "act on first, or send must_read=true if every line matters (it then "
+        "never expires unacked)."
+    )
+
+
+def _style_notes(message: str) -> list[str]:
+    style = []
+    if _GREETING.match(message):
+        style.append("opens with a greeting; lead with the ask or the finding")
+    blocks = _FENCE.findall(message)
+    longest = max((len(b.strip("\n").splitlines()) for b in blocks), default=0)
+    if longest > _PASTE_LINES:
+        style.append(f"pastes a {longest}-line block; point at the path and lines instead")
+    return style
+
+
+def _over_budget() -> int:
+    """This session's send count in the window, when it is over budget, else 0.
+
+    ettle frames the rail as a commons each agent has a private incentive to
+    over-graze. The budget only warns: holding mail back would change delivery
+    semantics every peer relies on, and the warning is what reaches the sender."""
+    if SEND_BUDGET <= 0:
+        return 0
+    now = time.time()
+    _SEND_TIMES.append(now)
+    _SEND_TIMES[:] = [t for t in _SEND_TIMES if now - t <= SEND_BUDGET_WINDOW]
+    return len(_SEND_TIMES) if len(_SEND_TIMES) > SEND_BUDGET else 0
+
+
+def _select_messages(
+    thread_id: str | None, include_read: bool, message_ids: list[str] | None
+) -> list[dict]:
+    if message_ids:
+        wanted = set(message_ids)
+        return [m for m in _read_inbox(AGENT_ID, thread_id=thread_id) if m.get("id") in wanted]
+    if include_read:
+        return _read_inbox(AGENT_ID, thread_id=thread_id)
+    return _read_inbox(AGENT_ID, state_filter="pending", thread_id=thread_id)
+
+
+# Changed receipts shown per peek, newest first. pellicle capped a list at its
+# first five and so always showed the same five oldest entries, never the one
+# just written; the fix was newest-first with a count of the rest.
+_RECEIPTS_SHOWN = 10
+
+
+def _receipt_fields(all_receipts: bool) -> dict:
+    """Delivery receipts for sent messages: only what changed, unless asked."""
+    every = _get_sent_receipts(AGENT_ID)
+    out: dict = {}
+    if all_receipts:
+        _new_receipts(every)
+        receipts = every
+    else:
+        receipts, older = _new_receipts(every, _RECEIPTS_SHOWN)
+        out["receipts_unchanged"] = len(every) - len(receipts) - older
+        out["receipts_older"] = older
+    out = {k: v for k, v in out.items() if v}
+    if receipts:
+        out["sent_receipts"] = receipts
+        out.update(_expired_fields(receipts))
+    return out
+
+
+def _expired_fields(receipts: list[dict]) -> dict:
+    dead = [r["id"] for r in receipts if r.get("state") == "expired"]
+    if not dead:
+        return {}
+    return {
+        "expired_unread": dead,
+        "expired_unread_note": (
+            "These messages you sent reached the addressee's inbox and were "
+            "never read — their TTL elapsed first. Nobody declined them and "
+            "nobody is going to; the content is gone. Resend if it still "
+            "matters, and consider must_read=true or a longer ttl for anything "
+            "that must survive an absence."
+        ),
+    }
 
 
 @mcp.tool(
@@ -1680,7 +1900,9 @@ def dispatch_tool(
         "Use ack() to acknowledge messages when you're done with them. "
         "Also returns delivery receipts for messages you sent, but only ones that "
         "are new or changed state (pending → read → expired) since your last peek; "
-        "receipts_unchanged counts the rest. Set all_receipts=true for the full list. "
+        "receipts_unchanged counts the rest. At most 10 changed receipts are listed, "
+        "newest first, with receipts_older counting the others. Set all_receipts=true "
+        "for the full list. "
         + (
             f"Message text over {DELIVER_MAX_CHARS} chars arrives as its opening and "
             "closing lines around a marker naming what was cut, with truncated_from "
@@ -1700,29 +1922,12 @@ def peek_tool(
 ) -> dict:
     """Non-destructive read of inbox messages plus sent message receipts."""
     _cleanup_expired(AGENT_ID)
-
-    if message_ids:
-        wanted = set(message_ids)
-        messages = [m for m in _read_inbox(AGENT_ID, thread_id=thread_id) if m.get("id") in wanted]
-    elif include_read:
-        messages = _read_inbox(AGENT_ID, thread_id=thread_id)
-    else:
-        messages = _read_inbox(AGENT_ID, state_filter="pending", thread_id=thread_id)
-
-    # Mark pending → read
+    messages = _select_messages(thread_id, include_read, message_ids)
     _mark_read(messages)
-
-    # Clean internal fields (and surface cross-host provenance via _public_msg)
     clean = [
         _public_msg(m, just_read=not (include_read or message_ids), full=bool(message_ids))
         for m in messages
     ]
-
-    # Delivery receipts for sent messages: only what changed, unless asked.
-    every = _get_sent_receipts(AGENT_ID)
-    fresh = _new_receipts(every)
-    receipts = every if all_receipts else fresh
-
     result = {
         "agent_id": AGENT_ID,
         "messages": clean,
@@ -1734,20 +1939,7 @@ def peek_tool(
             # Acked, expired, outside thread_id, or never ours: all look alike
             # from here, and an empty list must not read as success.
             result["not_found"] = missing
-    if len(every) > len(receipts):
-        result["receipts_unchanged"] = len(every) - len(receipts)
-    if receipts:
-        result["sent_receipts"] = receipts
-        dead = [r["id"] for r in receipts if r.get("state") == "expired"]
-        if dead:
-            result["expired_unread"] = dead
-            result["expired_unread_note"] = (
-                "These messages you sent reached the addressee's inbox and were "
-                "never read — their TTL elapsed first. Nobody declined them and "
-                "nobody is going to; the content is gone. Resend if it still "
-                "matters, and consider must_read=true or a longer ttl for anything "
-                "that must survive an absence."
-            )
+    result.update(_receipt_fields(all_receipts))
     # Not _with_pending — this already drained the inbox. The arm notice still
     # belongs here, and doubly so: peek is what a session reaches for when it
     # suspects it is missing mail, which is exactly the symptom of being unarmed.
@@ -1833,13 +2025,13 @@ def digest_tool(nick: str | None = None, since: str | None = None) -> dict:
         "List agents: those live on this host, plus any reachable cross-host via "
         "the git transport (the 'remote' list — durable delivery, so they may be "
         "offline right now). dispatch(target=id) reaches either the same way. "
-        "Each local agent carries 'armed': false means it is running but holds no "
-        "message watch, so nothing wakes it and a reply waits on its operator — "
-        "unless it also carries 'handling': true, meaning its watch woke it for a "
-        "message in the last few minutes and it is dealing with that now. "
+        "An agent with 'armed': false is running with no message watch, so nothing "
+        "wakes it and a reply waits on its operator. 'handling': true overrides "
+        "that: its watch woke it for a message in the last few minutes and it is "
+        "dealing with it now. "
         "Every entry in 'agents' is live (its presence lock is held); "
-        "'server_pid' is the dispatch server subprocess, not the session, so do "
-        "not check it against /proc for liveness. "
+        "'server_pid' belongs to the dispatch server subprocess, which can outlive "
+        "or predate the session, so /proc tells you nothing about liveness. "
         "'native' lists OTHER Claude Code sessions currently visible on Claude "
         "Code's own built-in inter-session protocol — informational only unless "
         "the dispatch-ucbridge daemon is running for a bridged nick; see "

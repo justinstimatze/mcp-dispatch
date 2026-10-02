@@ -34,12 +34,20 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # Max message size in bytes.
 max_message_bytes = 65536
 
-# How much of a message the recipient's model is handed (default: 2000). Longer
-# messages arrive as their opening and closing lines around a marker that says how much was cut and how to fetch it, plus
-# truncated_from; peek(message_ids=[...]) returns them whole. The stored file,
-# bridges and the TUI keep every byte. must_read and urgent messages are never
-# cut. Messages within a few chars of the cap are left whole. 0 turns this off.
+# How much of a message the recipient's model is handed (default: 2000). A longer
+# message arrives as its opening and closing lines around a marker giving the
+# omitted length and the peek(message_ids=[...]) call that returns it whole, plus
+# truncated_from. The stored file, bridges and the TUI keep every byte. must_read
+# and urgent messages are never cut, nor is one at most 80 chars over the cap.
+# 0 turns this off.
 deliver_max_chars = 2000
+
+# Sends per window before dispatch() warns the sending session (default 20 per
+# 600 s; 0 = off). Warn-only: nothing is
+# held back. Over 14 days of real traffic, 20 caught one session's burst and
+# nothing else.
+send_budget = 20
+send_budget_window = 600
 
 # Adopt unread mail left behind by a dead session of the same project. Dynamic-mode
 # ids are <project>-<pid>, so a restart is a NEW id with an empty inbox — without
@@ -89,9 +97,9 @@ default_ttl = 604800  # 7 days
 # wrapper that sets DBUS_SESSION_BUS_ADDRESS / DISPLAY, or one that pushes
 # elsewhere (e.g. ntfy, or appending to a log you tail).
 
-# Affordance contract — the load-bearing "when to reach for this" guidance the
-# model reads at session start. The built-in default is a good generic version;
-# override here for environment-specific escalation paths. Placeholders:
+# Affordance contract — the "when to reach for this" guidance the model reads at
+# session start. The built-in default is a good generic version; override here
+# for environment-specific escalation paths. Placeholders:
 # {agent_id}, {agent_list}.
 #
 # This example wires the loose escalation seam to a structured-deliberation tool
@@ -302,7 +310,7 @@ Available targets: {agent_list}.
 # command = ["/abs/path/to/mcp-dispatch/bin/dispatch-agent-claude", "/home/you/code/stope"]
 # env = { DISPATCH_AGENT_TOOLS = "mcp__dispatch__peek mcp__dispatch__ack mcp__dispatch__dispatch mcp__dispatch__who mcp__dispatch__digest Read Grep Glob" }
 #
-# Read and Grep cost no memory — they are built into the harness, not MCP servers.
+# Read and Grep cost no memory: both are harness built-ins with no server process.
 # What they cost is the exfiltration path: a hostile message can now steer the
 # session into reading a file and putting it on the bus. Bash and Write are a
 # different question again, and the answer here is no; if you want them, you want

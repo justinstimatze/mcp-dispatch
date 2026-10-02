@@ -150,8 +150,13 @@ dispatch(
     payload={"commit": "abc123", "env": "staging"},  # optional: structured data
     ttl=3600,               # optional: expire after 1 hour
     must_read=True,         # optional: survive TTL, require explicit ack
+    kind="ask",             # optional: fyi | ask | decision | conflict
+    about="server.py:1207", # optional: what it concerns, a pointer (≤200 chars)
 )
 ```
+
+`kind` and `about` let a recipient triage a message before reading it. They are
+written into the message only when set.
 
 The response includes `queued_to` — the inboxes the message was written to
 (empty for a channel with no current subscribers). That is *addressing, not
@@ -159,8 +164,23 @@ receipt*: it says the message is durably waiting, not that anyone has looked at
 it. To confirm it was read, check `sent_receipts` in your next `peek()` — a
 recipient flips the message from `pending` to `read` when they read it.
 `peek()` lists a receipt only when it is new or its state has changed since
-that session's last peek, and counts the rest in `receipts_unchanged`; pass
-`all_receipts=true` for the full list.
+that session's last peek, and counts the rest in `receipts_unchanged`. At most
+10 changed receipts are listed, newest first, with `receipts_older` counting the
+others; pass `all_receipts=true` for the full list.
+
+The `dispatch()` result can also carry notes about the message just sent, each
+present only when it applies:
+
+- `truncated_on_delivery`: the message is more than 80 chars over
+  `deliver_max_chars`, so recipients get its head and tail.
+- `style`: it opens with a greeting, or pastes a fenced block over 20 lines.
+- `over_budget`: this session has sent more than `send_budget` messages in
+  `send_budget_window` seconds. Nothing is held back.
+
+A message identical to one of yours that no recipient has read yet is dropped
+and the result says `duplicate_of` with the earlier id. Once any recipient has
+read or acked it, or the envelope differs (`must_read`, `ttl`, `kind` and the
+rest), the same text goes through again.
 
 A third state, `expired`, means the TTL elapsed with nobody ever reading it.
 Expiry used to delete the message, and since receipts are built by reading those
@@ -263,12 +283,20 @@ dispatch_dir = "~/.config/mcp-dispatch/messages"
 # Maximum message size in bytes (default: 65536)
 max_message_bytes = 65536
 
-# How much of a message the recipient's model is handed (default: 2000). Longer
-# messages arrive as their opening and closing lines around a marker that says how much was cut and how to fetch it, plus
-# truncated_from; peek(message_ids=[...]) returns them whole. The stored file,
-# bridges and the TUI keep every byte. must_read and urgent messages are never
-# cut. Messages within a few chars of the cap are left whole. 0 turns this off.
+# How much of a message the recipient's model is handed (default: 2000). A longer
+# message arrives as its opening and closing lines around a marker giving the
+# omitted length and the peek(message_ids=[...]) call that returns it whole, plus
+# truncated_from. The stored file, bridges and the TUI keep every byte. must_read
+# and urgent messages are never cut, nor is one at most 80 chars over the cap.
+# 0 turns this off.
 deliver_max_chars = 2000
+
+# Sends per window before dispatch() warns the sending session (default 20 per
+# 600 s; 0 = off). Warn-only: nothing is
+# held back. Over 14 days of real traffic, 20 caught one session's burst and
+# nothing else.
+send_budget = 20
+send_budget_window = 600
 
 # Default TTL in seconds (0 = no expiry; must_read overrides). Default: 604800 (7 days)
 # — long enough that messages survive a parked/idle session instead of expiring
@@ -534,9 +562,9 @@ are never reaped — a nick you have talked to once stays addressable forever.
 Four things follow:
 
 - **`who(scope="all")` reports offline teammates** under a `known` key, alongside
-  the live `agents` and cross-host `remote` lists. Plain `who()` lists only live
-  sessions on this host and gives the other lists as counts under `elsewhere`. A nick with a live session isn't
-  listed there — it's already in `agents`. `remote` is reachability rather than
+  the live `agents` and cross-host `remote` lists. A nick with a live session
+  appears once, in `agents`. Plain `who()` lists only live sessions on this host
+  and gives the other lists as counts under `elsewhere`. `remote` is reachability rather than
   liveness (it comes from git lane activity, not a heartbeat), so its entries
   carry the `nick` that resolves correctly, an `age`, and `stale: true` once
   they have gone quiet for an hour.
@@ -650,8 +678,8 @@ not.
 That default has a cost worth naming, because you will meet it. A woken agent can
 triage but cannot verify: asked whether a proposed change breaks something, it
 answers with a reasoned prior and tells you it could not grep. Adding `Read` and
-`Grep` to one nick's `DISPATCH_AGENT_TOOLS` fixes that for zero memory — they are
-built into the harness, not MCP servers. What it costs is an exfiltration path
+`Grep` to one nick's `DISPATCH_AGENT_TOOLS` fixes that for zero memory, since both
+are harness built-ins with no server process. What it costs is an exfiltration path
 that does not exist today, since a hostile message could then steer the session
 into reading a file and putting it on the bus. That is a per-project judgement,
 which is why it is a per-nick knob and not a default.
