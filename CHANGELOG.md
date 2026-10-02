@@ -6,6 +6,8 @@ truth for versions.
 
 ## [Unreleased]
 
+## [0.11.8] - 2026-10-01
+
 ### Changed
 - **Dispatch tool results cost far fewer tokens.** Across 14 days of
   transcripts, re-sent delivery receipts were 44% of dispatch's tool-result
@@ -56,10 +58,8 @@ truth for versions.
   `receipts_older` counting the rest.
 - **The server instructions carry a message style for agent readers:** no
   greetings or sign-offs, what changes for the reader before any question, and
-  paths and ids instead of pasted content. It is appended after the template, so a host with
-  its own `instructions` still gets it.
-
-### Changed
+  paths and ids instead of pasted content. It is appended after the template,
+  so a host with its own `instructions` still gets it.
 - **`dispatch-gate-router` puts no pusher-written text in a DM.** The branch
   name, job names and a pull_request run's own workflow name all come from
   the PR, and a `safe()` charset still lets someone with push access spell an
