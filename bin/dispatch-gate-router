@@ -111,6 +111,18 @@ def gh_json(args: list[str]):
     return json.loads(out.stdout) if out.stdout.strip() else None
 
 
+def gh_text(args: list[str]) -> str | None:
+    """A gh call's raw output, or None when it failed. Read as bytes and decoded leniently: a job
+    log carries a test runner's colour codes and whatever else the job printed."""
+    try:
+        out = subprocess.run(["gh", *args], capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", errors="replace")
+
+
 def empty_state() -> dict:
     return {"version": STATE_VERSION, "notified": [], "processed": [], "red": {}}
 
@@ -272,6 +284,60 @@ def seed_backlog(repo: str, deny: list[str], state: dict) -> int:
     return seeded
 
 
+# What GitHub writes when a job's runner went away mid-job: a spot instance stopped on its
+# two-minute reclaim notice ("shutdown signal"), or one that vanished with none ("lost
+# communication"). The job then concludes failure, and so does the run, though none of its own
+# steps failed: the step it was on ends cancelled. Kept in step with SIGNALS in the watched repo's
+# web/scripts/spot-rerun.sh, which reruns such a run's failed jobs on attempts 1 and 2 and believes
+# attempt 3; the merge queue also asks for a fresh pass when its tests lost their runner. That
+# script's two checkout-network signals are left out: a checkout that died that way ends with a
+# failed step, which pages.
+RUNNER_LOST_SIGNALS = (
+    "The runner has received a shutdown signal",
+    "lost communication with the server",
+)
+RUNNER_LOST_RETRIES = 2
+# Job conclusions that are not a red of their own.
+NOT_RED = ("success", "skipped", "neutral", "cancelled", None)
+
+
+def _has_runner_lost_signal(text: str | None) -> bool:
+    return bool(text) and any(s in text for s in RUNNER_LOST_SIGNALS)
+
+
+def lost_its_runner(repo: str, run: dict) -> bool:
+    """True when every failed job in this attempt died because its runner went away, on an attempt
+    the spot retry still reruns. Such a run is red on GitHub with nothing for its lane to fix, so it
+    is not paged. Everything else pages: a job that failed or timed out on its own beside a lost one,
+    a failed step, a job whose annotations and log can't be read or don't carry the line, and a third
+    attempt (a pool that keeps losing runners is worth a look). Job, annotation and log text is only
+    matched against the fixed strings above, never put in a message."""
+    attempt = int(run.get("run_attempt", 1))
+    if attempt > RUNNER_LOST_RETRIES:
+        return False
+    try:
+        data = gh_json(["api", f"repos/{repo}/actions/runs/{int(run['id'])}/attempts/{attempt}/jobs?per_page=100"])
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+        return False
+    failed = [j for j in (data or {}).get("jobs", []) if j.get("conclusion") not in NOT_RED]
+    if not failed:
+        return False
+    for job in failed:
+        if job.get("conclusion") != "failure":
+            return False  # timed_out, startup_failure, action_required: the job's own verdict
+        if any(step.get("conclusion") == "failure" for step in job.get("steps") or []):
+            return False
+        job_id = int(job["id"])  # an Actions job's id is its check run's id
+        notes = gh_text(["api", f"repos/{repo}/check-runs/{job_id}/annotations", "--jq", ".[].message"])
+        if _has_runner_lost_signal(notes):
+            continue
+        # GitHub usually annotates a stopped runner's job only "The operation was canceled.", so the
+        # shutdown line is read from the log.
+        if not _has_runner_lost_signal(gh_text(["api", f"repos/{repo}/actions/jobs/{job_id}/logs"])):
+            return False
+    return True
+
+
 def route_failures(repo: str, deny: list[str], base: str, mayor: str, mirror: str | None, state: dict, dry_run: bool) -> int:
     routed = 0
     live = None
@@ -295,6 +361,10 @@ def route_failures(repo: str, deny: list[str], base: str, mayor: str, mirror: st
         key = f"{name}::{sha}::{attempt}"
         if key in state["notified"]:
             print(f"debounced (already notified for {key}): run {run['id']}")
+            state["processed"].append(rk)
+            continue
+        if lost_its_runner(repo, run):
+            print(f"not paging run {run['id']} attempt {attempt}: every failed job lost its runner")
             state["processed"].append(rk)
             continue
 

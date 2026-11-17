@@ -191,3 +191,132 @@ def test_a_green_run_of_any_other_workflow_is_never_read_for_findings(router, mo
     run = _run(router, path=".github/workflows/ci.yml")
     sent, state, calls = _findings(router, monkeypatch, [run], [_note(router)], {"jupiter"})
     assert sent == [] and calls == [] and state["findings"] == []
+
+
+# A run shaped like a merge-queue pass whose unit-test job's spot runner was reclaimed mid-install:
+# the job concludes failure, its running step cancelled, its annotation says only "The operation was
+# canceled.", and the shutdown line is in the log alone.
+SHUTDOWN_LOG = (
+    "Progress: resolved 1032\n"
+    "##[error]The runner has received a shutdown signal. This can happen when the runner "
+    "service is stopped, or a manually started runner is canceled.\n"
+    "##[error]The operation was canceled.\n"
+)
+
+
+def _lost_job(job_id):
+    return {
+        "id": job_id,
+        "conclusion": "failure",
+        "steps": [
+            {"name": "Set up job", "conclusion": "success"},
+            {"name": "Run pnpm install", "conclusion": "cancelled"},
+        ],
+    }
+
+
+def _route_with_jobs(router, monkeypatch, run, jobs, logs, annotations=None):
+    sent: list[tuple[str, str, dict]] = []
+    read: list[str] = []
+
+    def gh(args):
+        if "/attempts/" in args[1]:
+            return {"jobs": jobs}
+        return {"workflows": [{"id": 7, "name": "Merge queue"}]}
+
+    def text(args):
+        read.append(args[1])
+        job_id = int(args[1].split("/")[-2])
+        if args[1].endswith("/annotations"):
+            return (annotations or {}).get(job_id, "The operation was canceled.")
+        return logs.get(job_id)
+
+    monkeypatch.setattr(
+        router, "fetch_runs", lambda repo, status: [run] if status == "failure" else []
+    )
+    monkeypatch.setattr(router, "tree_distance", lambda *a: "0 behind develop, 0 ahead")
+    monkeypatch.setattr(router, "live_nicks", lambda: {router.DEFAULT_MAYOR})
+    monkeypatch.setattr(router, "gh_json", gh)
+    monkeypatch.setattr(router, "gh_text", text, raising=False)
+    monkeypatch.setattr(
+        router, "dispatch_send", lambda to, msg, payload: sent.append((to, msg, payload))
+    )
+    router._WORKFLOW_NAMES.clear()
+    state = router.empty_state()
+    router.route_failures(
+        router.DEFAULT_REPO, [], "develop", router.DEFAULT_MAYOR, None, state, False
+    )
+    return sent, state, read
+
+
+def _mq_run(router, **over):
+    return _run(router, name="Merge queue", event="workflow_dispatch", head_branch="main", **over)
+
+
+def test_a_merge_queue_run_whose_only_failed_jobs_lost_their_runner_does_not_page(
+    router, monkeypatch
+):
+    run = _mq_run(router)
+    jobs = [
+        {"id": 1, "conclusion": "success", "steps": []},
+        _lost_job(2),
+        {"id": 3, "conclusion": "skipped"},
+    ]
+    sent, state, _ = _route_with_jobs(router, monkeypatch, run, jobs, logs={2: SHUTDOWN_LOG})
+    assert sent == []
+    assert router.run_key(run) in state["processed"], "a skipped run is not re-read on every poll"
+    assert state["red"] == {}, "no red is opened, so no 'Green again' follows"
+
+
+def test_a_runner_that_vanished_without_notice_does_not_page(router, monkeypatch):
+    sent, _, read = _route_with_jobs(
+        router,
+        monkeypatch,
+        _mq_run(router),
+        [_lost_job(2)],
+        logs={},
+        annotations={2: "The self-hosted runner: x lost communication with the server."},
+    )
+    assert sent == []
+    assert not any(p.endswith("/logs") for p in read), (
+        "the annotation answered, so the log is not fetched"
+    )
+
+
+@pytest.mark.parametrize(
+    "why, jobs, logs, attempt",
+    [
+        (
+            "a job with a failed step alongside a lost runner",
+            [
+                _lost_job(2),
+                {"id": 4, "conclusion": "failure", "steps": [{"conclusion": "failure"}]},
+            ],
+            {2: SHUTDOWN_LOG, 4: SHUTDOWN_LOG},
+            1,
+        ),
+        (
+            "a job that timed out alongside a lost runner",
+            [_lost_job(2), {"id": 4, "conclusion": "timed_out"}],
+            {2: SHUTDOWN_LOG},
+            1,
+        ),
+        (
+            "a cancelled step with no runner-loss line in the log",
+            [_lost_job(2)],
+            {2: "##[error]The operation was canceled.\n"},
+            1,
+        ),
+        ("a log that could not be read", [_lost_job(2)], {}, 1),
+        ("a third attempt, which the spot retry believes", [_lost_job(2)], {2: SHUTDOWN_LOG}, 3),
+    ],
+)
+def test_a_real_failure_or_an_unproven_runner_loss_still_pages(
+    router, monkeypatch, why, jobs, logs, attempt
+):
+    sent, state, _ = _route_with_jobs(
+        router, monkeypatch, _mq_run(router, run_attempt=attempt), jobs, logs
+    )
+    assert len(sent) == 1, why
+    assert sent[0][1].startswith("Gate red: Merge queue (workflow_dispatch) failed")
+    assert state["red"], why

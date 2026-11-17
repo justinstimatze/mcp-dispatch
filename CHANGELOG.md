@@ -6,6 +6,18 @@ truth for versions.
 
 ## [Unreleased]
 
+### Fixed
+- **gate-router no longer pages a red for a run whose only failed jobs lost
+  their runner.** A spot runner stopped on its reclaim notice ends its job as
+  `failure` with the running step `cancelled`, so the whole run reads as failed
+  and the lane got "Gate red", then "Green again" on the next pass, with nothing
+  to fix. The router now reads the failed jobs and skips the run when every one
+  of them has no failed step and carries GitHub's "runner has received a
+  shutdown signal" or "lost communication with the server" line, on attempts 1
+  and 2 (the ones the repo's spot retry reruns). A job that failed or timed out
+  on its own beside a lost one, an unreadable log, or a third attempt still
+  pages.
+
 ## [0.11.9] - 2026-10-01
 
 ### Security
